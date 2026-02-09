@@ -1,0 +1,20 @@
+{
+  "name": "proworkbench",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "server",
+    "ui"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,ui \"npm -w server run dev\" \"wait-on http://127.0.0.1:8787/admin/meta && npm -w ui run dev\"",
+    "dev:server": "npm -w server run dev",
+    "dev:ui": "npm -w ui run dev",
+    "build": "npm -w ui run build && npm -w server run build",
+    "start": "npm -w server run start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1",
+    "wait-on": "^7.2.0"
+  }
+}

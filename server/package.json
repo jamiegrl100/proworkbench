@@ -1,0 +1,25 @@
+{
+  "name": "proworkbench-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "build": "node -e \"console.log('no build step yet')\"",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "argon2": "^0.31.2",
+    "better-sqlite3": "^11.7.2",
+    "cookie-parser": "^1.4.6",
+    "csurf": "^1.11.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "node-fetch": "^3.3.2",
+    "@slack/bolt": "^3.17.0"
+  }
+}

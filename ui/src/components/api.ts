@@ -1,4 +1,4 @@
-import { clearToken, getToken } from "../auth";
+import { clearToken, getToken, stashLastToken } from "../auth";
 
 export class UnauthorizedError extends Error {
   constructor(message = "UNAUTHORIZED") {
@@ -22,6 +22,7 @@ async function parseResponse<T>(r: Response): Promise<T> {
   const json = txt ? (() => { try { return JSON.parse(txt); } catch { return null; } })() : null;
   if (!r.ok) {
     if (r.status === 401) {
+      stashLastToken(getToken());
       clearToken();
       window.dispatchEvent(new Event("pb-auth-logout"));
       const unauth = new UnauthorizedError(json?.error || txt || "UNAUTHORIZED");

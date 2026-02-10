@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 
-import { clearToken, setToken } from "../auth";
+import { clearToken, getLastToken, setToken, stashLastToken } from "../auth";
 import { getJson, postJson } from "./api";
 
 type SetupState = {
@@ -19,7 +19,7 @@ export default function LoginScreen({
   onCancel?: () => void;
   allowCancel?: boolean;
 }) {
-  const [tokenInput, setTokenInput] = useState((initialToken || "").trim());
+  const [tokenInput, setTokenInput] = useState((initialToken || getLastToken() || "").trim());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [info, setInfo] = useState("");
@@ -64,7 +64,7 @@ export default function LoginScreen({
       setToken(token);
       onAuthenticated(token);
     } catch (e: any) {
-      clearToken();
+      stashLastToken(token);
       const msg = String(e?.message || e);
       setErr(msg);
       setInfo("Use Generate token only on first setup (no existing tokens), or paste a known admin token.");
@@ -100,7 +100,7 @@ export default function LoginScreen({
       setToken(token);
       onAuthenticated(token);
     } catch (e: any) {
-      clearToken();
+      stashLastToken(tokenInput.trim());
       const msg = String(e?.message || e);
       setErr(msg);
       if (!bootstrapMode) setInfo("Generate token requires first setup, or a valid current token for rotation.");
@@ -156,6 +156,9 @@ export default function LoginScreen({
           </button>
           <button onClick={copyToken} disabled={busy || !tokenInput.trim()} style={{ padding: "8px 12px" }}>
             Copy
+          </button>
+          <button onClick={() => setTokenInput(getLastToken() || "")} disabled={busy} style={{ padding: "8px 12px" }}>
+            Use last token
           </button>
           <button onClick={clearInput} disabled={busy} style={{ padding: "8px 12px" }}>
             Clear

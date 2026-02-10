@@ -268,13 +268,17 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   // Minimal webchat endpoint that uses server-selected provider/model pipeline.
-  r.post('/webchat/send', async (req, res) => {
+  const handleWebchatSend = async (req, res) => {
     const message = String(req.body?.message || '').trim();
     if (!message) return res.status(400).json({ ok: false, error: 'message required' });
     const out = await llmChatOnce({ db, messageText: message, timeoutMs: 90_000 });
     if (!out.ok) return res.status(502).json({ ok: false, error: out.error || 'WebChat failed' });
     return res.json({ ok: true, reply: out.text, model: out.model || null, provider: out.profile || null });
-  });
+  };
+
+  r.post('/webchat/send', handleWebchatSend);
+  r.post('/chat/send', handleWebchatSend);
+  r.post('/webchat/message', handleWebchatSend);
 
   r.get('/webchat/status', (_req, res) => {
     res.json({

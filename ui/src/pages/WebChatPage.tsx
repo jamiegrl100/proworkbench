@@ -45,6 +45,7 @@ export default function WebChatPage() {
     try {
       let done = false;
       let lastErr = "";
+      let allNotFound = true;
       for (const ep of SEND_ENDPOINTS) {
         try {
           const r = await postJson<any>(ep, { message: payload });
@@ -53,23 +54,38 @@ export default function WebChatPage() {
             setMessages((prev) => [...prev, { role: "assistant", text: reply, ts: nowTs() }]);
             setSupportsSend(true);
             done = true;
+            allNotFound = false;
             break;
           }
         } catch (e: any) {
-          lastErr = String(e?.message || e);
+          const status = Number(e?.status || 0);
+          if (status !== 404) allNotFound = false;
+          lastErr = String(e?.detail?.error || e?.message || e);
         }
       }
 
       if (!done) {
-        setSupportsSend(false);
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "system",
-            text: "WebChat send endpoint is not implemented on this server build.",
-            ts: nowTs(),
-          },
-        ]);
+        if (allNotFound) {
+          setSupportsSend(false);
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "system",
+              text: "WebChat send endpoint is not implemented on this server build.",
+              ts: nowTs(),
+            },
+          ]);
+        } else {
+          setSupportsSend(true);
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "system",
+              text: "WebChat endpoint is available but the model request failed. Check Runtime/Models and retry.",
+              ts: nowTs(),
+            },
+          ]);
+        }
         if (lastErr) setErr(lastErr);
       }
     } finally {

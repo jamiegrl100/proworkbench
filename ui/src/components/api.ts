@@ -24,9 +24,13 @@ async function parseResponse<T>(r: Response): Promise<T> {
     if (r.status === 401) {
       clearToken();
       window.dispatchEvent(new Event("pb-auth-logout"));
-      throw new UnauthorizedError(json?.error || txt || "UNAUTHORIZED");
+      const unauth = new UnauthorizedError(json?.error || txt || "UNAUTHORIZED");
+      (unauth as any).status = 401;
+      (unauth as any).detail = json;
+      throw unauth;
     }
     const err = new Error(json?.error || txt || `${r.status}`);
+    (err as any).status = r.status;
     (err as any).detail = json;
     throw err;
   }

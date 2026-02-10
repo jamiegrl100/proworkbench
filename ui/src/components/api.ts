@@ -10,7 +10,10 @@ export class UnauthorizedError extends Error {
 function authHeaders(_url: string) {
   const headers: Record<string, string> = {};
   const token = getToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+    headers["X-PB-Admin-Token"] = token;
+  }
   return headers;
 }
 

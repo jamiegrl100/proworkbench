@@ -29,6 +29,18 @@ export default function LoginScreen({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [info, setInfo] = useState("");
+  const [bootstrapMode, setBootstrapMode] = useState(false);
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const state = await getJson<AuthState>("/admin/auth/state");
+        setBootstrapMode(Number(state?.tokenCount || 0) === 0);
+      } catch {
+        setBootstrapMode(false);
+      }
+    })();
+  }, []);
 
   async function verifyAndSaveToken() {
     const token = tokenInput.trim();
@@ -57,6 +69,7 @@ export default function LoginScreen({
       if (!state.loggedIn && Number(state.tokenCount || 0) === 0) {
         // Fresh install: bootstrap first token using the user-provided value.
         await postJson("/admin/setup/bootstrap", { token });
+        setBootstrapMode(false);
         state = await getJson<AuthState>("/admin/auth/state");
       }
 
@@ -67,7 +80,11 @@ export default function LoginScreen({
       onAuthenticated(token);
     } catch (e: any) {
       clearToken();
-      setErr(String(e?.message || e));
+      const msg = String(e?.message || e);
+      setErr(msg);
+      if (/Token was rejected/i.test(msg)) {
+        setInfo("If this is a first install, use Generate token. Otherwise paste your existing admin token.");
+      }
     } finally {
       setBusy(false);
     }
@@ -122,9 +139,11 @@ export default function LoginScreen({
           <button onClick={verifyAndSaveToken} disabled={busy} style={{ padding: "8px 12px" }}>
             {busy ? "Saving..." : "Save token"}
           </button>
-          <button onClick={generateToken} disabled={busy} style={{ padding: "8px 12px" }}>
-            Generate token
-          </button>
+          {bootstrapMode ? (
+            <button onClick={generateToken} disabled={busy} style={{ padding: "8px 12px" }}>
+              Generate token
+            </button>
+          ) : null}
           <button onClick={copyToken} disabled={busy || !tokenInput.trim()} style={{ padding: "8px 12px" }}>
             Copy
           </button>

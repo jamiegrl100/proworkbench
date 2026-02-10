@@ -3,6 +3,9 @@ import { getJson, postJson } from "../components/api";
 
 export default function RuntimePage() {
   const [status, setStatus] = useState<any>(null);
+  const [telegramStatus, setTelegramStatus] = useState<any>(null);
+  const [slackStatus, setSlackStatus] = useState<any>(null);
+  const [webchatStatus, setWebchatStatus] = useState<any>(null);
   const [models, setModels] = useState<string[]>([]);
   const [logs, setLogs] = useState<string>("");
   const [host, setHost] = useState("127.0.0.1");
@@ -61,6 +64,11 @@ export default function RuntimePage() {
     setErr("");
     try {
       await Promise.all([loadStatus(), loadConfigIfAvailable()]);
+      await Promise.all([
+        getJson<any>("/admin/telegram/worker/status").then(setTelegramStatus).catch(() => setTelegramStatus(null)),
+        getJson<any>("/admin/slack/worker/status").then(setSlackStatus).catch(() => setSlackStatus(null)),
+        getJson<any>("/admin/webchat/status").then(setWebchatStatus).catch(() => setWebchatStatus(null)),
+      ]);
       await Promise.all([loadModels(), loadLogsIfAvailable()]);
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -140,6 +148,17 @@ export default function RuntimePage() {
         </div>
         <div style={{ fontSize: 12, opacity: 0.8 }}>
           PB checks runtime only. Start Text WebUI manually on `127.0.0.1:5000`.
+        </div>
+      </section>
+
+      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+        <h3 style={{ margin: 0 }}>Workers</h3>
+        <div>Telegram: <b>{telegramStatus ? (telegramStatus.running ? "running" : "stopped") : "unknown"}</b></div>
+        <div>Slack: <b>{slackStatus ? (slackStatus.running ? "running" : "stopped") : "unknown"}</b></div>
+        <div>
+          WebChat: <b>{webchatStatus ? "available" : "unknown"}</b>
+          {webchatStatus?.providerName ? ` (${webchatStatus.providerName})` : ""}
+          {webchatStatus?.selectedModel ? ` model=${webchatStatus.selectedModel}` : ""}
         </div>
       </section>
 

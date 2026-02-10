@@ -1,6 +1,7 @@
 import express from 'express';
 import argon2 from 'argon2';
 import { countAdminTokens, createAdminToken, revokeAdminToken, verifyAdminToken } from '../auth/adminToken.js';
+import { extractToken } from './middleware.js';
 
 function nowIso() {
   return new Date().toISOString();
@@ -10,10 +11,10 @@ export function createAuthRouter({ db }) {
   const r = express.Router();
 
   r.get('/state', (req, res) => {
-    const token = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1] || '';
+    const token = extractToken(req);
     const loggedIn = verifyAdminToken(db, token);
     const tokenCount = countAdminTokens(db);
-    res.json({ loggedIn, tokenCount });
+    res.json({ loggedIn, tokenCount, setupComplete: tokenCount > 0 });
   });
 
   r.post('/bootstrap', (req, res) => {
@@ -52,7 +53,7 @@ export function createAuthRouter({ db }) {
   });
 
   r.post('/logout', (req, res) => {
-    const token = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1] || '';
+    const token = extractToken(req);
     revokeAdminToken(db, token);
     res.json({ ok: true });
   });

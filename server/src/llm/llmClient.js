@@ -1,6 +1,7 @@
 import fetch from 'node-fetch';
 
 function nowIso() { return new Date().toISOString(); }
+const REQUIRED_DEFAULT_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
 
 function sanitizeModelText(raw) {
   let s = String(raw ?? '');
@@ -45,6 +46,11 @@ function kvGet(db, key, fallback) {
   return row ? JSON.parse(row.value_json) : fallback;
 }
 
+function kvSet(db, key, value) {
+  db.prepare('INSERT INTO app_kv (key, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json')
+    .run(key, JSON.stringify(value));
+}
+
 function traceInsert(db, { method, path, status, durationMs, profile, ok }) {
   db.prepare('INSERT INTO llm_request_trace (ts, method, path, status, duration_ms, profile, ok) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(nowIso(), method, path, status ?? null, durationMs ?? null, profile ?? null, ok ? 1 : 0);
@@ -57,7 +63,13 @@ function traceInsert(db, { method, path, status, durationMs, profile, ok }) {
 function getDefaultModel(db) {
   const sel = kvGet(db, 'llm.selectedModel', null);
   if (sel) return sel;
+  const preferred = db.prepare('SELECT id FROM llm_models_cache WHERE id = ? LIMIT 1').get(REQUIRED_DEFAULT_MODEL)?.id || null;
+  if (preferred) {
+    kvSet(db, 'llm.selectedModel', preferred);
+    return preferred;
+  }
   const row = db.prepare('SELECT id FROM llm_models_cache ORDER BY discovered_at DESC LIMIT 1').get();
+  if (row?.id) kvSet(db, 'llm.selectedModel', row.id);
   return row?.id ?? null;
 }
 

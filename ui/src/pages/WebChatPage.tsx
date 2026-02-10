@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { getJson, postJson } from "../components/api";
+import { getJson } from "../components/api";
 
 type Msg = {
   role: "user" | "assistant" | "system";
@@ -7,7 +7,7 @@ type Msg = {
   ts: string;
 };
 
-const SEND_ENDPOINTS = ["/admin/webchat/send", "/admin/chat/send", "/admin/webchat/message"];
+const REQUIRED_MODEL = "models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf";
 
 function nowTs() {
   return new Date().toISOString();
@@ -17,21 +17,39 @@ export default function WebChatPage() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
-  const [supportsSend, setSupportsSend] = useState<boolean | null>(null);
-  const [provider, setProvider] = useState<string>("unknown");
-  const [model, setModel] = useState<string>("none");
+  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:5000");
+  const [running, setRunning] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [model, setModel] = useState<string>(REQUIRED_MODEL);
   const [err, setErr] = useState("");
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const s = await getJson<any>("/admin/llm/status");
-        setProvider(String(s?.providerName || s?.providerId || "unknown"));
-        setModel(String(s?.selectedModel || "none"));
-      } catch {
-        // no-op
+  const requiredMissing = models.length > 0 && !models.includes(REQUIRED_MODEL);
+
+  async function loadStatus() {
+    setErr("");
+    try {
+      const s = await getJson<any>("/admin/runtime/textwebui/status");
+      setBaseUrl(String(s?.baseUrl || "http://127.0.0.1:5000"));
+      setRunning(Boolean(s?.running));
+      setReady(Boolean(s?.ready));
+      const list = Array.isArray(s?.models) ? s.models.map((m: any) => String(m)) : [];
+      setModels(list);
+      if (list.includes(REQUIRED_MODEL)) {
+        setModel(REQUIRED_MODEL);
+      } else if (list.length > 0 && !list.includes(model)) {
+        setModel(list[0]);
       }
-    })();
+    } catch (e: any) {
+      setRunning(false);
+      setReady(false);
+      setModels([]);
+      setErr(String(e?.message || e));
+    }
+  }
+
+  useEffect(() => {
+    loadStatus();
   }, []);
 
   async function send() {
@@ -43,59 +61,49 @@ export default function WebChatPage() {
     setText("");
 
     try {
-      let done = false;
-      let lastErr = "";
-      let allNotFound = true;
-      for (const ep of SEND_ENDPOINTS) {
-        try {
-          const r = await postJson<any>(ep, { message: payload });
-          const reply = String(r?.reply || r?.text || r?.assistant || r?.message || "").trim();
-          if (reply) {
-            setMessages((prev) => [...prev, { role: "assistant", text: reply, ts: nowTs() }]);
-            setSupportsSend(true);
-            done = true;
-            allNotFound = false;
-            break;
-          }
-        } catch (e: any) {
-          const status = Number(e?.status || 0);
-          if (status !== 404) allNotFound = false;
-          lastErr = String(e?.detail?.error || e?.message || e);
-        }
+      if (!running) {
+        throw new Error("Text WebUI is not connected. Start it manually with --api --api-port 5000 --listen-host 127.0.0.1.");
       }
-
-      if (!done) {
-        if (allNotFound) {
-          setSupportsSend(false);
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "system",
-              text: "WebChat send endpoint is not implemented on this server build.",
-              ts: nowTs(),
-            },
-          ]);
-        } else {
-          setSupportsSend(true);
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "system",
-              text: "WebChat endpoint is available but the model request failed. Check Runtime/Models and retry.",
-              ts: nowTs(),
-            },
-          ]);
-        }
-        if (lastErr) setErr(lastErr);
+      if (models.length === 0) {
+        throw new Error("No models available. Load a model in Text Generation WebUI first.");
       }
+      const res = await fetch("/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: payload }],
+          temperature: 0.2,
+          max_tokens: 256,
+        }),
+      });
+      const txt = await res.text();
+      let json: any = null;
+      try {
+        json = txt ? JSON.parse(txt) : null;
+      } catch {
+        json = null;
+      }
+      if (!res.ok) {
+        throw new Error(json?.error?.message || json?.error || txt || `HTTP ${res.status}`);
+      }
+      const reply = String(json?.choices?.[0]?.message?.content || json?.choices?.[0]?.text || "").trim();
+      if (!reply) {
+        throw new Error("Model returned an empty response.");
+      }
+      setMessages((prev) => [...prev, { role: "assistant", text: reply, ts: nowTs() }]);
+    } catch (e: any) {
+      const message = String(e?.message || e);
+      setErr(message);
+      setMessages((prev) => [...prev, { role: "system", text: message, ts: nowTs() }]);
     } finally {
       setSending(false);
     }
   }
 
   const statusLine = useMemo(() => {
-    return `Provider: ${provider} | Model: ${model}`;
-  }, [provider, model]);
+    return `Text WebUI: ${running ? "Connected" : "Not connected"} | Ready: ${ready ? "yes" : "no"} | Base URL: ${baseUrl}`;
+  }, [running, ready, baseUrl]);
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
@@ -104,13 +112,37 @@ export default function WebChatPage() {
         <div style={{ fontSize: 12, opacity: 0.8, marginTop: 6 }}>{statusLine}</div>
       </div>
 
-      {supportsSend === false ? (
+      {!running ? (
         <div style={{ padding: 10, border: "1px solid #f8d39b", background: "#fff8ed", borderRadius: 8 }}>
-          Not implemented on backend yet. This page remains stable and shows model/provider context.
+          Start Text Generation WebUI manually:
+          <div style={{ marginTop: 6, fontFamily: "monospace" }}>
+            cd ~/Apps/text-generation-webui
+            <br />
+            ./start_linux.sh --api --api-port 5000 --listen-host 127.0.0.1
+          </div>
+        </div>
+      ) : null}
+
+      {requiredMissing ? (
+        <div style={{ padding: 10, border: "1px solid #f8d39b", background: "#fff8ed", borderRadius: 8 }}>
+          Required default model is missing: <code>{REQUIRED_MODEL}</code>. Using first available model instead.
         </div>
       ) : null}
 
       {err ? <div style={{ padding: 10, border: "1px solid #f1c6c6", background: "#fff4f4", borderRadius: 8, color: "#b00020" }}>{err}</div> : null}
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <label style={{ fontSize: 13 }}>Model</label>
+        <select value={model} onChange={(e) => setModel(e.target.value)} style={{ flex: 1, maxWidth: 620, padding: 8 }}>
+          {models.length === 0 ? <option value={model}>{model || "No models"}</option> : null}
+          {models.map((m) => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </select>
+        <button onClick={loadStatus} disabled={sending} style={{ padding: "8px 12px" }}>
+          Refresh
+        </button>
+      </div>
 
       <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10, minHeight: 260, maxHeight: 420, overflow: "auto", display: "grid", gap: 8 }}>
         {messages.length === 0 ? (

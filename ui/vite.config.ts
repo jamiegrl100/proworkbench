@@ -11,6 +11,7 @@ export default defineConfig({
       "/admin": { target: "http://127.0.0.1:8787" },
       "/health": { target: "http://127.0.0.1:8787" },
       "/api": { target: "http://127.0.0.1:8787" },
+      "/v1": { target: "http://127.0.0.1:5000" },
       "/ws": { target: "http://127.0.0.1:8787", ws: true },
     },
   },

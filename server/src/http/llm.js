@@ -7,6 +7,8 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+const REQUIRED_DEFAULT_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
+
 function normalizeBaseUrl(u) {
   const s = String(u || '').trim().replace(/\/+$/g, '');
   return s.replace(/\/v1$/g, '');
@@ -100,6 +102,10 @@ function autoSelectDefaultModel(db, candidateIds) {
   const current = getKv(db, 'llm.selectedModel', null);
   const has = (id) => candidateIds.includes(id);
   if (current && has(current)) return current;
+  if (has(REQUIRED_DEFAULT_MODEL)) {
+    setKv(db, 'llm.selectedModel', REQUIRED_DEFAULT_MODEL);
+    return REQUIRED_DEFAULT_MODEL;
+  }
 
   const isEmbedding = (id) => /(^|[-_/])(embed|embedding|embeddings)([-_/]|$)/i.test(id) || /nomic-embed/i.test(id);
   const preferred = candidateIds.find((id) => !isEmbedding(id)) || candidateIds[0] || null;
@@ -254,8 +260,9 @@ export function createLlmRouter({ db, dataDir }) {
         // manual/custom only
         const count = db.prepare('SELECT COUNT(1) AS c FROM llm_models_cache').get().c;
         const now = nowIso();
-const candidateIds = models.map((m) => m.id).filter(Boolean);
-const selected = autoSelectDefaultModel(db, candidateIds);
+        const existing = db.prepare('SELECT id FROM llm_models_cache ORDER BY id ASC').all();
+        const candidateIds = existing.map((m) => String(m.id)).filter(Boolean);
+        autoSelectDefaultModel(db, candidateIds);
         setKv(db, 'llm.lastRefreshedAt', now);
         saveTrace(db, trace, 'anthropic', true);
         return res.json({ ok: true, modelCount: count, lastRefreshedAt: now });
@@ -296,6 +303,7 @@ const selected = autoSelectDefaultModel(db, candidateIds);
         ins.run(m.id, JSON.stringify(m.raw), providerId === 'openai' ? 'openai' : (activeProfile || 'openai'), now);
       }
 
+      autoSelectDefaultModel(db, models.map((m) => m.id).filter(Boolean));
       setKv(db, 'llm.lastRefreshedAt', now);
       res.json({ ok: true, modelCount: models.length, lastRefreshedAt: now });
     } catch (e) {

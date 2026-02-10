@@ -15,7 +15,7 @@ function setKv(db, key, value) {
 
 export function createSetupRouter({ db, dataDir, telegram, slack }) {
   const r = express.Router();
-  r.use(requireAuthOrBootstrap(db));
+  const requireSetupAuth = requireAuthOrBootstrap(db);
 
   r.get('/state', (_req, res) => {
     const { env } = readEnvFile(dataDir);
@@ -24,7 +24,10 @@ export function createSetupRouter({ db, dataDir, telegram, slack }) {
     const llmMode = getKv(db, 'llm.mode', 'auto');
     const activeProfile = getKv(db, 'llm.activeProfile', null);
     const lastRef = getKv(db, 'llm.lastRefreshedAt', null);
+    const tokenCount = countAdminTokens(db);
     res.json({
+      tokenCount,
+      setupComplete: tokenCount > 0,
       secretsOk,
       llm: { baseUrl: llmBaseUrl, mode: llmMode, activeProfile, lastRefreshedAt: lastRef },
       telegramRunning: Boolean(telegram?.state?.running),
@@ -45,6 +48,13 @@ export function createSetupRouter({ db, dataDir, telegram, slack }) {
       return res.status(400).json({ error: String(e?.message || e) });
     }
   });
+
+  // Protected setup mutations. In bootstrap mode (0 tokens), these are also allowed.
+  r.use('/secrets', requireSetupAuth);
+  r.use('/slack-secrets', requireSetupAuth);
+  r.use('/llm', requireSetupAuth);
+  r.use('/slack-oauth-secrets', requireSetupAuth);
+  r.use('/complete', requireSetupAuth);
 
   r.post('/secrets', (req, res) => {
     const { BOT_API_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS } = req.body || {};

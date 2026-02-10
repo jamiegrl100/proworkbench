@@ -1,6 +1,6 @@
 import { countAdminTokens, verifyAdminToken } from '../auth/adminToken.js';
 
-function extractToken(req) {
+export function extractToken(req) {
   const auth = String(req.headers.authorization || '');
   const match = auth.match(/^Bearer\s+(.+)$/i);
   const legacy = String(req.headers['x-pb-admin-token'] || '');

@@ -2,6 +2,7 @@ import express from 'express';
 import { requireAuth } from './middleware.js';
 import { todayKey } from '../util/securityDaily.js';
 import { recordEvent } from '../util/events.js';
+import { createAdminToken, revokeAdminToken } from '../auth/adminToken.js';
 
 function nowIso() {
   return new Date().toISOString();
@@ -20,6 +21,20 @@ function setKv(db, key, value) {
 export function createSecurityRouter({ db }) {
   const r = express.Router();
   r.use(requireAuth(db));
+
+  r.post('/token', (req, res) => {
+    const prev = String(req.adminToken || '').trim();
+    const token = createAdminToken(db);
+    if (prev) revokeAdminToken(db, prev);
+    res.json({ ok: true, token });
+  });
+
+  r.post('/token/rotate', (req, res) => {
+    const prev = String(req.adminToken || '').trim();
+    const token = createAdminToken(db);
+    if (prev) revokeAdminToken(db, prev);
+    res.json({ ok: true, token });
+  });
 
   r.get('/summary', (req, res) => {
   try {

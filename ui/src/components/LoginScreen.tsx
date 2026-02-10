@@ -3,16 +3,10 @@ import React, { useState } from "react";
 import { clearToken, setToken } from "../auth";
 import { getJson, postJson } from "./api";
 
-type AuthState = {
-  loggedIn?: boolean;
+type SetupState = {
   tokenCount?: number;
+  setupComplete?: boolean;
 };
-
-function generateHexToken() {
-  const bytes = new Uint8Array(32);
-  window.crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
 
 export default function LoginScreen({
   initialToken,
@@ -34,8 +28,9 @@ export default function LoginScreen({
   React.useEffect(() => {
     (async () => {
       try {
-        const state = await getJson<AuthState>("/admin/auth/state");
-        setBootstrapMode(Number(state?.tokenCount || 0) === 0);
+        const state = await getJson<SetupState>("/admin/setup/state");
+        const count = Number(state?.tokenCount || 0);
+        setBootstrapMode(count === 0);
       } catch {
         setBootstrapMode(false);
       }
@@ -54,47 +49,64 @@ export default function LoginScreen({
     setInfo("");
 
     try {
-      // Requirement requested /admin/meta verification with auth header.
-      const metaRes = await fetch("/admin/meta", {
+      // Verify token against an authenticated endpoint.
+      const verifyRes = await fetch("/admin/security/summary", {
         method: "GET",
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "X-PB-Admin-Token": token,
+        },
       });
-      if (!metaRes.ok) {
-        throw new Error(`Meta check failed (HTTP ${metaRes.status}).`);
+      if (!verifyRes.ok) {
+        throw new Error(`Token check failed (HTTP ${verifyRes.status}).`);
       }
 
       setToken(token);
-      let state = await getJson<AuthState>("/admin/auth/state");
-
-      if (!state.loggedIn && Number(state.tokenCount || 0) === 0) {
-        // Fresh install: bootstrap first token using the user-provided value.
-        await postJson("/admin/setup/bootstrap", { token });
-        setBootstrapMode(false);
-        state = await getJson<AuthState>("/admin/auth/state");
-      }
-
-      if (!state.loggedIn) {
-        throw new Error("Token was rejected by server.");
-      }
-
       onAuthenticated(token);
     } catch (e: any) {
       clearToken();
       const msg = String(e?.message || e);
       setErr(msg);
-      if (/Token was rejected/i.test(msg)) {
-        setInfo("If this is a first install, use Generate token. Otherwise paste your existing admin token.");
-      }
+      setInfo("Use Generate token only on first setup (no existing tokens), or paste a known admin token.");
     } finally {
       setBusy(false);
     }
   }
 
-  function generateToken() {
-    const token = generateHexToken();
-    setTokenInput(token);
-    setInfo("Generated token in input. Click Save token to verify.");
+  async function generateToken() {
+    setBusy(true);
     setErr("");
+    setInfo("");
+    try {
+      if (bootstrapMode) {
+        const out = await postJson<{ token: string }>("/admin/setup/bootstrap", {});
+        const token = String(out?.token || "").trim();
+        if (!token) throw new Error("Bootstrap did not return a token.");
+        setTokenInput(token);
+        setToken(token);
+        onAuthenticated(token);
+        return;
+      }
+
+      const current = tokenInput.trim();
+      if (!current) {
+        throw new Error("Paste your current admin token to rotate it.");
+      }
+      setToken(current);
+      const out = await postJson<{ ok: boolean; token: string }>("/admin/security/token/rotate", {});
+      const token = String(out?.token || "").trim();
+      if (!token) throw new Error("Rotate did not return a token.");
+      setTokenInput(token);
+      setToken(token);
+      onAuthenticated(token);
+    } catch (e: any) {
+      clearToken();
+      const msg = String(e?.message || e);
+      setErr(msg);
+      if (!bootstrapMode) setInfo("Generate token requires first setup, or a valid current token for rotation.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function copyToken() {
@@ -139,11 +151,9 @@ export default function LoginScreen({
           <button onClick={verifyAndSaveToken} disabled={busy} style={{ padding: "8px 12px" }}>
             {busy ? "Saving..." : "Save token"}
           </button>
-          {bootstrapMode ? (
-            <button onClick={generateToken} disabled={busy} style={{ padding: "8px 12px" }}>
-              Generate token
-            </button>
-          ) : null}
+          <button onClick={generateToken} disabled={busy} style={{ padding: "8px 12px" }}>
+            Generate token
+          </button>
           <button onClick={copyToken} disabled={busy || !tokenInput.trim()} style={{ padding: "8px 12px" }}>
             Copy
           </button>

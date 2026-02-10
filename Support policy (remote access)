@@ -1,0 +1,55 @@
+Support policy (remote access)
+
+PB (Proworkbench) is designed as a local-first assistant: your models, tools, and data run on your own hardware, under your control. That design choice is intentional—it’s what enables PB’s “secure-by-default” posture (block-all tools, explicit approvals for risky actions, and clear visibility into what’s running).
+
+Because remote exposure dramatically increases risk (and the number of ways a setup can be misconfigured), we have a clear support boundary:
+
+What we do support
+
+We support remote access only when PB is reachable exclusively over a private network that you control, for example:
+
+A VPN / tailnet (e.g., Tailscale, WireGuard, ZeroTier)
+
+A private LAN where access is limited to trusted devices/users
+
+In these setups, PB is still not “public,” and access is constrained by:
+
+your private network membership rules, and
+
+PB’s own authentication/authorization model.
+
+What we do not support
+
+We do not provide support for exposing PB directly to the public internet, including (but not limited to):
+
+port forwarding from your router to PB
+
+opening firewall rules to “anyone on the internet”
+
+public tunnels/funnels that make PB broadly reachable (especially without strict access controls)
+
+“DM a link and anyone can access it” style deployments
+
+These configurations are high risk and can lead to unauthorized access, data exposure, or unintended tool execution. Even with good guardrails, public exposure creates a security and support burden that is out of scope for the project.
+
+If you choose to expose PB publicly anyway
+
+You’re free to experiment, but please understand:
+
+this is at your own risk
+
+we can’t troubleshoot or endorse internet-exposed deployments
+
+we may close/redirect support requests that involve public exposure configs
+
+Recommended best practice
+
+If you need remote access, keep PB private:
+
+use a tailnet/VPN,
+
+restrict access to trusted devices/users,
+
+and keep PB’s tool execution surfaces restricted to the web admin UI (as intended).
+
+If you’re unsure whether your setup is “private network only,” ask in Discussions with a high-level description (no secrets), and we’ll help you confirm whether it falls within supported configurations.

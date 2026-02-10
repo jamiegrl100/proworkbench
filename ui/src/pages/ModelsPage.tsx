@@ -10,6 +10,7 @@ const SUGGESTED_ANTHROPIC_MODELS = [
   'claude-3-sonnet-20240229',
   'claude-3-haiku-20240307',
 ];
+const REQUIRED_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
 
 export default function ModelsPage() {
   const [status, setStatus] = useState<{ baseUrl: string; mode: string; activeProfile: string | null; lastRefreshedAt: string | null } | null>(null);
@@ -98,7 +99,11 @@ export default function ModelsPage() {
     setBusy('select');
     setErr('');
     try {
-      await postJson('/admin/llm/select-model', { modelId });
+      if (providerId === 'textwebui') {
+        await postJson('/admin/runtime/textwebui/select-model', { modelId });
+      } else {
+        await postJson('/admin/llm/select-model', { modelId });
+      }
       await loadAll();
       toast('Selected model updated.');
     } catch (e: any) {
@@ -185,8 +190,16 @@ export default function ModelsPage() {
             <button disabled={busy === 'tw_models'} onClick={refreshTextWebuiModels} style={{ padding: '8px 12px' }}>
               Refresh models
             </button>
+            <button disabled={busy === 'select'} onClick={() => chooseModel(REQUIRED_MODEL)} style={{ padding: '8px 12px' }}>
+              Use required model
+            </button>
             <div style={{ fontSize: 12, opacity: 0.8 }}>{textWebuiModels.length} models</div>
           </div>
+          {textWebuiStatus?.running && textWebuiModels.length === 0 ? (
+            <div style={{ fontSize: 12, color: '#92400e' }}>
+              Text WebUI is reachable but no model is loaded. Open Text WebUI in browser, load a model, then click Refresh models.
+            </div>
+          ) : null}
           <label>
             <div style={{ fontSize: 12, opacity: 0.75 }}>Model</div>
             <select value={selectedModel || ''} onChange={(e) => chooseModel(e.target.value)} style={{ width: 420, padding: 8 }}>

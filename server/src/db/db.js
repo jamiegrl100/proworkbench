@@ -130,6 +130,118 @@ export function migrate(db) {
       next_retry_at TEXT,
       cancelled_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS tool_proposals (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      message_id TEXT,
+      tool_name TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      summary TEXT,
+      status TEXT NOT NULL,
+      requires_approval INTEGER NOT NULL DEFAULT 0,
+      approval_id INTEGER,
+      created_at TEXT NOT NULL,
+      executed_run_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS tool_runs (
+      id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      stdout TEXT,
+      stderr TEXT,
+      result_json TEXT,
+      artifacts_json TEXT,
+      error_json TEXT,
+      correlation_id TEXT NOT NULL,
+      args_hash TEXT,
+      admin_token_fingerprint TEXT,
+      approval_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS tool_approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      proposal_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT,
+      resolved_by_token_fingerprint TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS tool_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      action TEXT NOT NULL,
+      proposal_id TEXT,
+      run_id TEXT,
+      approval_id INTEGER,
+      admin_token_fingerprint TEXT,
+      notes_json TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS web_tool_proposals (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      message_id TEXT,
+      tool_name TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      summary TEXT,
+      status TEXT NOT NULL,
+      requires_approval INTEGER NOT NULL DEFAULT 0,
+      approval_id INTEGER,
+      created_at TEXT NOT NULL,
+      executed_run_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS web_tool_runs (
+      id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      stdout TEXT,
+      stderr TEXT,
+      result_json TEXT,
+      artifacts_json TEXT,
+      error_json TEXT,
+      correlation_id TEXT NOT NULL,
+      args_hash TEXT,
+      admin_token_fingerprint TEXT,
+      approval_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS web_tool_approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      proposal_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT,
+      resolved_by_token_fingerprint TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS web_tool_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      action TEXT NOT NULL,
+      proposal_id TEXT,
+      run_id TEXT,
+      approval_id INTEGER,
+      admin_token_fingerprint TEXT,
+      notes_json TEXT
+    );
   `);
 
   // Ensure admin_auth row exists

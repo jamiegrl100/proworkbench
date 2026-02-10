@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { getJson, postJson } from "../components/api";
 
-type ProposalStatus = "draft" | "generated" | "tested" | "enabled" | "rejected" | "invalid";
+type ProposalStatus = "all" | "awaiting_approval" | "ready" | "executed" | "failed" | "rejected";
 
 function jsonPretty(v: any) {
   try {
@@ -12,9 +12,6 @@ function jsonPretty(v: any) {
 }
 
 export default function ToolsPage() {
-  const [policyAvailable, setPolicyAvailable] = useState(true);
-  const [proposalsAvailable, setProposalsAvailable] = useState(true);
-  const [installedAvailable, setInstalledAvailable] = useState(true);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
@@ -22,42 +19,32 @@ export default function ToolsPage() {
   const [allowList, setAllowList] = useState("");
   const [denyList, setDenyList] = useState("");
   const [providerOverrides, setProviderOverrides] = useState("{}");
-  const [proposalStatus, setProposalStatus] = useState<ProposalStatus>("draft");
+
+  const [registry, setRegistry] = useState<any[]>([]);
+  const [proposalStatus, setProposalStatus] = useState<ProposalStatus>("all");
   const [proposals, setProposals] = useState<any[]>([]);
+  const [runs, setRuns] = useState<any[]>([]);
   const [installed, setInstalled] = useState<any[]>([]);
 
   async function load() {
     setLoading(true);
     setErr("");
     try {
-      setPolicyAvailable(true);
-      setProposalsAvailable(true);
-      setInstalledAvailable(true);
+      const [policy, reg, prop, runList, inst] = await Promise.all([
+        getJson<any>("/admin/tools/policy"),
+        getJson<any[]>("/admin/tools/registry"),
+        getJson<any[]>(`/admin/tools/proposals?status=${encodeURIComponent(proposalStatus)}`),
+        getJson<any[]>("/admin/tools/runs?limit=50"),
+        getJson<any>("/admin/tools/installed"),
+      ]);
 
-      try {
-        const p = await getJson<any>("/admin/tools/policy");
-        setAllowList((p?.allow_list_json || p?.allowList || []).join(", "));
-        setDenyList((p?.deny_list_json || p?.denyList || []).join(", "));
-        setProviderOverrides(jsonPretty(p?.per_provider_overrides_json || p?.providerOverrides || {}));
-      } catch {
-        setPolicyAvailable(false);
-      }
-
-      try {
-        const r = await getJson<any>(`/admin/tools/proposals?status=${encodeURIComponent(proposalStatus)}`);
-        setProposals(Array.isArray(r) ? r : r?.items || []);
-      } catch {
-        setProposalsAvailable(false);
-        setProposals([]);
-      }
-
-      try {
-        const i = await getJson<any>("/admin/tools/installed");
-        setInstalled(Array.isArray(i) ? i : i?.items || []);
-      } catch {
-        setInstalledAvailable(false);
-        setInstalled([]);
-      }
+      setAllowList((policy?.allow_list_json || []).join(", "));
+      setDenyList((policy?.deny_list_json || []).join(", "));
+      setProviderOverrides(jsonPretty(policy?.per_provider_overrides_json || {}));
+      setRegistry(Array.isArray(reg) ? reg : []);
+      setProposals(Array.isArray(prop) ? prop : []);
+      setRuns(Array.isArray(runList) ? runList : []);
+      setInstalled(Array.isArray(inst) ? inst : inst?.items || []);
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -110,45 +97,69 @@ export default function ToolsPage() {
 
       <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>Tool Policy</h3>
-        {!policyAvailable ? (
-          <div style={{ fontSize: 13, opacity: 0.8 }}>
-            `/admin/tools/policy` is not available on this server build.
-          </div>
+        <div style={{ fontSize: 12, opacity: 0.8 }}>
+          Tools execute on server only. Dangerous tools require explicit approval from Web Admin.
+        </div>
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>Allow list (comma-separated)</div>
+          <input value={allowList} onChange={(e) => setAllowList(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>Deny list (comma-separated)</div>
+          <input value={denyList} onChange={(e) => setDenyList(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>Provider overrides JSON</div>
+          <textarea value={providerOverrides} onChange={(e) => setProviderOverrides(e.target.value)} rows={5} style={{ width: "100%", padding: 8, fontFamily: "monospace" }} />
+        </label>
+        <div>
+          <button onClick={savePolicy} disabled={busy} style={{ padding: "8px 12px" }}>Save policy</button>
+        </div>
+      </section>
+
+      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+        <h3 style={{ margin: 0 }}>Registered Tools</h3>
+        {loading ? (
+          <div>Loading…</div>
+        ) : registry.length === 0 ? (
+          <div>No registered tools.</div>
         ) : (
-          <>
-            <label>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>Allow list (comma-separated)</div>
-              <input value={allowList} onChange={(e) => setAllowList(e.target.value)} style={{ width: "100%", padding: 8 }} />
-            </label>
-            <label>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>Deny list (comma-separated)</div>
-              <input value={denyList} onChange={(e) => setDenyList(e.target.value)} style={{ width: "100%", padding: 8 }} />
-            </label>
-            <label>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>Provider overrides JSON</div>
-              <textarea value={providerOverrides} onChange={(e) => setProviderOverrides(e.target.value)} rows={5} style={{ width: "100%", padding: 8, fontFamily: "monospace" }} />
-            </label>
-            <div>
-              <button onClick={savePolicy} disabled={busy} style={{ padding: "8px 12px" }}>Save policy</button>
-            </div>
-          </>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: "#fafafa" }}>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Tool</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Risk</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Approval</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Policy</th>
+              </tr>
+            </thead>
+            <tbody>
+              {registry.map((t) => (
+                <tr key={String(t.id)}>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>
+                    <div style={{ fontWeight: 600 }}>{t.id}</div>
+                    <div style={{ fontSize: 12, opacity: 0.75 }}>{t.description || "—"}</div>
+                  </td>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{t.risk || "—"}</td>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{t.requiresApproval ? "Required" : "Not required"}</td>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{t.policyAllowed ? "Allowed" : `Denied (${t.policyReason || "policy"})`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </section>
 
       <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>Tool Proposals</h3>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {(["draft", "generated", "tested", "enabled", "rejected", "invalid"] as ProposalStatus[]).map((s) => (
+          {(["all", "awaiting_approval", "ready", "executed", "failed", "rejected"] as ProposalStatus[]).map((s) => (
             <button key={s} onClick={() => setProposalStatus(s)} style={{ padding: "6px 10px", borderRadius: 999, border: "1px solid #ddd", background: proposalStatus === s ? "#f2f2f2" : "#fff" }}>
               {s}
             </button>
           ))}
         </div>
-        {!proposalsAvailable ? (
-          <div style={{ fontSize: 13, opacity: 0.8 }}>
-            `/admin/tools/proposals` is not available on this server build.
-          </div>
-        ) : loading ? (
+        {loading ? (
           <div>Loading…</div>
         ) : proposals.length === 0 ? (
           <div>No proposals for status `{proposalStatus}`.</div>
@@ -158,12 +169,38 @@ export default function ToolsPage() {
       </section>
 
       <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+        <h3 style={{ margin: 0 }}>Recent Tool Runs</h3>
+        {loading ? (
+          <div>Loading…</div>
+        ) : runs.length === 0 ? (
+          <div>No tool runs yet.</div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: "#fafafa" }}>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Run</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Status</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Proposal</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Started</th>
+              </tr>
+            </thead>
+            <tbody>
+              {runs.map((run) => (
+                <tr key={String(run.id)}>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.id}</td>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.status}</td>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.proposal_id}</td>
+                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.started_at}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>Installed Tools</h3>
-        {!installedAvailable ? (
-          <div style={{ fontSize: 13, opacity: 0.8 }}>
-            `/admin/tools/installed` is not available on this server build.
-          </div>
-        ) : loading ? (
+        {loading ? (
           <div>Loading…</div>
         ) : installed.length === 0 ? (
           <div>No installed tools.</div>

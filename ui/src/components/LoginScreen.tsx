@@ -49,8 +49,8 @@ export default function LoginScreen({
     setInfo("");
 
     try {
-      // Verify token against an authenticated endpoint.
-      const verifyRes = await fetch("/admin/security/summary", {
+      // Verify token against a lightweight authenticated endpoint.
+      const verifyRes = await fetch("/admin/health/auth", {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,

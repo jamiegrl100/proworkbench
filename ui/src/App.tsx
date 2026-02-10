@@ -257,6 +257,7 @@ export default function App() {
     clearToken();
     setAdminTokenState(null);
     setSwitchTokenMode(false);
+    window.location.assign("/");
   }
 
   const showLogin = adminToken == null || switchTokenMode;

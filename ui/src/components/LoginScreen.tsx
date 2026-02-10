@@ -35,6 +35,15 @@ export default function LoginScreen({
         setBootstrapMode(false);
       }
     })();
+
+    try {
+      const params = new URLSearchParams(window.location.search || "");
+      if (params.get("expired") === "1") {
+        setInfo("Session expired. Paste your admin token to continue.");
+      }
+    } catch {
+      // ignore
+    }
   }, []);
 
   async function verifyAndSaveToken() {

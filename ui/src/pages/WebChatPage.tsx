@@ -12,6 +12,8 @@ type Proposal = {
   approval_id?: number | null;
   approval_status?: string | null;
   created_at: string;
+  effective_access?: string;
+  effective_reason?: string;
 };
 
 type ToolRun = {
@@ -59,6 +61,7 @@ export default function WebChatPage() {
   const [sending, setSending] = useState(false);
   const [invoking, setInvoking] = useState<Record<string, boolean>>({});
   const [invokedRunIds, setInvokedRunIds] = useState<Record<string, string>>({});
+  const [proposalUi, setProposalUi] = useState<Record<string, { showDetails: boolean; status?: string }>>({});
   const [provider, setProvider] = useState("Text WebUI");
   const [model, setModel] = useState("—");
   const [err, setErr] = useState("");
@@ -144,6 +147,7 @@ export default function WebChatPage() {
     if (invokedRunIds[pid]) return;
 
     setInvoking((prev) => ({ ...prev, [pid]: true }));
+    setProposalUi((prev) => ({ ...prev, [pid]: { ...(prev[pid] || { showDetails: false }), status: "running" } }));
     setErr("");
     try {
       const r = await postJson<any>("/admin/tools/execute", { proposal_id: pid });
@@ -161,6 +165,7 @@ export default function WebChatPage() {
       ]);
 
       const finalRun = await pollRun(runId);
+      setProposalUi((prev) => ({ ...prev, [pid]: { ...(prev[pid] || { showDetails: false }), status: finalRun?.status || "unknown" } }));
       setMessages((prev) => [
         ...prev,
         {
@@ -179,11 +184,14 @@ export default function WebChatPage() {
         message = `${message} Open Approvals to approve this run: #/approvals`;
       } else if (code === "APPROVAL_DENIED") {
         message = `${message} Open Approvals to review or create a new proposal.`;
+      } else if (code === "TOOL_BLOCKED") {
+        message = `${message} This tool is blocked by policy.`;
       } else if (code === "TOOL_DENIED") {
         message = `${message} Update policy in Tools page if this should be allowed.`;
       }
       if (corr) message += ` (correlation: ${corr})`;
       setErr(message);
+      setProposalUi((prev) => ({ ...prev, [pid]: { ...(prev[pid] || { showDetails: false }), status: "blocked" } }));
       setMessages((prev) => [
         ...prev,
         {
@@ -255,29 +263,69 @@ export default function WebChatPage() {
                       Tool: <b>{p.tool_name}</b> • Risk: <b>{p.risk_level}</b>
                     </div>
                     <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
-                      {p.summary || "No summary"} {p.requires_approval ? "• Approval required" : ""}
+                      {p.summary || "No summary"}
                     </div>
-                    <pre
-                      style={{
-                        margin: 0,
-                        marginBottom: 8,
-                        maxHeight: 140,
-                        overflow: "auto",
-                        background: "#fafafa",
-                        border: "1px solid #eee",
-                        padding: 8,
-                        fontSize: 12,
-                      }}
-                    >
-                      {shortJson(p.args_json)}
-                    </pre>
-                    <button
-                      onClick={() => invokeTool(p)}
-                      disabled={Boolean(invoking[p.id] || invokedRunIds[p.id])}
-                      style={{ padding: "8px 12px" }}
-                    >
-                      {invoking[p.id] ? "Running..." : invokedRunIds[p.id] ? "Invoked" : "Invoke tool"}
-                    </button>
+                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 8 }}>
+                      <div style={{ fontSize: 12 }}>
+                        Status: <b>{proposalUi[p.id]?.status || p.status}</b>
+                      </div>
+                      <div style={{ fontSize: 12, opacity: 0.8 }}>
+                        Effective: <b>{String(p.effective_access || "unknown")}</b>
+                      </div>
+                      {p.requires_approval ? (
+                        <div style={{ fontSize: 12, color: "#92400e" }}>
+                          Needs approval
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button
+                        onClick={() => invokeTool(p)}
+                        disabled={Boolean(invoking[p.id] || invokedRunIds[p.id]) || p.status !== "ready"}
+                        style={{ padding: "8px 12px" }}
+                        title={p.status !== "ready" ? "This proposal is not ready to run." : ""}
+                      >
+                        {invoking[p.id] ? "Running..." : invokedRunIds[p.id] ? "Invoked" : "Invoke tool"}
+                      </button>
+                      {p.status === "awaiting_approval" ? (
+                        <button onClick={() => { window.location.hash = "#/approvals"; }} style={{ padding: "8px 12px" }}>
+                          Open Approvals
+                        </button>
+                      ) : null}
+                      <button
+                        onClick={() =>
+                          setProposalUi((prev) => ({
+                            ...prev,
+                            [p.id]: { ...(prev[p.id] || { showDetails: false }), showDetails: !(prev[p.id]?.showDetails || false) },
+                          }))
+                        }
+                        style={{ padding: "8px 12px" }}
+                      >
+                        {proposalUi[p.id]?.showDetails ? "Hide details" : "Show details"}
+                      </button>
+                    </div>
+
+                    {proposalUi[p.id]?.showDetails ? (
+                      <pre
+                        style={{
+                          margin: 0,
+                          marginTop: 8,
+                          maxHeight: 160,
+                          overflow: "auto",
+                          background: "#fafafa",
+                          border: "1px solid #eee",
+                          padding: 8,
+                          fontSize: 12,
+                        }}
+                      >
+                        {shortJson(p.args_json)}
+                      </pre>
+                    ) : (
+                      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+                        Args: <code>{Object.keys(p.args_json || {}).slice(0, 5).join(", ") || "(none)"}</code>
+                      </div>
+                    )}
                   </div>
                 ) : null}
 

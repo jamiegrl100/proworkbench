@@ -241,6 +241,7 @@ export default function App() {
     const onAuthLogout = () => {
       setAdminTokenState(null);
       setSwitchTokenMode(false);
+      window.location.assign("/login?expired=1");
     };
     const onTokenChanged = () => setAdminTokenState(getToken());
     window.addEventListener("pb-auth-logout", onAuthLogout as EventListener);
@@ -257,7 +258,7 @@ export default function App() {
     clearToken();
     setAdminTokenState(null);
     setSwitchTokenMode(false);
-    window.location.assign("/");
+    window.location.assign("/login");
   }
 
   const showLogin = adminToken == null || switchTokenMode;

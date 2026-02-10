@@ -167,20 +167,87 @@ const TOOL_REGISTRY = {
   },
 };
 
-function isToolAllowedByPolicy(db, toolId) {
-  const denyList = Array.isArray(kvGet(db, 'tools.deny_list_json', []))
-    ? kvGet(db, 'tools.deny_list_json', [])
-    : [];
-  const allowList = Array.isArray(kvGet(db, 'tools.allow_list_json', []))
-    ? kvGet(db, 'tools.allow_list_json', [])
-    : [];
-  if (denyList.includes('*') || denyList.includes(toolId)) {
-    return { allowed: false, reason: 'Tool is denied by policy.' };
+const ACCESS_MODES = ['blocked', 'allowed', 'allowed_with_approval'];
+
+function defaultPolicyV2() {
+  return {
+    version: 2,
+    global_default: 'blocked',
+    per_risk: {
+      low: 'blocked',
+      medium: 'blocked',
+      high: 'blocked',
+      critical: 'blocked',
+    },
+    per_tool: {},
+    provider_overrides: {},
+    updated_at: nowIso(),
+  };
+}
+
+function normalizeAccessMode(v) {
+  const s = String(v || '').trim();
+  return ACCESS_MODES.includes(s) ? s : null;
+}
+
+function normalizePolicyV2(raw) {
+  const base = defaultPolicyV2();
+  if (!raw || typeof raw !== 'object') return base;
+
+  const globalDefault = normalizeAccessMode(raw.global_default) || base.global_default;
+  const perRisk = raw.per_risk && typeof raw.per_risk === 'object' ? raw.per_risk : {};
+
+  const next = {
+    version: 2,
+    global_default: globalDefault,
+    per_risk: {
+      low: normalizeAccessMode(perRisk.low) || base.per_risk.low,
+      medium: normalizeAccessMode(perRisk.medium) || base.per_risk.medium,
+      high: normalizeAccessMode(perRisk.high) || base.per_risk.high,
+      critical: normalizeAccessMode(perRisk.critical) || base.per_risk.critical,
+    },
+    per_tool: raw.per_tool && typeof raw.per_tool === 'object' ? raw.per_tool : {},
+    provider_overrides: raw.provider_overrides && typeof raw.provider_overrides === 'object' ? raw.provider_overrides : {},
+    updated_at: String(raw.updated_at || '').trim() || nowIso(),
+  };
+
+  // Clean per_tool values.
+  const cleaned = {};
+  for (const [k, v] of Object.entries(next.per_tool || {})) {
+    const mode = normalizeAccessMode(v);
+    if (mode) cleaned[String(k)] = mode;
   }
-  if (allowList.length > 0 && !allowList.includes(toolId)) {
-    return { allowed: false, reason: 'Tool is not in allow-list policy.' };
-  }
-  return { allowed: true, reason: 'allowed' };
+  next.per_tool = cleaned;
+
+  return next;
+}
+
+function getPolicyV2(db) {
+  const current = kvGet(db, 'tools.policy_v2', null);
+  const normalized = normalizePolicyV2(current);
+  if (!current) kvSet(db, 'tools.policy_v2', normalized); // ensure persisted default = BLOCK ALL
+  return normalized;
+}
+
+function setPolicyV2(db, policy) {
+  const normalized = normalizePolicyV2({ ...policy, updated_at: nowIso() });
+  kvSet(db, 'tools.policy_v2', normalized);
+  return normalized;
+}
+
+function effectiveAccessForTool(policy, toolDef) {
+  const risk = String(toolDef?.risk || 'low');
+  const perRisk = policy?.per_risk || {};
+  const perTool = policy?.per_tool || {};
+
+  let mode = normalizeAccessMode(policy?.global_default) || 'blocked';
+  mode = normalizeAccessMode(perRisk[risk]) || mode;
+  mode = normalizeAccessMode(perTool[toolDef.id]) || mode;
+
+  const requiresApproval = mode === 'allowed_with_approval';
+  const allowed = mode === 'allowed' || requiresApproval;
+  const reason = mode === 'blocked' ? 'Blocked by policy' : (requiresApproval ? 'Allowed with approval' : 'Allowed');
+  return { allowed, requiresApproval, mode, reason };
 }
 
 async function executeRegisteredTool({ toolName, args, workdir }) {
@@ -253,6 +320,9 @@ function insertWebToolAudit(db, action, adminToken, extra = {}) {
 
 function toProposalResponse(db, row) {
   if (!row) return null;
+  const toolDef = TOOL_REGISTRY[row.tool_name] || { id: row.tool_name, risk: row.risk_level };
+  const policy = getPolicyV2(db);
+  const eff = effectiveAccessForTool(policy, toolDef);
   const approval = row.approval_id
     ? db.prepare('SELECT id, status, reason, created_at, resolved_at FROM web_tool_approvals WHERE id = ?').get(row.approval_id)
     : null;
@@ -270,6 +340,8 @@ function toProposalResponse(db, row) {
     approval_status: approval?.status || null,
     executed_run_id: row.executed_run_id || null,
     created_at: row.created_at,
+    effective_access: eff.mode,
+    effective_reason: eff.reason,
   };
 }
 
@@ -296,8 +368,14 @@ function createProposal(db, { sessionId, messageId, toolName, args, summary }) {
   if (!def) return null;
   const proposalId = newId('prop');
   const createdAt = nowIso();
-  const requiresApproval = def.requiresApproval ? 1 : 0;
+  const policy = getPolicyV2(db);
+  const eff = effectiveAccessForTool(policy, def);
+  const requiresApproval = eff.requiresApproval ? 1 : 0;
   const riskLevel = def.risk;
+
+  const status =
+    eff.mode === 'blocked' ? 'blocked' :
+      (requiresApproval ? 'awaiting_approval' : 'ready');
 
   db.prepare(`
     INSERT INTO web_tool_proposals
@@ -311,14 +389,14 @@ function createProposal(db, { sessionId, messageId, toolName, args, summary }) {
     JSON.stringify(args || {}),
     riskLevel,
     summary || '',
-    requiresApproval ? 'awaiting_approval' : 'ready',
+    status,
     requiresApproval,
     null,
     createdAt
   );
 
   let approvalId = null;
-  if (requiresApproval) {
+  if (requiresApproval && status !== 'blocked') {
     const info = db.prepare(`
       INSERT INTO web_tool_approvals
         (proposal_id, tool_name, args_json, risk_level, status, reason, created_at, resolved_at, resolved_by_token_fingerprint)
@@ -602,11 +680,14 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         SET status = 'approved', resolved_at = ?, resolved_by_token_fingerprint = ?, reason = NULL
         WHERE id = ?
       `).run(nowIso(), tokenFingerprint(req.adminToken), Number(parsed.id));
-      db.prepare(`
-        UPDATE web_tool_proposals
-        SET status = 'ready'
-        WHERE approval_id = ?
-      `).run(Number(parsed.id));
+      // Approval can only move proposal to ready if policy currently allows it.
+      const prop = db.prepare('SELECT * FROM web_tool_proposals WHERE approval_id = ?').get(Number(parsed.id));
+      if (prop) {
+        const def = TOOL_REGISTRY[prop.tool_name] || { id: prop.tool_name, risk: prop.risk_level };
+        const eff = effectiveAccessForTool(getPolicyV2(db), def);
+        const nextStatus = eff.mode === 'blocked' ? 'blocked' : 'ready';
+        db.prepare('UPDATE web_tool_proposals SET status = ? WHERE approval_id = ?').run(nextStatus, Number(parsed.id));
+      }
       insertWebToolAudit(db, 'APPROVAL_APPROVE', req.adminToken, { approval_id: Number(parsed.id) });
       recordEvent(db, 'tool.approval.approved', { approval_id: Number(parsed.id) });
       return res.json({ ok: true });
@@ -652,39 +733,51 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/tools/registry', (_req, res) => {
+    const policy = getPolicyV2(db);
     const rows = Object.values(TOOL_REGISTRY).map((t) => {
-      const policy = isToolAllowedByPolicy(db, t.id);
+      const eff = effectiveAccessForTool(policy, t);
       return {
         id: t.id,
         label: t.label,
         risk: t.risk,
         requiresApproval: t.requiresApproval,
         description: t.description,
-        policyAllowed: policy.allowed,
-        policyReason: policy.reason,
+        effective_access: eff.mode,
+        effective_reason: eff.reason,
+        allowed: eff.allowed,
+        requires_approval: eff.requiresApproval,
       };
     });
     res.json(rows);
   });
 
-  r.get('/tools/policy', (_req, res) => {
-    res.json({
-      allow_list_json: kvGet(db, 'tools.allow_list_json', []),
-      deny_list_json: kvGet(db, 'tools.deny_list_json', []),
-      per_provider_overrides_json: kvGet(db, 'tools.per_provider_overrides_json', {}),
+  r.get('/tools', (_req, res) => {
+    const policy = getPolicyV2(db);
+    const tools = Object.values(TOOL_REGISTRY).map((t) => {
+      const eff = effectiveAccessForTool(policy, t);
+      const override = normalizeAccessMode(policy?.per_tool?.[t.id]) || null;
+      return {
+        id: t.id,
+        label: t.label,
+        description: t.description,
+        risk: t.risk,
+        baseline_requires_approval: Boolean(t.requiresApproval),
+        effective_access: eff.mode,
+        effective_reason: eff.reason,
+        override_access: override,
+      };
     });
+    res.json({ ok: true, policy, tools });
+  });
+
+  r.get('/tools/policy', (_req, res) => {
+    const policy = getPolicyV2(db);
+    res.json({ ok: true, policy });
   });
 
   r.post('/tools/policy', (req, res) => {
-    const allowList = Array.isArray(req.body?.allow_list_json) ? req.body.allow_list_json.map((v) => String(v)) : [];
-    const denyList = Array.isArray(req.body?.deny_list_json) ? req.body.deny_list_json.map((v) => String(v)) : [];
-    const overrides = req.body?.per_provider_overrides_json && typeof req.body.per_provider_overrides_json === 'object'
-      ? req.body.per_provider_overrides_json
-      : {};
-    kvSet(db, 'tools.allow_list_json', allowList);
-    kvSet(db, 'tools.deny_list_json', denyList);
-    kvSet(db, 'tools.per_provider_overrides_json', overrides);
-    res.json({ ok: true });
+    const policy = setPolicyV2(db, req.body?.policy || req.body);
+    res.json({ ok: true, policy });
   });
 
   r.get('/tools/proposals', (req, res) => {
@@ -715,17 +808,36 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     const proposal = toProposalResponse(db, proposalRow);
     const correlationId = newId('corr');
 
+    if (proposal.status === 'blocked') {
+      return res.status(403).json({
+        ok: false,
+        code: 'TOOL_BLOCKED',
+        error: 'This tool is blocked by policy.',
+        correlation_id: correlationId,
+      });
+    }
+    if (proposal.status === 'rejected') {
+      return res.status(403).json({
+        ok: false,
+        code: 'APPROVAL_DENIED',
+        error: 'This tool run was denied in Approvals.',
+        approval_id: proposal.approval_id || null,
+        correlation_id: correlationId,
+      });
+    }
+
     if (proposal.executed_run_id) {
       const existing = db.prepare('SELECT * FROM web_tool_runs WHERE id = ?').get(proposal.executed_run_id);
       return res.json({ ok: true, idempotent: true, run_id: proposal.executed_run_id, run: toRunResponse(existing) });
     }
 
-    const policy = isToolAllowedByPolicy(db, proposal.tool_name);
-    if (!policy.allowed) {
+    const def = TOOL_REGISTRY[proposal.tool_name] || { id: proposal.tool_name, risk: proposal.risk_level };
+    const eff = effectiveAccessForTool(getPolicyV2(db), def);
+    if (!eff.allowed) {
       return res.status(403).json({
         ok: false,
         code: 'TOOL_DENIED',
-        error: policy.reason,
+        error: 'Tool is blocked by policy.',
         correlation_id: correlationId,
       });
     }

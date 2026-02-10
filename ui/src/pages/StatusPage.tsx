@@ -3,12 +3,19 @@ import React from 'react';
 import Card from '../components/Card';
 import type { SetupState } from '../types';
 
-export default function StatusPage({ setup }: { setup: SetupState | null }) {
+export default function StatusPage({ setup, error }: { setup: SetupState | null; error?: string }) {
   return (
     <div style={{ padding: 16 }}>
       <h2 style={{ marginTop: 0 }}>Status</h2>
       {!setup ? (
-        <div>Loading…</div>
+        <div>
+          {error ? (
+            <div style={{ color: '#b00020', marginBottom: 8 }}>
+              Unable to load `/admin/setup/state`: {error}
+            </div>
+          ) : null}
+          <div>{error ? 'Waiting for valid admin token...' : 'Loading…'}</div>
+        </div>
       ) : (
         <div style={{ display: 'grid', gap: 10, maxWidth: 760 }}>
           <Card title="Telegram">

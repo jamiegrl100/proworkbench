@@ -17,6 +17,18 @@ export function countAdminTokens(db) {
 
 export function createAdminToken(db, { ttlDays = 365 } = {}) {
   const token = randomToken();
+  return storeAdminToken(db, token, { ttlDays });
+}
+
+export function createAdminTokenWithValue(db, token, { ttlDays = 365 } = {}) {
+  const cleaned = String(token || '').trim();
+  if (!/^[a-f0-9]{64}$/i.test(cleaned)) {
+    throw new Error('Token must be 64 hex characters.');
+  }
+  return storeAdminToken(db, cleaned, { ttlDays });
+}
+
+function storeAdminToken(db, token, { ttlDays = 365 } = {}) {
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString();
   db.prepare(

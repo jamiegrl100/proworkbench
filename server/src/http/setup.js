@@ -1,6 +1,6 @@
 import express from 'express';
 import { requireAuthOrBootstrap } from './middleware.js';
-import { countAdminTokens, createAdminToken } from '../auth/adminToken.js';
+import { countAdminTokens, createAdminToken, createAdminTokenWithValue } from '../auth/adminToken.js';
 import { readEnvFile, writeEnvFile, envConfigured, normalizeAllowedChatIds } from '../util/envStore.js';
 
 function getKv(db, key, fallback) {
@@ -32,13 +32,18 @@ export function createSetupRouter({ db, dataDir, telegram, slack }) {
     });
   });
 
-  r.post('/bootstrap', (_req, res) => {
+  r.post('/bootstrap', (req, res) => {
     const count = countAdminTokens(db);
     if (count > 0) {
       return res.status(409).json({ error: 'Bootstrap already completed.' });
     }
-    const token = createAdminToken(db);
-    return res.json({ token });
+    try {
+      const requestedToken = String(req.body?.token || '').trim();
+      const token = requestedToken ? createAdminTokenWithValue(db, requestedToken) : createAdminToken(db);
+      return res.json({ token });
+    } catch (e) {
+      return res.status(400).json({ error: String(e?.message || e) });
+    }
   });
 
   r.post('/secrets', (req, res) => {

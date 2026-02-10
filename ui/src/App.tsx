@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 
-import { getJson, postJson } from "./components/api";
+import { clearToken, getToken } from "./auth";
+import LoginScreen from "./components/LoginScreen";
+import { getJson } from "./components/api";
 import type { SetupState } from "./types";
 import StatusPage from "./pages/StatusPage";
 import DiagnosticsPage from "./pages/DiagnosticsPage";
@@ -37,11 +39,6 @@ type NavItem = {
   badge?: number;
 };
 
-type AuthState = {
-  loggedIn?: boolean;
-  tokenCount?: number;
-};
-
 const ALLOWED_PAGES = new Set<PageKey>([
   "status",
   "diagnostics",
@@ -70,23 +67,25 @@ function navigate(page: PageKey) {
   if (window.location.hash !== next) window.location.hash = next;
 }
 
-function tokenFingerprint() {
-  const t = localStorage.getItem("pb_admin_token") || "";
-  if (!t) return "not set";
-  if (t.length <= 12) return t;
-  return `${t.slice(0, 6)}...${t.slice(-4)}`;
+function tokenFingerprint(token: string | null) {
+  if (!token) return "not set";
+  if (token.length <= 12) return token;
+  return `${token.slice(0, 6)}...${token.slice(-4)}`;
 }
 
-export default function App() {
+function AdminShell({
+  adminToken,
+  onLogout,
+  onSwitchToken,
+}: {
+  adminToken: string;
+  onLogout: () => void;
+  onSwitchToken: () => void;
+}) {
   const [page, setPage] = useState<PageKey>(() => getHashPage());
   const [setup, setSetup] = useState<SetupState | null>(null);
   const [setupError, setSetupError] = useState("");
-  const [auth, setAuth] = useState<AuthState>({});
   const [pendingBadge, setPendingBadge] = useState<number>(0);
-  const [showTokenModal, setShowTokenModal] = useState(false);
-  const [tokenInput, setTokenInput] = useState("");
-  const [unauthorized, setUnauthorized] = useState(false);
-  const [tokenErr, setTokenErr] = useState("");
 
   useEffect(() => {
     const onHash = () => setPage(getHashPage());
@@ -96,20 +95,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const onUnauthorized = () => setUnauthorized(true);
-    window.addEventListener("pb:unauthorized", onUnauthorized as EventListener);
-    return () => window.removeEventListener("pb:unauthorized", onUnauthorized as EventListener);
-  }, []);
-
-  useEffect(() => {
     (async () => {
-      try {
-        const a = await getJson<AuthState>("/admin/auth/state");
-        setAuth(a || {});
-      } catch {
-        setAuth({});
-      }
-
       try {
         const s = await getJson<SetupState>("/admin/setup/state");
         setSetup(s);
@@ -119,7 +105,7 @@ export default function App() {
         setSetupError(String(e?.message || e));
       }
     })();
-  }, []);
+  }, [adminToken]);
 
   const nav = useMemo<NavItem[]>(
     () => [
@@ -139,21 +125,6 @@ export default function App() {
     ],
     [pendingBadge]
   );
-
-  async function generateToken() {
-    setTokenErr("");
-    try {
-      const out = await postJson<{ token?: string }>("/admin/setup/bootstrap", {});
-      if (out?.token) {
-        localStorage.setItem("pb_admin_token", out.token);
-        window.location.reload();
-        return;
-      }
-      setTokenErr("Bootstrap did not return a token.");
-    } catch (e: any) {
-      setTokenErr(String(e?.message || e));
-    }
-  }
 
   const content = (() => {
     switch (page) {
@@ -221,7 +192,17 @@ export default function App() {
               >
                 <span>{item.label}</span>
                 {item.badge ? (
-                  <span style={{ background: "#ef4444", color: "#fff", borderRadius: 999, minWidth: 18, textAlign: "center", fontSize: 11, padding: "1px 6px" }}>
+                  <span
+                    style={{
+                      background: "#ef4444",
+                      color: "#fff",
+                      borderRadius: 999,
+                      minWidth: 18,
+                      textAlign: "center",
+                      fontSize: 11,
+                      padding: "1px 6px",
+                    }}
+                  >
                     {item.badge}
                   </span>
                 ) : null}
@@ -231,22 +212,15 @@ export default function App() {
         </div>
 
         <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
-          <div style={{ fontSize: 12, opacity: 0.8 }}>Token: {tokenFingerprint()}</div>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>Token: {tokenFingerprint(adminToken)}</div>
           <button
-            onClick={() => {
-              setTokenErr("");
-              setTokenInput(localStorage.getItem("pb_admin_token") || "");
-              setShowTokenModal(true);
-            }}
+            onClick={onSwitchToken}
             style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
           >
             Switch token
           </button>
           <button
-            onClick={() => {
-              localStorage.removeItem("pb_admin_token");
-              window.location.reload();
-            }}
+            onClick={onLogout}
             style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
           >
             Logout
@@ -254,59 +228,57 @@ export default function App() {
         </div>
       </aside>
 
-      <main style={{ flex: 1 }}>
-        {unauthorized ? (
-          <div style={{ margin: 16, padding: 12, border: "1px solid #f8d39b", background: "#fff8ed", borderRadius: 10 }}>
-            <b>Unauthorized</b>. Set `pb_admin_token` using Switch token or generate one in bootstrap mode.
-            <button onClick={() => setShowTokenModal(true)} style={{ marginLeft: 8, padding: "4px 8px" }}>
-              Switch token
-            </button>
-          </div>
-        ) : null}
-
-        {!auth?.loggedIn && auth?.tokenCount ? (
-          <div style={{ margin: 16, padding: 12, border: "1px solid #f8d39b", background: "#fff8ed", borderRadius: 10 }}>
-            Existing admin token detected. Paste it with Switch token.
-          </div>
-        ) : null}
-
-        <div style={{ padding: 18 }}>{content}</div>
-      </main>
-
-      {showTokenModal ? (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", display: "grid", placeItems: "center" }}>
-          <div style={{ width: 420, background: "#fff", borderRadius: 12, padding: 16, boxShadow: "0 10px 30px rgba(0,0,0,0.2)" }}>
-            <h3 style={{ marginTop: 0 }}>Switch admin token</h3>
-            <input
-              value={tokenInput}
-              onChange={(e) => setTokenInput(e.target.value)}
-              placeholder="paste pb_admin_token"
-              style={{ width: "100%", padding: 8, marginBottom: 12 }}
-            />
-            {tokenErr ? <div style={{ color: "#b00020", marginBottom: 10 }}>{tokenErr}</div> : null}
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-              <button onClick={generateToken} style={{ padding: "6px 10px" }}>
-                Generate token
-              </button>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button onClick={() => setShowTokenModal(false)} style={{ padding: "6px 10px" }}>
-                  Cancel
-                </button>
-                <button
-                  onClick={() => {
-                    if (tokenInput.trim()) localStorage.setItem("pb_admin_token", tokenInput.trim());
-                    setShowTokenModal(false);
-                    window.location.reload();
-                  }}
-                  style={{ padding: "6px 10px" }}
-                >
-                  Save
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <main style={{ flex: 1, padding: 18 }}>{content}</main>
     </div>
+  );
+}
+
+export default function App() {
+  const [adminToken, setAdminTokenState] = useState<string | null>(getToken());
+  const [switchTokenMode, setSwitchTokenMode] = useState(false);
+
+  useEffect(() => {
+    const onAuthLogout = () => {
+      setAdminTokenState(null);
+      setSwitchTokenMode(false);
+    };
+    const onTokenChanged = () => setAdminTokenState(getToken());
+    window.addEventListener("pb-auth-logout", onAuthLogout as EventListener);
+    window.addEventListener("pb-auth-token-changed", onTokenChanged as EventListener);
+    window.addEventListener("storage", onTokenChanged);
+    return () => {
+      window.removeEventListener("pb-auth-logout", onAuthLogout as EventListener);
+      window.removeEventListener("pb-auth-token-changed", onTokenChanged as EventListener);
+      window.removeEventListener("storage", onTokenChanged);
+    };
+  }, []);
+
+  function logout() {
+    clearToken();
+    setAdminTokenState(null);
+    setSwitchTokenMode(false);
+  }
+
+  const showLogin = adminToken == null || switchTokenMode;
+  if (showLogin) {
+    return (
+      <LoginScreen
+        initialToken={adminToken}
+        onAuthenticated={(token) => {
+          setAdminTokenState(token);
+          setSwitchTokenMode(false);
+        }}
+        allowCancel={Boolean(adminToken && switchTokenMode)}
+        onCancel={() => setSwitchTokenMode(false)}
+      />
+    );
+  }
+
+  return (
+    <AdminShell
+      adminToken={adminToken}
+      onLogout={logout}
+      onSwitchToken={() => setSwitchTokenMode(true)}
+    />
   );
 }

@@ -1,7 +1,16 @@
-function authHeaders(url: string) {
+import { clearToken, getToken } from "../auth";
+
+export class UnauthorizedError extends Error {
+  constructor(message = "UNAUTHORIZED") {
+    super(message);
+    this.name = "UnauthorizedError";
+  }
+}
+
+function authHeaders(_url: string) {
   const headers: Record<string, string> = {};
-  const token = localStorage.getItem('pb_admin_token');
-  if (token && url.startsWith('/admin')) headers.Authorization = `Bearer ${token}`;
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
 
@@ -10,7 +19,9 @@ async function parseResponse<T>(r: Response): Promise<T> {
   const json = txt ? (() => { try { return JSON.parse(txt); } catch { return null; } })() : null;
   if (!r.ok) {
     if (r.status === 401) {
-      window.dispatchEvent(new Event('pb:unauthorized'));
+      clearToken();
+      window.dispatchEvent(new Event("pb-auth-logout"));
+      throw new UnauthorizedError(json?.error || txt || "UNAUTHORIZED");
     }
     const err = new Error(json?.error || txt || `${r.status}`);
     (err as any).detail = json;

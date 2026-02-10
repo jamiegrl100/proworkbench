@@ -1,7 +1,7 @@
 import express from 'express';
 import { requireAuth } from './middleware.js';
 
-export function createEventsRouter({ db, csrfProtection }) {
+export function createEventsRouter({ db }) {
   const r = express.Router();
   r.use(requireAuth(db));
 
@@ -25,7 +25,7 @@ export function createEventsRouter({ db, csrfProtection }) {
     res.json({ events, types });
   });
 
-  r.post('/clear', csrfProtection, (req, res) => {
+  r.post('/clear', (req, res) => {
     db.prepare('DELETE FROM security_events').run();
     res.json({ ok: true });
   });

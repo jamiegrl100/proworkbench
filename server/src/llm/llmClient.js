@@ -76,8 +76,8 @@ async function fetchJsonWithTimeout(url, options, timeoutMs) {
 }
 
 export async function llmChatOnce({ db, messageText, timeoutMs = 60_000 }) {
-  const providerId = kvGet(db, 'llm.providerId', 'lmstudio');
-  const baseUrl = normalizeBaseUrl(kvGet(db, 'llm.baseUrl', providerId === 'openai' ? 'https://api.openai.com' : (providerId === 'anthropic' ? 'https://api.anthropic.com' : (process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:1234'))));
+  const providerId = kvGet(db, 'llm.providerId', 'textwebui');
+  const baseUrl = normalizeBaseUrl(kvGet(db, 'llm.baseUrl', providerId === 'openai' ? 'https://api.openai.com' : (providerId === 'anthropic' ? 'https://api.anthropic.com' : (process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:5000'))));
   const profile = kvGet(db, 'llm.activeProfile', null); // 'openai' | 'gateway' | 'anthropic' | null
   const model = getDefaultModel(db);
 

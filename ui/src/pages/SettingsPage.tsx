@@ -5,7 +5,7 @@ import { getJson, postJson } from '../components/api';
 
 declare function toast(msg: string): void;
 
-export default function SettingsPage({ csrf }: { csrf: string }) {
+export default function SettingsPage() {
   const [clientId, setClientId] = useState('');
   const [clientSecret, setClientSecret] = useState('');
 
@@ -34,15 +34,11 @@ export default function SettingsPage({ csrf }: { csrf: string }) {
     setBusy('save');
     setErr('');
     try {
-      await postJson(
-        '/admin/settings/advanced',
-        {
-          unknown_autoblock_violations: unknownViolations,
-          unknown_autoblock_window_minutes: unknownWindow,
-          rate_limit_per_minute: ratePerMinute,
-        },
-        csrf
-      );
+      await postJson('/admin/settings/advanced', {
+        unknown_autoblock_violations: unknownViolations,
+        unknown_autoblock_window_minutes: unknownWindow,
+        rate_limit_per_minute: ratePerMinute,
+      });
       toast('Saved advanced settings. Restart recommended.');
       await load();
     } catch (e: any) {

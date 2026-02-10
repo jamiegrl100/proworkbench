@@ -22,6 +22,13 @@ export function migrate(db) {
       created_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS admin_tokens (
+      token TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      last_used_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS sessions (
       sid TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -130,4 +137,6 @@ export function migrate(db) {
   if (!row) {
     db.prepare('INSERT INTO admin_auth (id, password_hash, created_at) VALUES (1, NULL, NULL)').run();
   }
+
+  db.prepare('DELETE FROM admin_tokens WHERE datetime(expires_at) <= datetime(?)').run(new Date().toISOString());
 }

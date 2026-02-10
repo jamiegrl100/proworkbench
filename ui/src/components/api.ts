@@ -1,17 +1,34 @@
-export async function getJson<T>(url: string): Promise<T> {
-  const r = await fetch(url, { credentials: 'include' });
-  if (!r.ok) throw new Error(`${r.status}`);
-  return r.json();
+function authHeaders(url: string) {
+  const headers: Record<string, string> = {};
+  const token = localStorage.getItem('pb_admin_token');
+  if (token && url.startsWith('/admin')) headers.Authorization = `Bearer ${token}`;
+  return headers;
 }
 
-export async function postJson<T>(url: string, body: any, csrfToken: string): Promise<T> {
+async function parseResponse<T>(r: Response): Promise<T> {
+  const txt = await r.text();
+  const json = txt ? (() => { try { return JSON.parse(txt); } catch { return null; } })() : null;
+  if (!r.ok) {
+    if (r.status === 401) {
+      window.dispatchEvent(new Event('pb:unauthorized'));
+    }
+    const err = new Error(json?.error || txt || `${r.status}`);
+    (err as any).detail = json;
+    throw err;
+  }
+  return (json ?? ({} as T)) as T;
+}
+
+export async function getJson<T>(url: string): Promise<T> {
+  const r = await fetch(url, { headers: authHeaders(url) });
+  return parseResponse<T>(r);
+}
+
+export async function postJson<T>(url: string, body: any, _csrfToken?: string): Promise<T> {
   const r = await fetch(url, {
     method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(url) },
     body: JSON.stringify(body),
   });
-  const txt = await r.text();
-  if (!r.ok) throw new Error(txt || `${r.status}`);
-  return txt ? JSON.parse(txt) : ({} as T);
+  return parseResponse<T>(r);
 }

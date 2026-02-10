@@ -1,7 +1,7 @@
 import express from 'express';
 import { requireAuth } from './middleware.js';
 
-export function createAdminRouter({ db, csrfProtection, telegram, slack, dataDir }) {
+export function createAdminRouter({ db, telegram, slack, dataDir }) {
   const r = express.Router();
   r.use(requireAuth(db));
 
@@ -14,20 +14,20 @@ export function createAdminRouter({ db, csrfProtection, telegram, slack, dataDir
     res.json({ allowed, pending, blocked, pendingCount: pending.length, pendingCap: 500, pendingOverflowActive });
   });
 
-  r.post('/telegram/:chatId/approve', csrfProtection, (req, res) => {
+  r.post('/telegram/:chatId/approve', (req, res) => {
     const chatId = req.params.chatId;
     telegram.approve(chatId);
     res.json({ ok: true });
   });
 
-  r.post('/telegram/:chatId/block', csrfProtection, (req, res) => {
+  r.post('/telegram/:chatId/block', (req, res) => {
     const chatId = req.params.chatId;
     const reason = req.body?.reason || 'manual';
     telegram.block(chatId, reason);
     res.json({ ok: true });
   });
 
-  r.post('/telegram/:chatId/restore', csrfProtection, (req, res) => {
+  r.post('/telegram/:chatId/restore', (req, res) => {
     const chatId = req.params.chatId;
     telegram.restore(chatId);
     res.json({ ok: true });
@@ -37,7 +37,7 @@ r.get('/telegram/worker/status', (req, res) => {
   res.json({ running: Boolean(telegram.state?.running), startedAt: telegram.state?.startedAt || null, lastError: telegram.state?.lastError || null });
 });
 
-r.post('/telegram/worker/start', csrfProtection, async (req, res) => {
+r.post('/telegram/worker/start', async (req, res) => {
   try {
     await telegram.startIfReady();
     res.json({ ok: true, running: Boolean(telegram.state?.running) });
@@ -46,7 +46,7 @@ r.post('/telegram/worker/start', csrfProtection, async (req, res) => {
   }
 });
 
-r.post('/telegram/worker/restart', csrfProtection, async (req, res) => {
+r.post('/telegram/worker/restart', async (req, res) => {
   try {
     telegram.stopNow();
     await telegram.startIfReady();
@@ -56,7 +56,7 @@ r.post('/telegram/worker/restart', csrfProtection, async (req, res) => {
   }
 });
 
-r.post('/telegram/worker/stop', csrfProtection, (req, res) => {
+r.post('/telegram/worker/stop', (req, res) => {
   try {
     telegram.stopNow();
     res.json({ ok: true, running: Boolean(telegram.state?.running) });
@@ -74,37 +74,37 @@ r.get('/slack/users', (req, res) => {
   res.json({ allowed, pending, blocked, pendingCount: pending.length, pendingCap: 500 });
 });
 
-r.post('/slack/:userId/approve', csrfProtection, (req, res) => {
+r.post('/slack/:userId/approve', (req, res) => {
   slack.approve(req.params.userId);
   res.json({ ok: true });
 });
 
-r.post('/slack/:userId/block', csrfProtection, (req, res) => {
+r.post('/slack/:userId/block', (req, res) => {
   slack.block(req.params.userId, req.body?.reason || 'manual');
   res.json({ ok: true });
 });
 
-r.post('/slack/:userId/restore', csrfProtection, (req, res) => {
+r.post('/slack/:userId/restore', (req, res) => {
   slack.restore(req.params.userId);
   res.json({ ok: true });
 });
 
 r.get('/slack/worker/status', (_req, res) => res.json(slack.meta()));
-r.post('/slack/worker/start', csrfProtection, async (_req, res) => {
+r.post('/slack/worker/start', async (_req, res) => {
   try { await slack.startIfReady(); res.json({ ok: true, ...slack.meta() }); }
   catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e) }); }
 });
-r.post('/slack/worker/restart', csrfProtection, async (_req, res) => {
+r.post('/slack/worker/restart', async (_req, res) => {
   try { await slack.restart(); res.json({ ok: true, ...slack.meta() }); }
   catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e) }); }
 });
-r.post('/slack/worker/stop', csrfProtection, (_req, res) => {
+r.post('/slack/worker/stop', (_req, res) => {
   try { slack.stopNow(); res.json({ ok: true, ...slack.meta() }); }
   catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e) }); }
 });
 
 
-r.post('/settings/advanced', csrfProtection, (req, res) => {
+r.post('/settings/advanced', (req, res) => {
   try {
     const { unknown_autoblock_violations, unknown_autoblock_window_minutes, rate_limit_per_minute } = req.body || {};
 

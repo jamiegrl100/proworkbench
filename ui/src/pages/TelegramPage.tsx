@@ -4,7 +4,7 @@ import Table from '../components/Table';
 import { getJson, postJson } from '../components/api';
 import type { TelegramUsersResponse } from '../types';
 
-export default function TelegramPage({ csrf, onPendingBadge }: { csrf: string; onPendingBadge: (n: number | null) => void }) {
+export default function TelegramPage({ onPendingBadge }: { onPendingBadge: (n: number | null) => void }) {
   const [data, setData] = useState<TelegramUsersResponse | null>(null);
   const [worker, setWorker] = useState<{ running: boolean; startedAt: string | null; lastError: string | null } | null>(null);
   const [tab, setTab] = useState<'pending' | 'allowed' | 'blocked'>('pending');
@@ -39,7 +39,7 @@ export default function TelegramPage({ csrf, onPendingBadge }: { csrf: string; o
     setBusy(true);
     setErr('');
     try {
-      await postJson('/admin/telegram/worker/start', {}, csrf);
+      await postJson('/admin/telegram/worker/start', {});
       await refresh();
       toast('Worker started.');
     } catch (e: any) {
@@ -53,7 +53,7 @@ export default function TelegramPage({ csrf, onPendingBadge }: { csrf: string; o
     setBusy(true);
     setErr('');
     try {
-      await postJson('/admin/telegram/worker/restart', {}, csrf);
+      await postJson('/admin/telegram/worker/restart', {});
       await refresh();
       toast('Worker restarted.');
     } catch (e: any) {
@@ -67,7 +67,7 @@ export default function TelegramPage({ csrf, onPendingBadge }: { csrf: string; o
     setBusy(true);
     setErr('');
     try {
-      await postJson('/admin/telegram/worker/stop', {}, csrf);
+      await postJson('/admin/telegram/worker/stop', {});
       await refresh();
       toast('Worker stopped.');
     } catch (e: any) {
@@ -86,7 +86,7 @@ export default function TelegramPage({ csrf, onPendingBadge }: { csrf: string; o
     setBusy(true);
     setErr('');
     try {
-      await postJson(url, body || {}, csrf);
+      await postJson(url, body || {});
       await refresh();
     } catch (e: any) {
       setErr(String(e?.message || e));

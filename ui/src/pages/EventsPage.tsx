@@ -4,7 +4,7 @@ import Card from '../components/Card';
 import { downloadCsv } from '../components/csv';
 import { getJson, postJson } from '../components/api';
 
-export default function EventsPage({ csrf }: { csrf: string }) {
+export default function EventsPage() {
   const [events, setEvents] = useState<any[]>([]);
   const [types, setTypes] = useState<{ type: string; c: number }[]>([]);
   const [typeFilter, setTypeFilter] = useState<string>('');
@@ -46,7 +46,7 @@ export default function EventsPage({ csrf }: { csrf: string }) {
     setBusy('clear');
     setErr('');
     try {
-      await postJson('/admin/events/clear', {}, csrf);
+      await postJson('/admin/events/clear', {});
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));

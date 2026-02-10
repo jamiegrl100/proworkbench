@@ -17,7 +17,7 @@ function setKv(db, key, value) {
     .run(key, JSON.stringify(value));
 }
 
-export function createSecurityRouter({ db, csrfProtection }) {
+export function createSecurityRouter({ db }) {
   const r = express.Router();
   r.use(requireAuth(db));
 
@@ -153,7 +153,7 @@ export function createSecurityRouter({ db, csrfProtection }) {
   }
 });
 
-  r.post('/report/run', csrfProtection, (req, res) => {
+  r.post('/report/run', (req, res) => {
     const { critical } = req.body || {};
     const isCritical = Boolean(critical);
 

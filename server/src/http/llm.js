@@ -60,17 +60,17 @@ async function fetchJson(url, { method, headers, body }, trace, pathForTrace) {
 }
 
 function getProviderId(db) {
-  return getKv(db, 'llm.providerId', 'lmstudio'); // lmstudio | openai | anthropic
+  return getKv(db, 'llm.providerId', 'textwebui'); // textwebui | openai | anthropic
 }
 
 function getProviderName(db) {
   const id = getProviderId(db);
-  return getKv(db, 'llm.providerName', id === 'openai' ? 'OpenAI' : (id === 'anthropic' ? 'Anthropic' : 'LM Studio'));
+  return getKv(db, 'llm.providerName', id === 'openai' ? 'OpenAI' : (id === 'anthropic' ? 'Anthropic' : 'Text WebUI'));
 }
 
 function getProviderGroup(db) {
   const id = getProviderId(db);
-  return getKv(db, 'llm.providerGroup', id === 'lmstudio' ? 'Local' : 'API');
+  return getKv(db, 'llm.providerGroup', id === 'textwebui' ? 'Local' : 'API');
 }
 
 function getBaseUrl(db) {
@@ -79,7 +79,7 @@ function getBaseUrl(db) {
   const providerId = getProviderId(db);
   if (providerId === 'openai') return 'https://api.openai.com';
   if (providerId === 'anthropic') return 'https://api.anthropic.com';
-  return process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:1234';
+  return process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:5000';
 }
 
 function getMode(db) {
@@ -107,7 +107,7 @@ function autoSelectDefaultModel(db, candidateIds) {
   return preferred;
 }
 
-export function createLlmRouter({ db, csrfProtection, dataDir }) {
+export function createLlmRouter({ db, dataDir }) {
   const r = express.Router();
   r.use(requireAuth(db));
 
@@ -140,7 +140,7 @@ export function createLlmRouter({ db, csrfProtection, dataDir }) {
     });
   });
 
-  r.post('/config', csrfProtection, (req, res) => {
+  r.post('/config', (req, res) => {
     const { providerId, providerName, providerGroup, baseUrl, mode } = req.body || {};
 
     if (providerId) setKv(db, 'llm.providerId', String(providerId));
@@ -157,7 +157,7 @@ export function createLlmRouter({ db, csrfProtection, dataDir }) {
     res.json({ ok: true });
   });
 
-  r.post('/set-api-keys', csrfProtection, (req, res) => {
+  r.post('/set-api-keys', (req, res) => {
     const { openaiApiKey, anthropicApiKey } = req.body || {};
     const updates = {};
 
@@ -172,7 +172,7 @@ export function createLlmRouter({ db, csrfProtection, dataDir }) {
     res.json({ ok: true });
   });
 
-  r.post('/test', csrfProtection, async (req, res) => {
+  r.post('/test', async (req, res) => {
     const providerId = getProviderId(db);
     const baseUrl = normalizeBaseUrl(getBaseUrl(db));
     const mode = getMode(db);
@@ -210,7 +210,7 @@ export function createLlmRouter({ db, csrfProtection, dataDir }) {
 
         activeProfile = 'anthropic';
       } else {
-        // LM Studio local: autodetect
+        // Local OpenAI-compatible: autodetect
         if (mode === 'force_openai') {
           const out = await fetchJson(baseUrl + '/v1/models', { method: 'GET', headers: {} }, trace, '/v1/models');
           saveTrace(db, trace, 'openai', out.ok);
@@ -243,7 +243,7 @@ export function createLlmRouter({ db, csrfProtection, dataDir }) {
     }
   });
 
-  r.post('/refresh-models', csrfProtection, async (req, res) => {
+  r.post('/refresh-models', async (req, res) => {
     const providerId = getProviderId(db);
     const baseUrl = normalizeBaseUrl(getBaseUrl(db));
     const activeProfile = getKv(db, 'llm.activeProfile', null);
@@ -276,7 +276,7 @@ const selected = autoSelectDefaultModel(db, candidateIds);
 
         models = parseModelsFromOpenAi(out.json);
       } else {
-        // LM Studio local: use detected profile
+        // Local OpenAI-compatible: use detected profile
         const path = activeProfile === 'gateway' ? '/api/v1/models' : '/v1/models';
         const out = await fetchJson(baseUrl + path, { method: 'GET', headers: {} }, trace, path);
         saveTrace(db, trace, activeProfile || 'openai', out.ok);
@@ -310,14 +310,14 @@ const selected = autoSelectDefaultModel(db, candidateIds);
     res.json({ models: rows, selectedModel });
   });
 
-  r.post('/select-model', csrfProtection, (req, res) => {
+  r.post('/select-model', (req, res) => {
     const { modelId } = req.body || {};
     if (!modelId || !String(modelId).trim()) return res.status(400).json({ ok: false, error: 'modelId required' });
     setKv(db, 'llm.selectedModel', String(modelId).trim());
     res.json({ ok: true });
   });
 
-  r.post('/add-custom-model', csrfProtection, (req, res) => {
+  r.post('/add-custom-model', (req, res) => {
     const { modelId } = req.body || {};
     if (!modelId || !String(modelId).trim()) return res.status(400).json({ ok: false, error: 'modelId required' });
 

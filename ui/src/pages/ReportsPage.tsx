@@ -4,7 +4,7 @@ import Card from '../components/Card';
 import { downloadCsv } from '../components/csv';
 import { getJson, postJson } from '../components/api';
 
-export default function ReportsPage({ csrf }: { csrf: string }) {
+export default function ReportsPage() {
   const [summary, setSummary] = useState<any>(null);
   const [reports, setReports] = useState<any[]>([]);
   const [err, setErr] = useState('');
@@ -26,7 +26,7 @@ export default function ReportsPage({ csrf }: { csrf: string }) {
     setBusy(kind);
     setErr('');
     try {
-      await postJson('/admin/security/report/run', { critical: kind === 'critical' }, csrf);
+      await postJson('/admin/security/report/run', { critical: kind === 'critical' });
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));

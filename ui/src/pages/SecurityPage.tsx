@@ -5,7 +5,7 @@ import { getJson, postJson } from '../components/api';
 
 declare function toast(msg: string): void;
 
-export default function SecurityPage({ csrf }: { csrf: string }) {
+export default function SecurityPage() {
   const [summary, setSummary] = useState<any>(null);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState('');
@@ -88,7 +88,7 @@ export default function SecurityPage({ csrf }: { csrf: string }) {
               setBusy('restart');
               setErr('');
               try {
-                await postJson('/admin/telegram/worker/restart', {}, csrf);
+                await postJson('/admin/telegram/worker/restart', {});
                 toast('Worker restarted.');
               } catch (e: any) {
                 setErr(String(e?.message || e));

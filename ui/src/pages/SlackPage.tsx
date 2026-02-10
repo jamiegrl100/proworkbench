@@ -6,7 +6,7 @@ import { getJson, postJson } from '../components/api';
 
 declare function toast(msg: string): void;
 
-export default function SlackPage({ csrf }: { csrf: string }) {
+export default function SlackPage() {
   const [data, setData] = useState<any>({ allowed: [], pending: [], blocked: [] });
   const [status, setStatus] = useState<any>({ running: false, startedAt: null, lastError: null });
   const [botToken, setBotToken] = useState('');
@@ -32,7 +32,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson('/setup/slack-oauth-secrets', { SLACK_CLIENT_ID: clientId, SLACK_CLIENT_SECRET: clientSecret }, csrf);
+      await postJson('/setup/slack-oauth-secrets', { SLACK_CLIENT_ID: clientId, SLACK_CLIENT_SECRET: clientSecret });
       setClientId('');
       setClientSecret('');
       toast('Slack OAuth secrets saved.');
@@ -51,7 +51,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson('/setup/slack-secrets', { SLACK_BOT_TOKEN: botToken, SLACK_APP_TOKEN: appToken, SLACK_SIGNING_SECRET: signingSecret }, csrf);
+      await postJson('/setup/slack-secrets', { SLACK_BOT_TOKEN: botToken, SLACK_APP_TOKEN: appToken, SLACK_SIGNING_SECRET: signingSecret });
       setBotToken('');
       setAppToken('');
       setSigningSecret('');
@@ -68,7 +68,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson('/admin/slack/worker/start', {}, csrf);
+      await postJson('/admin/slack/worker/start', {});
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -80,7 +80,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson('/admin/slack/worker/stop', {}, csrf);
+      await postJson('/admin/slack/worker/stop', {});
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -92,7 +92,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson('/admin/slack/worker/restart', {}, csrf);
+      await postJson('/admin/slack/worker/restart', {});
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -105,7 +105,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson(`/admin/slack/${encodeURIComponent(userId)}/approve`, {}, csrf);
+      await postJson(`/admin/slack/${encodeURIComponent(userId)}/approve`, {});
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -117,7 +117,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson(`/admin/slack/${encodeURIComponent(userId)}/block`, { reason: 'manual' }, csrf);
+      await postJson(`/admin/slack/${encodeURIComponent(userId)}/block`, { reason: 'manual' });
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -129,7 +129,7 @@ export default function SlackPage({ csrf }: { csrf: string }) {
     setBusy(true);
     setErr('');
     try {
-      await postJson(`/admin/slack/${encodeURIComponent(userId)}/restore`, {}, csrf);
+      await postJson(`/admin/slack/${encodeURIComponent(userId)}/restore`, {});
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));

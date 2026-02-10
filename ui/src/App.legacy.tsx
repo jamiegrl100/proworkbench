@@ -119,8 +119,8 @@
   const [tgToken, setTgToken] = useState('');
   const [allowedIds, setAllowedIds] = useState('');
 
-  const [providerId, setProviderId] = useState<'lmstudio' | 'openai' | 'anthropic'>('lmstudio');
-  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:1234');
+  const [providerId, setProviderId] = useState<'textwebui' | 'openai' | 'anthropic'>('textwebui');
+  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:5000');
   const [mode, setMode] = useState<'auto' | 'force_openai' | 'force_gateway'>('auto');
   const [testing, setTesting] = useState(false);
   const [activeProfile, setActiveProfile] = useState<'openai' | 'gateway' | null>(null);
@@ -128,7 +128,7 @@
 
   useEffect(() => {
     getJson<SetupState>('/admin/setup/state').then(s => {
-      setBaseUrl(s.llm.baseUrl || 'http://127.0.0.1:1234');
+      setBaseUrl(s.llm.baseUrl || 'http://127.0.0.1:5000');
       setMode(s.llm.mode || 'auto');
       setActiveProfile(s.llm.activeProfile);
       setLastRefreshedAt(s.llm.lastRefreshedAt);
@@ -711,8 +711,8 @@ function ModelsPage({ csrf }: { csrf: string }) {
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [trace, setTrace] = useState<any[]>([]);
 
-  const [providerId, setProviderId] = useState<'lmstudio' | 'openai' | 'anthropic'>('lmstudio');
-  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:1234');
+  const [providerId, setProviderId] = useState<'textwebui' | 'openai' | 'anthropic'>('textwebui');
+  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:5000');
   const [mode, setMode] = useState<'auto' | 'force_openai' | 'force_gateway'>('auto');
   const [customModel, setCustomModel] = useState('');
   const [openaiApiKey, setOpenaiApiKey] = useState('');
@@ -740,7 +740,7 @@ const [busy, setBusy] = useState('');
     setErr('');
     const s = await getJson<any>('/admin/llm/status');
     setStatus(s);
-    setProviderId(s.providerId || 'lmstudio');
+    setProviderId(s.providerId || 'textwebui');
     setBaseUrl(s.baseUrl);
     setMode(s.mode);
     setOpenaiApiKey('');
@@ -760,8 +760,8 @@ const [busy, setBusy] = useState('');
     setBusy('save');
     setErr('');
     try {
-      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'LM Studio');
-      const providerGroup = providerId === 'lmstudio' ? 'Local' : 'API';
+      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'Text WebUI');
+      const providerGroup = providerId === 'textwebui' ? 'Local' : 'API';
       await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode }, csrf);
       await loadAll();
       toast('Saved provider settings.');
@@ -776,8 +776,8 @@ const [busy, setBusy] = useState('');
     setBusy('test');
     setErr('');
     try {
-      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'LM Studio');
-      const providerGroup = providerId === 'lmstudio' ? 'Local' : 'API';
+      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'Text WebUI');
+      const providerGroup = providerId === 'textwebui' ? 'Local' : 'API';
       await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode }, csrf);
       const t = await postJson<any>('/admin/llm/test', {}, csrf);
       if (!t.ok) throw new Error(t.error || 'LLM test failed');
@@ -871,9 +871,9 @@ async function saveKeys() {
               setProviderId(v);
               if (v === 'openai') setBaseUrl('https://api.openai.com');
               if (v === 'anthropic') setBaseUrl('https://api.anthropic.com');
-              if (v === 'lmstudio') setBaseUrl('http://127.0.0.1:1234');
+              if (v === 'textwebui') setBaseUrl('http://127.0.0.1:5000');
             }} style={{ width: 320, padding: 8 }}>
-              <option value="lmstudio">Local: LM Studio</option>
+              <option value="textwebui">Local: Text WebUI</option>
               <option value="openai">API: OpenAI</option>
               <option value="anthropic">API: Anthropic</option>
             </select>
@@ -883,7 +883,7 @@ async function saveKeys() {
             <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} style={{ width: '100%', padding: 8 }} />
           </label>
 
-          {providerId === 'lmstudio' ? (
+          {providerId === 'textwebui' ? (
           <label>
             <div style={{ fontSize: 12, opacity: 0.75 }}>Endpoint mode (Advanced)</div>
             <select value={mode} onChange={(e) => setMode(e.target.value as any)} style={{ width: 320, padding: 8 }}>

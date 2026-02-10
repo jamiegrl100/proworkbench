@@ -158,7 +158,7 @@ const state = {
     }
     if (trimmed === '/status') {
       const providerGroup = kvGet(db, 'llm.providerGroup', 'Local');
-      const providerName = kvGet(db, 'llm.providerName', 'LM Studio');
+      const providerName = kvGet(db, 'llm.providerName', 'Text WebUI');
       const profile = kvGet(db, 'llm.activeProfile', null);
       const endpoint =
         providerName === 'Anthropic'

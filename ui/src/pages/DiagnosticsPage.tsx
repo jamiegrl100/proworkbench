@@ -46,15 +46,6 @@ export default function DiagnosticsPage() {
         },
       },
       {
-        id: 'csrf',
-        title: 'Auth: /admin/auth/csrf',
-        run: async () => {
-          const data: any = await withTimeout(getJson('/admin/auth/csrf'), t);
-          const ok = Boolean(data?.csrf);
-          return { ok, message: ok ? 'csrf token present' : 'csrf missing' };
-        },
-      },
-      {
         id: 'telegram_worker',
         title: 'Telegram: worker status',
         run: async () => {

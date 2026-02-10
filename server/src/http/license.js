@@ -22,7 +22,7 @@ function kvDel(db, key) {
   db.prepare('DELETE FROM app_kv WHERE key = ?').run(key);
 }
 
-export function createLicenseRouter({ db, csrfProtection }) {
+export function createLicenseRouter({ db }) {
   const r = express.Router();
   r.use(requireAuth(db));
 
@@ -34,7 +34,7 @@ export function createLicenseRouter({ db, csrfProtection }) {
         res.json({ ok: true, keyPresent: Boolean(key), status, publicKey: { source, fingerprint: publicKeyFingerprint(pem), missing: status.reason === 'public_key_missing' } });
   });
 
-  r.post('/activate', csrfProtection, (req, res) => {
+  r.post('/activate', (req, res) => {
     const { key } = req.body || {};
         const { pem } = loadPublicKeyPem();
     const status = verifyLicenseKey(String(key || ''), { publicKeyPem: pem });
@@ -43,7 +43,7 @@ export function createLicenseRouter({ db, csrfProtection }) {
     res.json({ ok: true, status });
   });
 
-  r.post('/clear', csrfProtection, (req, res) => {
+  r.post('/clear', (req, res) => {
     kvDel(db, 'license.key');
     res.json({ ok: true });
   });

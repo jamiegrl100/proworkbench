@@ -11,19 +11,21 @@ const SUGGESTED_ANTHROPIC_MODELS = [
   'claude-3-haiku-20240307',
 ];
 
-export default function ModelsPage({ csrf }: { csrf: string }) {
+export default function ModelsPage() {
   const [status, setStatus] = useState<{ baseUrl: string; mode: string; activeProfile: string | null; lastRefreshedAt: string | null } | null>(null);
   const [models, setModels] = useState<{ id: string; source: string; discovered_at: string }[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [trace, setTrace] = useState<any[]>([]);
 
-  const [providerId, setProviderId] = useState<'lmstudio' | 'openai' | 'anthropic'>('lmstudio');
-  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:1234');
+  const [providerId, setProviderId] = useState<'textwebui' | 'openai' | 'anthropic'>('textwebui');
+  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:5000');
   const [mode, setMode] = useState<'auto' | 'force_openai' | 'force_gateway'>('auto');
   const [customModel, setCustomModel] = useState('');
   const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [anthropicApiKey, setAnthropicApiKey] = useState('');
   const [showAllModels, setShowAllModels] = useState(false);
+  const [textWebuiStatus, setTextWebuiStatus] = useState<{ running: boolean; ready: boolean; baseUrl: string; models: string[]; error?: string } | null>(null);
+  const [textWebuiModels, setTextWebuiModels] = useState<string[]>([]);
 
   const [busy, setBusy] = useState('');
 
@@ -38,7 +40,7 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
     setErr('');
     const s = await getJson<any>('/admin/llm/status');
     setStatus(s);
-    setProviderId(s.providerId || 'lmstudio');
+    setProviderId(s.providerId || 'textwebui');
     setBaseUrl(s.baseUrl);
     setMode(s.mode);
     setOpenaiApiKey('');
@@ -48,6 +50,9 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
     setSelectedModel(m.selectedModel || null);
     const t = await getJson<any>('/admin/llm/trace');
     setTrace(t.trace || []);
+    const tw = await getJson<any>('/admin/runtime/textwebui/status');
+    setTextWebuiStatus(tw);
+    setTextWebuiModels(tw.models || []);
   }
 
   useEffect(() => {
@@ -58,9 +63,9 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
     setBusy('save');
     setErr('');
     try {
-      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'LM Studio');
-      const providerGroup = providerId === 'lmstudio' ? 'Local' : 'API';
-      await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode }, csrf);
+      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'Text WebUI');
+      const providerGroup = providerId === 'textwebui' ? 'Local' : 'API';
+      await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode });
       await loadAll();
       toast('Saved provider settings.');
     } catch (e: any) {
@@ -74,12 +79,12 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
     setBusy('test');
     setErr('');
     try {
-      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'LM Studio');
-      const providerGroup = providerId === 'lmstudio' ? 'Local' : 'API';
-      await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode }, csrf);
-      const t = await postJson<any>('/admin/llm/test', {}, csrf);
+      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'Text WebUI');
+      const providerGroup = providerId === 'textwebui' ? 'Local' : 'API';
+      await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode });
+      const t = await postJson<any>('/admin/llm/test', {});
       if (!t.ok) throw new Error(t.error || 'LLM test failed');
-      const r = await postJson<any>('/admin/llm/refresh-models', {}, csrf);
+      const r = await postJson<any>('/admin/llm/refresh-models', {});
       if (!r.ok) throw new Error(r.error || 'Model refresh failed');
       await loadAll();
     } catch (e: any) {
@@ -93,7 +98,7 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
     setBusy('select');
     setErr('');
     try {
-      await postJson('/admin/llm/select-model', { modelId }, csrf);
+      await postJson('/admin/llm/select-model', { modelId });
       await loadAll();
       toast('Selected model updated.');
     } catch (e: any) {
@@ -107,7 +112,7 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
     setBusy('keys');
     setErr('');
     try {
-      await postJson('/admin/llm/set-api-keys', { openaiApiKey, anthropicApiKey }, csrf);
+      await postJson('/admin/llm/set-api-keys', { openaiApiKey, anthropicApiKey });
       setOpenaiApiKey('');
       setAnthropicApiKey('');
       await loadAll();
@@ -123,10 +128,26 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
     setBusy('custom');
     setErr('');
     try {
-      await postJson('/admin/llm/add-custom-model', { modelId: customModel }, csrf);
+      await postJson('/admin/llm/add-custom-model', { modelId: customModel });
       setCustomModel('');
       await loadAll();
       toast('Added custom model.');
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function refreshTextWebuiModels() {
+    setBusy('tw_models');
+    setErr('');
+    try {
+      const r = await getJson<any>('/admin/runtime/textwebui/models');
+      setTextWebuiModels(r.models || []);
+      const s = await getJson<any>('/admin/runtime/textwebui/status');
+      setTextWebuiStatus(s);
+      toast('Refreshed Text WebUI models.');
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -150,6 +171,34 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
         </div>
       ) : null}
 
+      <Card title="Text WebUI (local)">
+        <div style={{ display: 'grid', gap: 10 }}>
+          <div style={{ fontSize: 13, opacity: 0.85 }}>
+            Start Text WebUI manually on port 5000: <code>./start_linux.sh --api --api-port 5000 --listen-host 127.0.0.1</code>
+          </div>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+            <div>Status: <b>{textWebuiStatus?.running ? (textWebuiStatus.ready ? 'Ready' : 'Running') : 'Not running'}</b></div>
+            <div>Base URL: <code>{textWebuiStatus?.baseUrl || 'http://127.0.0.1:5000'}</code></div>
+            {textWebuiStatus?.error ? <div style={{ color: '#b00020' }}>{textWebuiStatus.error}</div> : null}
+          </div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <button disabled={busy === 'tw_models'} onClick={refreshTextWebuiModels} style={{ padding: '8px 12px' }}>
+              Refresh models
+            </button>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>{textWebuiModels.length} models</div>
+          </div>
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.75 }}>Model</div>
+            <select value={selectedModel || ''} onChange={(e) => chooseModel(e.target.value)} style={{ width: 420, padding: 8 }}>
+              <option value="" disabled>Select a model</option>
+              {textWebuiModels.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </Card>
+
       <Card title="Provider">
         <div style={{ display: 'grid', gap: 10 }}>
           {providerId === 'anthropic' ? (
@@ -170,11 +219,11 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
                 setProviderId(v);
                 if (v === 'openai') setBaseUrl('https://api.openai.com');
                 if (v === 'anthropic') setBaseUrl('https://api.anthropic.com');
-                if (v === 'lmstudio') setBaseUrl('http://127.0.0.1:1234');
+                if (v === 'textwebui') setBaseUrl('http://127.0.0.1:5000');
               }}
               style={{ width: 320, padding: 8 }}
             >
-              <option value="lmstudio">Local: LM Studio</option>
+              <option value="textwebui">Local: Text WebUI</option>
               <option value="openai">API: OpenAI</option>
               <option value="anthropic">API: Anthropic</option>
             </select>
@@ -184,7 +233,7 @@ export default function ModelsPage({ csrf }: { csrf: string }) {
             <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} style={{ width: '100%', padding: 8 }} />
           </label>
 
-          {providerId === 'lmstudio' ? (
+          {providerId === 'textwebui' ? (
             <label>
               <div style={{ fontSize: 12, opacity: 0.75 }}>Endpoint mode (Advanced)</div>
               <select value={mode} onChange={(e) => setMode(e.target.value as any)} style={{ width: 320, padding: 8 }}>

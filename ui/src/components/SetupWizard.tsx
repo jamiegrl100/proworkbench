@@ -4,7 +4,7 @@ import Card from './Card';
 import { getJson, postJson } from './api';
 import type { SetupState } from '../types';
 
-export default function SetupWizard({ csrf, onConfigured }: { csrf: string; onConfigured: () => void }) {
+export default function SetupWizard({ onConfigured }: { onConfigured: () => void }) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [err, setErr] = useState<string>('');
 
@@ -12,8 +12,8 @@ export default function SetupWizard({ csrf, onConfigured }: { csrf: string; onCo
   const [tgToken, setTgToken] = useState('');
   const [allowedIds, setAllowedIds] = useState('');
 
-  const [providerId, setProviderId] = useState<'lmstudio' | 'openai' | 'anthropic'>('lmstudio');
-  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:1234');
+  const [providerId, setProviderId] = useState<'textwebui' | 'openai' | 'anthropic'>('textwebui');
+  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:5000');
   const [mode, setMode] = useState<'auto' | 'force_openai' | 'force_gateway'>('auto');
   const [testing, setTesting] = useState(false);
   const [activeProfile, setActiveProfile] = useState<'openai' | 'gateway' | null>(null);
@@ -21,7 +21,7 @@ export default function SetupWizard({ csrf, onConfigured }: { csrf: string; onCo
 
   useEffect(() => {
     getJson<SetupState>('/admin/setup/state').then((s) => {
-      setBaseUrl(s.llm.baseUrl || 'http://127.0.0.1:1234');
+      setBaseUrl(s.llm.baseUrl || 'http://127.0.0.1:5000');
       setMode(s.llm.mode || 'auto');
       setActiveProfile(s.llm.activeProfile);
       setLastRefreshedAt(s.llm.lastRefreshedAt);
@@ -36,8 +36,7 @@ export default function SetupWizard({ csrf, onConfigured }: { csrf: string; onCo
         BOT_API_TOKEN: botApiToken,
         TELEGRAM_BOT_TOKEN: tgToken,
         TELEGRAM_ALLOWED_CHAT_IDS: allowedIds,
-      },
-      csrf
+      }
     );
     setStep(2);
   }
@@ -46,11 +45,11 @@ export default function SetupWizard({ csrf, onConfigured }: { csrf: string; onCo
     setErr('');
     setTesting(true);
     try {
-      await postJson('/admin/setup/llm', { baseUrl, mode }, csrf);
-      const t = await postJson<{ ok: boolean; activeProfile: 'openai' | 'gateway' | null }>('/admin/llm/test', {}, csrf);
+      await postJson('/admin/setup/llm', { baseUrl, mode });
+      const t = await postJson<{ ok: boolean; activeProfile: 'openai' | 'gateway' | null }>('/admin/llm/test', {});
       if (!t.ok || !t.activeProfile) throw new Error('LLM test failed');
       setActiveProfile(t.activeProfile);
-      const rm = await postJson<{ ok: boolean; modelCount: number; lastRefreshedAt: string }>('/admin/llm/refresh-models', {}, csrf);
+      const rm = await postJson<{ ok: boolean; modelCount: number; lastRefreshedAt: string }>('/admin/llm/refresh-models', {});
       setLastRefreshedAt(rm.lastRefreshedAt);
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -61,7 +60,7 @@ export default function SetupWizard({ csrf, onConfigured }: { csrf: string; onCo
 
   async function finish() {
     setErr('');
-    await postJson('/admin/setup/complete', {}, csrf);
+    await postJson('/admin/setup/complete', {});
     onConfigured();
   }
 

@@ -3,8 +3,10 @@ import React, { useEffect, useState } from 'react';
 import Card from '../components/Card';
 import { downloadCsv } from '../components/csv';
 import { getJson, postJson } from '../components/api';
+import { useI18n } from '../i18n/LanguageProvider';
 
 export default function EventsPage() {
+  const { t } = useI18n();
   const [events, setEvents] = useState<any[]>([]);
   const [types, setTypes] = useState<{ type: string; c: number }[]>([]);
   const [typeFilter, setTypeFilter] = useState<string>('');
@@ -33,16 +35,19 @@ export default function EventsPage() {
   }, [typeFilter]);
 
   const qLower = query.trim().toLowerCase();
-  const typeFiltered = !showAllTypes && defaultTypes.length > 0 ? events.filter((e) => defaultTypes.includes(e.type)) : events;
+  const typeFiltered = typeFilter
+    ? events
+    : (!showAllTypes && defaultTypes.length > 0 ? events.filter((e) => defaultTypes.includes(e.type)) : events);
   const filteredEvents = qLower
     ? typeFiltered.filter((ev) => {
         const hay = `${ev.ts} ${ev.type} ${JSON.stringify(ev.payload ?? {})}`.toLowerCase();
         return hay.includes(qLower);
       })
     : typeFiltered;
+  const typeOptions = types.map((x) => ({ value: x.type, label: `${x.type} (${x.c})` }));
 
   async function clearAll() {
-    if (!confirm('Clear all events?')) return;
+    if (!confirm(t('events.confirmClearAll'))) return;
     setBusy('clear');
     setErr('');
     try {
@@ -57,28 +62,28 @@ export default function EventsPage() {
 
   return (
     <div style={{ padding: 16, maxWidth: 1100 }}>
-      <h2 style={{ marginTop: 0 }}>Events</h2>
+      <h2 style={{ marginTop: 0 }}>{t('page.events.title')}</h2>
       {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
 
-      <Card title="Filters">
+      <Card title={t('events.filters.title')}>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           <label>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>Type</div>
+            <div style={{ fontSize: 12, opacity: 0.75 }}>{t('events.filters.type')}</div>
             <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} style={{ width: 320, padding: 8 }}>
-              <option value="">All</option>
-              {types.map((t) => (
-                <option key={t.type} value={t.type}>
-                  {t.type} ({t.c})
+              <option value="">{t('events.filters.all')}</option>
+              {typeOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
                 </option>
               ))}
             </select>
           </label>
 
           <button disabled={!!busy} onClick={() => load()} style={{ padding: '8px 12px' }}>
-            Refresh
+            {t('common.refresh')}
           </button>
           <button disabled={!!busy} onClick={clearAll} style={{ padding: '8px 12px' }}>
-            Clear
+            {t('common.clear')}
           </button>
           <button
             disabled={events.length === 0}
@@ -88,21 +93,26 @@ export default function EventsPage() {
             }}
             style={{ padding: '8px 12px' }}
           >
-            Download CSV
+            {t('events.downloadCsv')}
           </button>
 
-          <div style={{ fontSize: 12, opacity: 0.8 }}>Showing {filteredEvents.length} / {events.length} (max 500)</div>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>{t('events.showing', { shown: filteredEvents.length, total: events.length })}</div>
         </div>
       </Card>
 
-      <Card title="Recent events">
+      <Card title={t('events.recent.title')}>
+        {filteredEvents.length === 0 ? (
+          <div style={{ marginBottom: 10, padding: 10, border: '1px solid #e5e7eb', borderRadius: 10, background: '#fafafa', fontSize: 13 }}>
+            {typeFilter ? t('events.emptyHelpForType', { type: typeFilter }) : t('events.emptyHelp')}
+          </div>
+        ) : null}
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr>
                 {['ts', 'type', 'summary'].map((h) => (
                   <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
-                    {h}
+                    {t(`events.col.${h}`)}
                   </th>
                 ))}
               </tr>
@@ -117,6 +127,13 @@ export default function EventsPage() {
                   </td>
                 </tr>
               ))}
+              {filteredEvents.length === 0 ? (
+                <tr>
+                  <td colSpan={3} style={{ padding: '12px 6px', opacity: 0.8 }}>
+                    {typeFilter ? t('events.emptyForType', { type: typeFilter }) : t('events.empty')}
+                  </td>
+                </tr>
+              ) : null}
             </tbody>
           </table>
         </div>

@@ -38,8 +38,13 @@ export function writeEnvFile(dataDir, updates) {
 }
 
 export function envConfigured(env) {
-  const required = ['BOT_API_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_ALLOWED_CHAT_IDS'];
-  return required.every(k => Boolean(env[k] && String(env[k]).trim().length > 0));
+  const hasBotApi = Boolean(env.BOT_API_TOKEN && String(env.BOT_API_TOKEN).trim().length > 0);
+  const hasTelegramToken = Boolean(env.TELEGRAM_BOT_TOKEN && String(env.TELEGRAM_BOT_TOKEN).trim().length > 0);
+  const hasAllowlist = Boolean(
+    (env.TELEGRAM_ALLOWED_USER_IDS && String(env.TELEGRAM_ALLOWED_USER_IDS).trim().length > 0) ||
+    (env.TELEGRAM_ALLOWED_CHAT_IDS && String(env.TELEGRAM_ALLOWED_CHAT_IDS).trim().length > 0)
+  );
+  return hasBotApi && hasTelegramToken && hasAllowlist;
 }
 
 export function normalizeAllowedChatIds(raw) {

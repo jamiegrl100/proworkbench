@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-label="MCP Servers screenshot placeholder">
+  <rect width="1200" height="675" fill="#0b1220"/>
+  <rect x="56" y="56" width="1088" height="563" rx="18" fill="#0f172a" stroke="#1f2937"/>
+  <text x="96" y="140" fill="#e5e7eb" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-size="40" font-weight="800">
+    MCP Servers
+  </text>
+  <text x="96" y="188" fill="#cbd5e1" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-size="18">
+    Placeholder screenshot. Replace with a real PB MCP Servers page image.
+  </text>
+  <rect x="96" y="236" width="1008" height="58" rx="12" fill="#111827"/>
+  <text x="126" y="274" fill="#38bdf8" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="16">
+    15 presets • Create • Test • Start/Stop • Logs • Approvals gating
+  </text>
+  <rect x="96" y="320" width="1008" height="226" rx="12" fill="#0b1220" stroke="#1f2937"/>
+  <text x="126" y="374" fill="#94a3b8" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-size="16">
+    TODO: drop a real screenshot at assets/screenshots/mcp-servers.png and update README/docs.
+  </text>
+</svg>
+

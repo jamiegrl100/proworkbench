@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "git_readonly",
+  "name": "Git (Read-only)",
+  "description": "Read git status/log/diff in a limited repo folder.",
+  "risk": "medium",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": false,
+  "fields": [
+    { "key": "repoPath", "label": "Repo folder", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": ["git"]
+  }
+}
+

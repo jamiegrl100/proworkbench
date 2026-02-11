@@ -26,6 +26,7 @@ export type TelegramUser = {
 
 export type TelegramUsersResponse = {
   allowed: TelegramUser[];
+  allowlist?: string[];
   pending: TelegramUser[];
   blocked: TelegramUser[];
   pendingCount: number;

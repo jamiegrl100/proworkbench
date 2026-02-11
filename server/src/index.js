@@ -21,6 +21,10 @@ import { createTelegramWorkerController } from './telegram/worker.js';
 import { createSlackWorkerController } from './slack/worker.js';
 import { meta } from './util/meta.js';
 import { createRuntimeTextWebuiRouter } from './http/runtimeTextWebui.js';
+import { seedMcpTemplates } from './mcp/seedTemplates.js';
+import { createMcpRouter } from './http/mcp.js';
+import { createDoctorRouter } from './http/doctor.js';
+import { createCanvasRouter } from './http/canvas.js';
 
 const app = express();
 
@@ -40,6 +44,12 @@ const db = openDb(dataDir);
 migrate(db);
 console.log(`Admin token DB: ${dbPath}`);
 console.log(`Admin tokens count: ${countAdminTokens(db)}`);
+try {
+  const seeded = seedMcpTemplates(db);
+  console.log(`MCP templates seeded: ${seeded.seeded || 0}`);
+} catch (e) {
+  console.log(`MCP templates seed error: ${String(e?.message || e)}`);
+}
 
 const telegram = createTelegramWorkerController({ db, dataDir });
 const slack = createSlackWorkerController({ db });
@@ -55,6 +65,9 @@ app.use('/admin/llm', createLlmRouter({ db, dataDir }));
 app.use('/admin/events', createEventsRouter({ db }));
 app.use('/admin/security', createSecurityRouter({ db }));
 app.use('/admin/runtime/textwebui', createRuntimeTextWebuiRouter({ db }));
+app.use('/admin/mcp', createMcpRouter({ db }));
+app.use('/admin/doctor', createDoctorRouter({ db, dataDir, telegram, slack }));
+app.use('/admin/canvas', createCanvasRouter({ db }));
 app.use('/admin', createAdminRouter({ db, telegram, slack, dataDir }));
 
 app.get('/', (_req, res) =>

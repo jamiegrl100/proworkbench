@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 
-import { clearToken, getLastToken, setToken, stashLastToken } from "../auth";
+import { clearToken, getLastToken, getToken, setToken, stashLastToken } from "../auth";
+import { useI18n } from "../i18n/LanguageProvider";
 import { getJson, postJson } from "./api";
 
 type SetupState = {
@@ -19,6 +20,7 @@ export default function LoginScreen({
   onCancel?: () => void;
   allowCancel?: boolean;
 }) {
+  const { t } = useI18n();
   const [tokenInput, setTokenInput] = useState((initialToken || getLastToken() || "").trim());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -39,7 +41,7 @@ export default function LoginScreen({
     try {
       const params = new URLSearchParams(window.location.search || "");
       if (params.get("expired") === "1") {
-        setInfo("Session expired. Paste your admin token to continue.");
+        setInfo(t("auth.sessionExpired"));
       }
     } catch {
       // ignore
@@ -49,7 +51,7 @@ export default function LoginScreen({
   async function verifyAndSaveToken() {
     const token = tokenInput.trim();
     if (!token) {
-      setErr("Token is required.");
+      setErr(t("auth.tokenRequired"));
       return;
     }
 
@@ -67,7 +69,7 @@ export default function LoginScreen({
         },
       });
       if (!verifyRes.ok) {
-        throw new Error(`Token check failed (HTTP ${verifyRes.status}).`);
+        throw new Error(t("auth.tokenCheckFailed", { status: verifyRes.status }));
       }
 
       setToken(token);
@@ -76,7 +78,7 @@ export default function LoginScreen({
       stashLastToken(token);
       const msg = String(e?.message || e);
       setErr(msg);
-      setInfo("Use Generate token only on first setup (no existing tokens), or paste a known admin token.");
+      setInfo(t("auth.invalidTokenHint"));
     } finally {
       setBusy(false);
     }
@@ -90,21 +92,43 @@ export default function LoginScreen({
       if (bootstrapMode) {
         const out = await postJson<{ token: string }>("/admin/setup/bootstrap", {});
         const token = String(out?.token || "").trim();
-        if (!token) throw new Error("Bootstrap did not return a token.");
+        if (!token) throw new Error(t("auth.bootstrapNoToken"));
         setTokenInput(token);
         setToken(token);
         onAuthenticated(token);
         return;
       }
 
-      const current = tokenInput.trim();
-      if (!current) {
-        throw new Error("Paste your current admin token to rotate it.");
+      // Rotation requires an already-valid token stored in localStorage.
+      // Never overwrite a working token with whatever is in the input box.
+      const current = getToken();
+      if (!current) throw new Error(t("auth.rotateRequiresLogin"));
+
+      const rotateRes = await fetch("/admin/security/token/rotate", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${current}`,
+          "X-PB-Admin-Token": current,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      const rotateTxt = await rotateRes.text();
+      const rotateJson = rotateTxt
+        ? (() => {
+            try {
+              return JSON.parse(rotateTxt);
+            } catch {
+              return null;
+            }
+          })()
+        : null;
+      if (!rotateRes.ok) {
+        throw new Error(t("auth.tokenCheckFailed", { status: rotateRes.status }));
       }
-      setToken(current);
-      const out = await postJson<{ ok: boolean; token: string }>("/admin/security/token/rotate", {});
-      const token = String(out?.token || "").trim();
-      if (!token) throw new Error("Rotate did not return a token.");
+      const token = String(rotateJson?.token || "").trim();
+      if (!token) throw new Error(t("auth.rotateNoToken"));
+
       setTokenInput(token);
       setToken(token);
       onAuthenticated(token);
@@ -112,7 +136,7 @@ export default function LoginScreen({
       stashLastToken(tokenInput.trim());
       const msg = String(e?.message || e);
       setErr(msg);
-      if (!bootstrapMode) setInfo("Generate token requires first setup, or a valid current token for rotation.");
+      if (!bootstrapMode) setInfo(t("auth.generateTokenHelpBootstrap"));
     } finally {
       setBusy(false);
     }
@@ -122,9 +146,9 @@ export default function LoginScreen({
     if (!tokenInput.trim()) return;
     try {
       await navigator.clipboard.writeText(tokenInput.trim());
-      setInfo("Token copied.");
+      setInfo(t("auth.tokenCopied"));
     } catch {
-      setInfo("Copy not available in this browser context.");
+      setInfo(t("auth.copyUnavailable"));
     }
   }
 
@@ -136,19 +160,17 @@ export default function LoginScreen({
   }
 
   return (
-    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 16, fontFamily: "system-ui, sans-serif" }}>
+    <div style={{ minHeight: "calc(100vh - 48px)", display: "grid", placeItems: "center", padding: 16, fontFamily: "system-ui, sans-serif" }}>
       <div style={{ width: 480, maxWidth: "100%", border: "1px solid #e5e7eb", borderRadius: 12, padding: 16, display: "grid", gap: 10 }}>
-        <h2 style={{ margin: 0 }}>Admin Login</h2>
-        <div style={{ fontSize: 13, opacity: 0.85 }}>
-          Enter your `pb_admin_token` to unlock admin pages.
-        </div>
+        <h2 style={{ margin: 0 }}>{t("auth.adminLoginTitle")}</h2>
+        <div style={{ fontSize: 13, opacity: 0.85 }}>{t("auth.subtitle")}</div>
 
         <label>
-          <div style={{ fontSize: 12, opacity: 0.8 }}>Admin token</div>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>{t("auth.adminTokenLabel")}</div>
           <input
             value={tokenInput}
             onChange={(e) => setTokenInput(e.target.value)}
-            placeholder="paste token"
+            placeholder={t("auth.tokenPlaceholder")}
             style={{ width: "100%", padding: 10 }}
           />
         </label>
@@ -158,23 +180,23 @@ export default function LoginScreen({
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button onClick={verifyAndSaveToken} disabled={busy} style={{ padding: "8px 12px" }}>
-            {busy ? "Saving..." : "Save token"}
+            {busy ? t("auth.saving") : t("auth.saveToken")}
           </button>
           <button onClick={generateToken} disabled={busy} style={{ padding: "8px 12px" }}>
-            Generate token
+            {bootstrapMode ? t("auth.generateToken") : t("auth.rotateToken")}
           </button>
           <button onClick={copyToken} disabled={busy || !tokenInput.trim()} style={{ padding: "8px 12px" }}>
-            Copy
+            {t("auth.copy")}
           </button>
           <button onClick={() => setTokenInput(getLastToken() || "")} disabled={busy} style={{ padding: "8px 12px" }}>
-            Use last token
+            {t("auth.useLastToken")}
           </button>
           <button onClick={clearInput} disabled={busy} style={{ padding: "8px 12px" }}>
-            Clear
+            {t("auth.clear")}
           </button>
           {allowCancel ? (
             <button onClick={onCancel} disabled={busy} style={{ padding: "8px 12px", marginLeft: "auto" }}>
-              Cancel
+              {t("auth.cancel")}
             </button>
           ) : null}
         </div>

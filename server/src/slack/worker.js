@@ -122,6 +122,12 @@ export function createSlackWorkerController({ db }) {
           return;
         }
 
+        if (/^\/(tool|run_tool|mcp)\b/i.test(text)) {
+          recordEvent(db, 'social.execution_blocked', { channel: 'slack', user_id: userId, text, status: 403 });
+          await say('For security, tool and MCP execution is WebChat-only. Open the PB Web UI to run it.');
+          return;
+        }
+
         touchAllowed(db, userId, username);
         incAllowedCount(db, userId);
         recordEvent(db, 'slack.message_in', { user_id: userId, username, text });

@@ -51,3 +51,29 @@ export async function postJson<T>(url: string, body: any, _csrfToken?: string): 
   });
   return parseResponse<T>(r);
 }
+
+export async function putJson<T>(url: string, body: any): Promise<T> {
+  const r = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(url) },
+    body: JSON.stringify(body),
+  });
+  return parseResponse<T>(r);
+}
+
+export async function patchJson<T>(url: string, body: any): Promise<T> {
+  const r = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(url) },
+    body: JSON.stringify(body),
+  });
+  return parseResponse<T>(r);
+}
+
+export async function deleteJson<T>(url: string): Promise<T> {
+  const r = await fetch(url, {
+    method: 'DELETE',
+    headers: authHeaders(url),
+  });
+  return parseResponse<T>(r);
+}

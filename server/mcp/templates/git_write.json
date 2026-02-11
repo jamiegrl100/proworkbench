@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "git_write",
+  "name": "Git (Write)",
+  "description": "Run safe git write operations in a limited repo folder.",
+  "risk": "medium",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": true,
+  "fields": [
+    { "key": "repoPath", "label": "Repo folder", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": ["git"]
+  }
+}
+

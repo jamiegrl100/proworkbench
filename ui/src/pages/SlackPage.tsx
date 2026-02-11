@@ -3,10 +3,12 @@ import React, { useEffect, useState } from 'react';
 import Card from '../components/Card';
 import Table from '../components/Table';
 import { getJson, postJson } from '../components/api';
+import { useI18n } from '../i18n/LanguageProvider';
 
 declare function toast(msg: string): void;
 
 export default function SlackPage() {
+  const { t } = useI18n();
   const [data, setData] = useState<any>({ allowed: [], pending: [], blocked: [] });
   const [status, setStatus] = useState<any>({ running: false, startedAt: null, lastError: null });
   const [botToken, setBotToken] = useState('');
@@ -35,7 +37,7 @@ export default function SlackPage() {
       await postJson('/setup/slack-oauth-secrets', { SLACK_CLIENT_ID: clientId, SLACK_CLIENT_SECRET: clientSecret });
       setClientId('');
       setClientSecret('');
-      toast('Slack OAuth secrets saved.');
+      toast(t('slack.toast.oauthSaved'));
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -55,7 +57,7 @@ export default function SlackPage() {
       setBotToken('');
       setAppToken('');
       setSigningSecret('');
-      toast('Slack secrets saved.');
+      toast(t('slack.toast.secretsSaved'));
       await load();
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -140,95 +142,95 @@ export default function SlackPage() {
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
-      <Card title="Slack (Socket Mode, DM-only)">
+      <Card title={t('slack.title')}>
         <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
-          Local-first Slack integration using Socket Mode (no public webhook). Responds only in direct messages and only to approved users.
+          {t('slack.subtitle')}
         </div>
 
         <div style={{ display: 'grid', gap: 10, gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
           <label>
             <div style={{ fontSize: 12, opacity: 0.75 }}>SLACK_CLIENT_ID (for Install)</div>
-            <input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="paste client id" style={{ width: '100%', padding: 8 }} />
+            <input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder={t('slack.placeholders.clientId')} style={{ width: '100%', padding: 8 }} />
           </label>
           <label>
             <div style={{ fontSize: 12, opacity: 0.75 }}>SLACK_CLIENT_SECRET (for Install)</div>
-            <input value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} placeholder="paste client secret" style={{ width: '100%', padding: 8 }} />
+            <input value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} placeholder={t('slack.placeholders.clientSecret')} style={{ width: '100%', padding: 8 }} />
           </label>
 
           <label>
             <div style={{ fontSize: 12, opacity: 0.75 }}>SLACK_BOT_TOKEN (xoxb-…)</div>
-            <input value={botToken} onChange={(e) => setBotToken(e.target.value)} placeholder="paste bot token" style={{ width: '100%', padding: 8 }} />
+            <input value={botToken} onChange={(e) => setBotToken(e.target.value)} placeholder={t('slack.placeholders.botToken')} style={{ width: '100%', padding: 8 }} />
           </label>
 
           <label>
             <div style={{ fontSize: 12, opacity: 0.75 }}>SLACK_APP_TOKEN (xapp-… for Socket Mode)</div>
-            <input value={appToken} onChange={(e) => setAppToken(e.target.value)} placeholder="paste app token" style={{ width: '100%', padding: 8 }} />
+            <input value={appToken} onChange={(e) => setAppToken(e.target.value)} placeholder={t('slack.placeholders.appToken')} style={{ width: '100%', padding: 8 }} />
           </label>
 
           <label>
             <div style={{ fontSize: 12, opacity: 0.75 }}>SLACK_SIGNING_SECRET</div>
-            <input value={signingSecret} onChange={(e) => setSigningSecret(e.target.value)} placeholder="paste signing secret" style={{ width: '100%', padding: 8 }} />
+            <input value={signingSecret} onChange={(e) => setSigningSecret(e.target.value)} placeholder={t('slack.placeholders.signingSecret')} style={{ width: '100%', padding: 8 }} />
           </label>
         </div>
 
         <div style={{ display: 'flex', gap: 10, marginTop: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-          <button disabled={busy || !clientId.trim() || !clientSecret.trim()} onClick={saveOauth} style={{ padding: '8px 12px' }}>Save OAuth</button>
-          <button disabled={busy} onClick={openOauth} style={{ padding: '8px 12px' }}>Install / Connect</button>
-          <button disabled={busy || !botToken.trim() || !appToken.trim() || !signingSecret.trim()} onClick={save} style={{ padding: '8px 12px' }}>Save tokens</button>
-          <button disabled={busy} onClick={restart} style={{ padding: '8px 12px' }}>Restart</button>
-          <button disabled={busy || !status.running} onClick={stop} style={{ padding: '8px 12px' }}>Stop</button>
-          <button disabled={busy || status.running} onClick={start} style={{ padding: '8px 12px' }}>Start</button>
+          <button disabled={busy || !clientId.trim() || !clientSecret.trim()} onClick={saveOauth} style={{ padding: '8px 12px' }}>{t('slack.actions.saveOauth')}</button>
+          <button disabled={busy} onClick={openOauth} style={{ padding: '8px 12px' }}>{t('slack.actions.installConnect')}</button>
+          <button disabled={busy || !botToken.trim() || !appToken.trim() || !signingSecret.trim()} onClick={save} style={{ padding: '8px 12px' }}>{t('slack.actions.saveTokens')}</button>
+          <button disabled={busy} onClick={restart} style={{ padding: '8px 12px' }}>{t('common.restart')}</button>
+          <button disabled={busy || !status.running} onClick={stop} style={{ padding: '8px 12px' }}>{t('common.stop')}</button>
+          <button disabled={busy || status.running} onClick={start} style={{ padding: '8px 12px' }}>{t('common.start')}</button>
         </div>
 
         <div style={{ marginTop: 12, fontSize: 12, opacity: 0.85 }}>
-          Status: <b>{status.running ? 'Running' : 'Stopped'}</b> · Started: {status.startedAt || '—'} · Last error: {status.lastError || '—'}
+          {t('slack.statusLine', { status: status.running ? t('common.running') : t('common.stopped'), startedAt: status.startedAt || '—', lastError: status.lastError || '—' })}
         </div>
         {err ? <div style={{ marginTop: 12, color: '#b00020', whiteSpace: 'pre-wrap' }}>{err}</div> : null}
       </Card>
 
-      <Card title="Pending approvals">
+      <Card title={t('slack.pending.title')}>
         <Table
           rows={data.pending || []}
           columns={[
-            { key: 'user_id', label: 'user_id' },
-            { key: 'username', label: 'username' },
-            { key: 'count', label: 'count' },
-            { key: 'last_seen_at', label: 'last_seen_at' },
+            { key: 'user_id', label: t('slack.col.user_id') },
+            { key: 'username', label: t('slack.col.username') },
+            { key: 'count', label: t('slack.col.count') },
+            { key: 'last_seen_at', label: t('slack.col.last_seen_at') },
           ]}
           actions={(row: any) => (
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              <button disabled={busy} onClick={() => approve(row.user_id)} style={{ padding: '6px 10px' }}>Approve</button>
-              <button disabled={busy} onClick={() => block(row.user_id)} style={{ padding: '6px 10px' }}>Block</button>
+              <button disabled={busy} onClick={() => approve(row.user_id)} style={{ padding: '6px 10px' }}>{t('slack.approve')}</button>
+              <button disabled={busy} onClick={() => block(row.user_id)} style={{ padding: '6px 10px' }}>{t('slack.block')}</button>
             </div>
           )}
         />
       </Card>
 
-      <Card title="Allowed users">
+      <Card title={t('slack.allowed.title')}>
         <Table
           rows={data.allowed || []}
           columns={[
-            { key: 'user_id', label: 'user_id' },
-            { key: 'label', label: 'label' },
-            { key: 'message_count', label: 'message_count' },
-            { key: 'last_seen_at', label: 'last_seen_at' },
+            { key: 'user_id', label: t('slack.col.user_id') },
+            { key: 'label', label: t('slack.col.label') },
+            { key: 'message_count', label: t('slack.col.message_count') },
+            { key: 'last_seen_at', label: t('slack.col.last_seen_at') },
           ]}
           actions={(row: any) => (
-            <button disabled={busy} onClick={() => block(row.user_id)} style={{ padding: '6px 10px' }}>Block</button>
+            <button disabled={busy} onClick={() => block(row.user_id)} style={{ padding: '6px 10px' }}>{t('slack.block')}</button>
           )}
         />
       </Card>
 
-      <Card title="Blocked users">
+      <Card title={t('slack.blocked.title')}>
         <Table
           rows={data.blocked || []}
           columns={[
-            { key: 'user_id', label: 'user_id' },
-            { key: 'reason', label: 'reason' },
-            { key: 'blocked_at', label: 'blocked_at' },
+            { key: 'user_id', label: t('slack.col.user_id') },
+            { key: 'reason', label: t('slack.col.reason') },
+            { key: 'blocked_at', label: t('slack.col.blocked_at') },
           ]}
           actions={(row: any) => (
-            <button disabled={busy} onClick={() => restore(row.user_id)} style={{ padding: '6px 10px' }}>Unblock</button>
+            <button disabled={busy} onClick={() => restore(row.user_id)} style={{ padding: '6px 10px' }}>{t('telegram.unblock')}</button>
           )}
         />
       </Card>

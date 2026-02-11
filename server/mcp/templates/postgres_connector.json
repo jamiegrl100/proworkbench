@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "postgres_connector",
+  "name": "Postgres Connector",
+  "description": "Connect to a Postgres database (secrets required).",
+  "risk": "high",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": true,
+  "fields": [
+    { "key": "host", "label": "Host", "type": "string", "required": true },
+    { "key": "port", "label": "Port", "type": "number", "required": true, "default": 5432 },
+    { "key": "user", "label": "User", "type": "string", "required": true },
+    { "key": "password", "label": "Password", "type": "secret", "required": true },
+    { "key": "database", "label": "Database", "type": "string", "required": true }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

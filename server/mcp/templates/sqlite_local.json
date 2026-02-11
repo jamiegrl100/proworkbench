@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "sqlite_local",
+  "name": "SQLite (Local DB)",
+  "description": "Read and query a SQLite database within PB work directory.",
+  "risk": "medium",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": false,
+  "fields": [
+    { "key": "dbPath", "label": "Database file", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

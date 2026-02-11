@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "build": "vite build",
-    "preview": "vite preview --host 127.0.0.1 --port 5173 --strictPort"
+    "preview": "vite preview --host 127.0.0.1 --port 5173 --strictPort",
+    "i18n:sync": "node scripts/i18n_sync.mjs",
+    "i18n:audit": "node scripts/i18n_audit.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

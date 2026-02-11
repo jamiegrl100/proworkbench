@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "smtp_sender",
+  "name": "Email/SMTP Sender",
+  "description": "Send email via SMTP (secrets required).",
+  "risk": "high",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": true,
+  "fields": [
+    { "key": "host", "label": "SMTP Host", "type": "string", "required": true },
+    { "key": "port", "label": "SMTP Port", "type": "number", "required": true, "default": 587 },
+    { "key": "user", "label": "SMTP User", "type": "string", "required": true },
+    { "key": "password", "label": "SMTP Password", "type": "secret", "required": true },
+    { "key": "from", "label": "From address", "type": "string", "required": true }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

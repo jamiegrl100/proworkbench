@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "text_utils",
+  "name": "Text Utilities",
+  "description": "Split/merge/deduplicate text and lists.",
+  "risk": "low",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": false,
+  "fields": [],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

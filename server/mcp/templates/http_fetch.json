@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "http_fetch",
+  "name": "HTTP Fetch (Domain Allowlist)",
+  "description": "Fetch HTTP URLs restricted to an allowlisted set of domains.",
+  "risk": "medium",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": false,
+  "fields": [
+    { "key": "domainAllowlistCsv", "label": "Allowed domains (comma separated)", "type": "csv", "required": true }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

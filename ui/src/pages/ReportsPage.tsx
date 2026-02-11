@@ -3,8 +3,10 @@ import React, { useEffect, useState } from 'react';
 import Card from '../components/Card';
 import { downloadCsv } from '../components/csv';
 import { getJson, postJson } from '../components/api';
+import { useI18n } from '../i18n/LanguageProvider';
 
 export default function ReportsPage() {
+  const { t } = useI18n();
   const [summary, setSummary] = useState<any>(null);
   const [reports, setReports] = useState<any[]>([]);
   const [err, setErr] = useState('');
@@ -37,16 +39,16 @@ export default function ReportsPage() {
 
   return (
     <div style={{ padding: 16, maxWidth: 1100 }}>
-      <h2 style={{ marginTop: 0 }}>Reports</h2>
+      <h2 style={{ marginTop: 0 }}>{t('page.reports.title')}</h2>
       {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
 
-      <Card title="Reporting cadence">
+      <Card title={t('reports.cadence.title')}>
         <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
-          Daily report is limited to <b>once per day</b> (per midnight reset). Critical reports can be run anytime.
+          {t('reports.cadence.body')}
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-          <button disabled={!!busy} onClick={() => run('daily')} style={{ padding: '8px 12px' }}>Generate daily report</button>
-          <button disabled={!!busy} onClick={() => run('critical')} style={{ padding: '8px 12px' }}>Generate critical report</button>
+          <button disabled={!!busy} onClick={() => run('daily')} style={{ padding: '8px 12px' }}>{t('reports.actions.generateDaily')}</button>
+          <button disabled={!!busy} onClick={() => run('critical')} style={{ padding: '8px 12px' }}>{t('reports.actions.generateCritical')}</button>
           <button
             disabled={reports.length === 0}
             onClick={() => {
@@ -56,7 +58,7 @@ export default function ReportsPage() {
             }}
             style={{ padding: '8px 12px' }}
           >
-            Download latest CSV
+            {t('reports.actions.downloadLatestCsv')}
           </button>
           <button
             disabled={reports.length === 0}
@@ -66,20 +68,20 @@ export default function ReportsPage() {
             }}
             style={{ padding: '8px 12px' }}
           >
-            Download CSV (last 10)
+            {t('reports.actions.downloadCsvLast10')}
           </button>
-          <div style={{ fontSize: 12, opacity: 0.8 }}>Last report: {summary?.lastReportTs || '—'}</div>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>{t('reports.lastReport', { ts: summary?.lastReportTs || '—' })}</div>
         </div>
       </Card>
 
-      <Card title="Last 10 reports">
+      <Card title={t('reports.last10.title')}>
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr>
                 {['ts', 'kind', 'payload'].map((h) => (
                   <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
-                    {h}
+                    {t(`reports.col.${h}`)}
                   </th>
                 ))}
               </tr>

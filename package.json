@@ -11,6 +11,8 @@
     "dev:server": "npm -w server run dev",
     "dev:ui": "npm -w ui run dev",
     "build": "npm -w ui run build && npm -w server run build",
+    "i18n:sync": "npm -w ui run i18n:sync",
+    "i18n:audit": "npm -w ui run i18n:audit",
     "start": "npm -w server run start"
   },
   "devDependencies": {

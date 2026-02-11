@@ -87,7 +87,14 @@ async function fetchJsonWithTimeout(url, options, timeoutMs) {
   }
 }
 
-export async function llmChatOnce({ db, messageText, timeoutMs = 60_000 }) {
+export async function llmChatOnce({
+  db,
+  messageText,
+  systemText = null,
+  timeoutMs = 60_000,
+  temperature = 0.7,
+  maxTokens = null,
+} = {}) {
   const providerId = kvGet(db, 'llm.providerId', 'textwebui');
   const baseUrl = normalizeBaseUrl(kvGet(db, 'llm.baseUrl', providerId === 'openai' ? 'https://api.openai.com' : (providerId === 'anthropic' ? 'https://api.anthropic.com' : (process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:5000'))));
   const profile = kvGet(db, 'llm.activeProfile', null); // 'openai' | 'gateway' | 'anthropic' | null
@@ -102,11 +109,17 @@ export async function llmChatOnce({ db, messageText, timeoutMs = 60_000 }) {
     if (profile === 'openai') {
       const path = '/v1/chat/completions';
       const url = baseUrl + path;
+      const messages = [];
+      if (systemText && systemText.trim()) messages.push({ role: 'system', content: systemText });
+      messages.push({ role: 'user', content: String(messageText || '') });
       const body = {
         model,
-        messages: [{ role: 'user', content: String(messageText || '') }],
-        temperature: 0.7,
+        messages,
+        temperature: typeof temperature === 'number' ? temperature : 0.7,
       };
+      if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) {
+        body.max_tokens = Math.floor(maxTokens);
+      }
       const { res, json } = await fetchJsonWithTimeout(url, {
         method: 'POST',
         headers: {
@@ -133,11 +146,14 @@ export async function llmChatOnce({ db, messageText, timeoutMs = 60_000 }) {
   if (!key) return { ok: false, error: 'ANTHROPIC_API_KEY missing' };
   const path = '/v1/messages';
   const url = baseUrl + path;
-  const body = {
-    model,
-    max_tokens: 1024,
-    messages: [{ role: 'user', content: String(messageText || '') }],
-  };
+  const userContent = systemText && systemText.trim()
+    ? `${systemText.trim()}\n\nUser:\n${String(messageText || '')}`
+    : String(messageText || '');
+	  const body = {
+	    model,
+	    max_tokens: (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) ? Math.floor(maxTokens) : 1024,
+	    messages: [{ role: 'user', content: userContent }],
+	  };
   const { res, json } = await fetchJsonWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
@@ -156,7 +172,12 @@ export async function llmChatOnce({ db, messageText, timeoutMs = 60_000 }) {
 // Gateway best-effort (your legacy/custom endpoint)
     const path = '/api/v1/chat';
     const url = baseUrl + path;
-    const body = { model, message: String(messageText || '') };
+    const message = systemText && systemText.trim()
+      ? `${systemText.trim()}\n\nUser:\n${String(messageText || '')}`
+      : String(messageText || '');
+    const body = { model, message };
+    if (typeof temperature === 'number' && Number.isFinite(temperature)) body.temperature = temperature;
+    if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = Math.floor(maxTokens);
     const { res, json } = await fetchJsonWithTimeout(url, {
       method: 'POST',
       headers: {

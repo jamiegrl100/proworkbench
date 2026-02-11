@@ -4,6 +4,17 @@ import { recordEvent } from '../util/events.js';
 import { incDaily, todayKey, markOverflowDrop } from '../util/securityDaily.js';
 import { makeTelegramApi } from './telegramApi.js';
 import { llmChatOnce } from '../llm/llmClient.js';
+import {
+  isTelegramSandboxBuildEnabled,
+  getOrCreateProject,
+  setActiveProject,
+  listProjectTree,
+  detectExecutionIntent,
+  detectBuildIntent,
+  generateSandboxProjectFiles,
+  applySandboxFiles,
+  createTelegramRunApproval,
+} from './sandbox.js';
 
 function nowIso() { return new Date().toISOString(); }
 function nowMs() { return Date.now(); }
@@ -15,6 +26,8 @@ function parseAllowedIds(raw) {
   return set;
 }
 
+const ALLOWLIST_KV_KEY = 'telegram.allowlist.user_ids';
+
 function kvGet(db, key, fallback) {
   const row = db.prepare('SELECT value_json FROM app_kv WHERE key = ?').get(key);
   return row ? JSON.parse(row.value_json) : fallback;
@@ -23,6 +36,29 @@ function kvGet(db, key, fallback) {
 function kvSet(db, key, value) {
   db.prepare('INSERT INTO app_kv (key, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json')
     .run(key, JSON.stringify(value));
+}
+
+function getDbAllowlist(db) {
+  const raw = kvGet(db, ALLOWLIST_KV_KEY, []);
+  const arr = Array.isArray(raw) ? raw.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  const set = new Set();
+  for (const id of arr) if (/^-?\d+$/.test(id)) set.add(id);
+  return set;
+}
+
+function setDbAllowlist(db, idsSet) {
+  const arr = Array.from(idsSet || []).map((x) => String(x || '').trim()).filter((x) => /^-?\d+$/.test(x));
+  arr.sort((a, b) => a.localeCompare(b));
+  kvSet(db, ALLOWLIST_KV_KEY, arr);
+  return new Set(arr);
+}
+
+function seedDbAllowlistFromEnv(db, dataDir) {
+  const current = getDbAllowlist(db);
+  if (current.size > 0) return current;
+  const { env } = readEnvFile(dataDir);
+  const seeded = parseAllowedIds(env.TELEGRAM_ALLOWED_USER_IDS || env.TELEGRAM_ALLOWED_CHAT_IDS || '');
+  return setDbAllowlist(db, seeded);
 }
 
 function recordPending(db, chatId, username) {
@@ -71,17 +107,6 @@ function scheduleNextRetry(attemptCount) {
 function isExpired(createdAtIso) {
   const created = new Date(createdAtIso).getTime();
   return (Date.now() - created) > 24 * 60 * 60_000;
-}
-
-function updateEnvAllowlist(dataDir, mutator) {
-  const { env } = readEnvFile(dataDir);
-  const current = normalizeAllowedChatIds(env.TELEGRAM_ALLOWED_CHAT_IDS || '');
-  const set = new Set(current ? current.split(',') : []);
-  mutator(set);
-  const next = Array.from(set).join(',');
-  writeEnvFile(dataDir, { TELEGRAM_ALLOWED_CHAT_IDS: next });
-  process.env.TELEGRAM_ALLOWED_CHAT_IDS = next;
-  return next;
 }
 
 export function createTelegramWorkerController({ db, dataDir }) {
@@ -135,11 +160,11 @@ const state = {
   const inFlight = new Map(); // chatId -> { jobId, abort?: AbortController }  (LLM client currently uses its own timeout; keep map for future)
 
   function isAllowed(chatId) {
-    const allowed = db.prepare('SELECT chat_id FROM telegram_allowed WHERE chat_id = ?').get(chatId);
-    if (allowed) return true;
-    const { env } = readEnvFile(dataDir);
-    const ids = parseAllowedIds(env.TELEGRAM_ALLOWED_CHAT_IDS);
-    return ids.has(String(chatId));
+    const id = String(chatId);
+    const ids = seedDbAllowlistFromEnv(db, dataDir);
+    if (ids.has(id)) return true;
+    const allowed = db.prepare('SELECT chat_id FROM telegram_allowed WHERE chat_id = ?').get(id);
+    return Boolean(allowed);
   }
 
   function isBlocked(chatId) {
@@ -152,8 +177,79 @@ const state = {
 
   async function handleAllowed(api, chatId, text) {
     const trimmed = String(text || '').trim();
+    if (/^\/(tool|run_tool|mcp)\b/i.test(trimmed)) {
+      // Hard-block tool/MCP execution on social channels. WebChat-only.
+      recordEvent(db, 'social.execution_blocked', { channel: 'telegram', chat_id: String(chatId), text: trimmed, status: 403 });
+      await send(api, chatId, 'For security, tool and MCP execution is WebChat-only. Open the PB Web UI to run it.');
+      return;
+    }
+    const sandboxEnabled = isTelegramSandboxBuildEnabled();
+
+    if (sandboxEnabled && /^\/newproject\b/i.test(trimmed)) {
+      const name = String(trimmed.replace(/^\/newproject\b/i, '')).trim() || null;
+      const p = setActiveProject(db, chatId, name || undefined);
+      await send(api, chatId, `✅ New sandbox project ready.\nProject: ${p.slug}\nPath: ${p.rootReal}`);
+      return;
+    }
+
+    if (sandboxEnabled && /^\/project\b/i.test(trimmed)) {
+      const p = getOrCreateProject(db, chatId);
+      const tree = await listProjectTree({ chatId, projectSlug: p.slug, maxEntries: 120 });
+      const preview = tree.entries.length
+        ? tree.entries.slice(0, 30).map((x) => `- ${x}`).join('\n')
+        : '(empty project)';
+      await send(
+        api,
+        chatId,
+        `Project: ${p.slug}\nPath: ${tree.rootReal}\nFiles (${tree.entries.length}):\n${preview}${tree.entries.length > 30 ? '\n...more files omitted' : ''}`
+      );
+      return;
+    }
+
+    if (sandboxEnabled && detectExecutionIntent(trimmed)) {
+      const p = getOrCreateProject(db, chatId);
+      const req = createTelegramRunApproval(db, {
+        chatId,
+        projectSlug: p.slug,
+        projectRoot: p.rootReal,
+        requestedAction: trimmed,
+      });
+      await send(
+        api,
+        chatId,
+        `Run/install request queued for Web Admin approval.\nApproval: apr:${req.approvalId}\nProject: ${p.slug}\nPath: ${p.rootReal}\n\nNo command was executed.`
+      );
+      return;
+    }
+
+    if (sandboxEnabled && detectBuildIntent(trimmed)) {
+      const p = getOrCreateProject(db, chatId);
+      const generated = await generateSandboxProjectFiles({ db, prompt: trimmed });
+      const writeOut = await applySandboxFiles({
+        chatId,
+        projectSlug: p.slug,
+        files: generated.files,
+      });
+      const changed = writeOut.files.slice(0, 25).map((f) => `- ${f.action}: ${f.path}`).join('\n') || '(no files written)';
+      const fallbackNote = generated.usedFallback ? '\nUsed fallback template due to model output format.' : '';
+      await send(
+        api,
+        chatId,
+        `Sandbox build complete.\nProject: ${p.slug}\nPath: ${writeOut.rootReal}\nCreated: ${writeOut.createdCount}, Updated: ${writeOut.updatedCount}, Bytes: ${writeOut.bytes}${fallbackNote}\n\nFiles:\n${changed}\n\nTo request run/build/install, send your command text and PB will create a Web Admin approval item.`
+      );
+      recordEvent(db, 'telegram.sandbox.build.write', {
+        chat_id: String(chatId),
+        project_slug: p.slug,
+        created: writeOut.createdCount,
+        updated: writeOut.updatedCount,
+        bytes: writeOut.bytes,
+      });
+      return;
+    }
+
     if (trimmed === '/help') {
-      await send(api, chatId, '/status\n/cancel');
+      if (sandboxEnabled) await send(api, chatId, '/status\n/cancel\n/project\n/newproject <name>');
+      else await send(api, chatId, '/status\n/cancel');
       return;
     }
     if (trimmed === '/status') {
@@ -357,23 +453,29 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
   }
 
   function approve(chatId) {
-  const pending = db.prepare('SELECT * FROM telegram_pending WHERE chat_id = ?').get(chatId);
-  if (pending) db.prepare('DELETE FROM telegram_pending WHERE chat_id = ?').run(chatId);
+    const id = String(chatId);
+    const pending = db.prepare('SELECT * FROM telegram_pending WHERE chat_id = ?').get(id);
+    if (pending) db.prepare('DELETE FROM telegram_pending WHERE chat_id = ?').run(id);
 
-  db.prepare('INSERT OR REPLACE INTO telegram_allowed (chat_id, label, added_at) VALUES (?, ?, ?)')
-    .run(chatId, pending?.username || null, nowIso());
+    db.prepare('INSERT OR REPLACE INTO telegram_allowed (chat_id, label, added_at, last_seen_at, message_count) VALUES (?, ?, ?, COALESCE((SELECT last_seen_at FROM telegram_allowed WHERE chat_id = ?), NULL), COALESCE((SELECT message_count FROM telegram_allowed WHERE chat_id = ?), 0))')
+      .run(id, pending?.username || null, nowIso(), id, id);
 
-  updateEnvAllowlist(dataDir, (set) => set.add(String(chatId)));
-}
+    const ids = seedDbAllowlistFromEnv(db, dataDir);
+    ids.add(id);
+    setDbAllowlist(db, ids);
+  }
 
   function block(chatId, reason) {
-  db.prepare('DELETE FROM telegram_pending WHERE chat_id = ?').run(chatId);
-  db.prepare('DELETE FROM telegram_allowed WHERE chat_id = ?').run(chatId);
-  db.prepare('INSERT OR REPLACE INTO telegram_blocked (chat_id, reason, blocked_at) VALUES (?, ?, ?)')
-    .run(chatId, reason || 'manual', nowIso());
+    const id = String(chatId);
+    db.prepare('DELETE FROM telegram_pending WHERE chat_id = ?').run(id);
+    db.prepare('DELETE FROM telegram_allowed WHERE chat_id = ?').run(id);
+    db.prepare('INSERT OR REPLACE INTO telegram_blocked (chat_id, reason, blocked_at) VALUES (?, ?, ?)')
+      .run(id, reason || 'manual', nowIso());
 
-  updateEnvAllowlist(dataDir, (set) => set.delete(String(chatId)));
-}
+    const ids = seedDbAllowlistFromEnv(db, dataDir);
+    ids.delete(id);
+    setDbAllowlist(db, ids);
+  }
 
   function restore(chatId) {
     const blocked = db.prepare('SELECT * FROM telegram_blocked WHERE chat_id = ?').get(chatId);
@@ -384,5 +486,57 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
       .run(chatId, null, nowIso(), nowIso(), 0);
   }
 
-  return { state, startIfReady, stopNow, approve, block, restore };
+  function getAllowlist() {
+    const ids = seedDbAllowlistFromEnv(db, dataDir);
+    // Keep telegram_allowed table in sync so users show in Allowed tab even before first message.
+    const stamp = nowIso();
+    for (const id of ids) {
+      db.prepare(`
+        INSERT INTO telegram_allowed (chat_id, label, added_at, last_seen_at, message_count)
+        VALUES (?, NULL, ?, NULL, 0)
+        ON CONFLICT(chat_id) DO NOTHING
+      `).run(id, stamp);
+    }
+    return Array.from(ids);
+  }
+
+  function addAllowlist(chatId) {
+    const id = String(chatId || '').trim();
+    if (!/^-?\d+$/.test(id)) throw new Error('Invalid Telegram user ID.');
+    const ids = seedDbAllowlistFromEnv(db, dataDir);
+    ids.add(id);
+    setDbAllowlist(db, ids);
+    db.prepare(`
+      INSERT INTO telegram_allowed (chat_id, label, added_at, last_seen_at, message_count)
+      VALUES (?, NULL, ?, NULL, 0)
+      ON CONFLICT(chat_id) DO NOTHING
+    `).run(id, nowIso());
+    db.prepare('DELETE FROM telegram_blocked WHERE chat_id = ?').run(id);
+    return Array.from(ids);
+  }
+
+  function removeAllowlist(chatId) {
+    const id = String(chatId || '').trim();
+    if (!/^-?\d+$/.test(id)) throw new Error('Invalid Telegram user ID.');
+    const ids = seedDbAllowlistFromEnv(db, dataDir);
+    ids.delete(id);
+    setDbAllowlist(db, ids);
+    db.prepare('DELETE FROM telegram_allowed WHERE chat_id = ?').run(id);
+    return Array.from(ids);
+  }
+
+  async function notify(chatId, text) {
+    const { env } = readEnvFile(dataDir);
+    if (!envConfigured(env)) return { ok: false, error: 'Telegram secrets not configured.' };
+    try {
+      const api = makeTelegramApi(env.TELEGRAM_BOT_TOKEN);
+      await send(api, String(chatId), String(text || ''));
+      return { ok: true };
+    } catch (e) {
+      state.lastError = String(e?.message || e);
+      return { ok: false, error: state.lastError };
+    }
+  }
+
+  return { state, startIfReady, stopNow, approve, block, restore, notify, getAllowlist, addAllowlist, removeAllowlist };
 }

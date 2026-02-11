@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "fs_readonly",
+  "name": "PB Files (Read-only)",
+  "description": "Read files inside PB work directory.",
+  "risk": "low",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": false,
+  "fields": [
+    { "key": "rootPath", "label": "Folder", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "pathReadOnly": true,
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

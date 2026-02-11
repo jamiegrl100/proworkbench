@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "json_utils",
+  "name": "JSON Formatter/Validator",
+  "description": "Format and validate JSON text.",
+  "risk": "low",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": false,
+  "fields": [],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

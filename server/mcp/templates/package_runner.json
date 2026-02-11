@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "package_runner",
+  "name": "Package Runner",
+  "description": "Run allowlisted package manager commands in PB work directory.",
+  "risk": "high",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": true,
+  "fields": [
+    { "key": "workdir", "label": "Working folder", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" },
+    { "key": "runner", "label": "Runner (npm/pip)", "type": "string", "required": true, "default": "npm" }
+  ],
+  "securityDefaults": {
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  }
+}
+

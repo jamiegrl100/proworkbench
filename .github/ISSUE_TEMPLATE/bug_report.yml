@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a problem in Proworkbench
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If this is a security issue, please use SECURITY.md instead of a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: PB version (release tag) or git commit SHA
+      placeholder: "v0.1-preview or abc1234"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include exact clicks/URLs and the smallest reproducible steps
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots (optional)
+      description: Please redact secrets and tokens
+      render: shell
+

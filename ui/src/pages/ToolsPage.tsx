@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { getJson, postJson } from "../components/api";
+import { useI18n } from "../i18n/LanguageProvider";
 
 type AccessMode = "blocked" | "allowed" | "allowed_with_approval";
 type Risk = "low" | "medium" | "high" | "critical";
@@ -22,11 +23,11 @@ type ToolRow = {
   override_access: AccessMode | null;
 };
 
-const ACCESS_LABEL: Record<AccessMode, string> = {
-  blocked: "Blocked",
-  allowed: "Allowed",
-  allowed_with_approval: "Allowed + Approval",
-};
+function accessLabel(t: (k: string, p?: any) => string, mode: AccessMode) {
+  if (mode === "blocked") return t("tools.policy.blocked");
+  if (mode === "allowed") return t("tools.policy.allowed");
+  return t("tools.policy.allowedApproval");
+}
 
 function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v));
@@ -49,6 +50,7 @@ function argsSummary(args: any) {
 }
 
 export default function ToolsPage() {
+  const { t } = useI18n();
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -62,21 +64,25 @@ export default function ToolsPage() {
 
   const [proposals, setProposals] = useState<any[]>([]);
   const [runs, setRuns] = useState<any[]>([]);
+  const [retentionDays, setRetentionDays] = useState(30);
+  const [purgeMsg, setPurgeMsg] = useState("");
 
   async function load() {
     setLoading(true);
     setErr("");
     try {
-      const [{ policy: p, tools: t }, prop, runList] = await Promise.all([
+      const [{ policy: p, tools: t }, prop, runList, ret] = await Promise.all([
         getJson<any>("/admin/tools"),
         getJson<any[]>("/admin/tools/proposals?status=all"),
         getJson<any[]>("/admin/tools/runs?limit=25"),
+        getJson<any>("/admin/retention").catch(() => ({ retention_days: 30 })),
       ]);
       const normalizedPolicy = p as PolicyV2;
       setPolicy(normalizedPolicy);
       setTools(Array.isArray(t) ? t : []);
       setProposals(Array.isArray(prop) ? prop : []);
       setRuns(Array.isArray(runList) ? runList : []);
+      setRetentionDays(Math.max(1, Math.min(365, Number(ret?.retention_days || 30) || 30)));
       setProviderOverridesText(JSON.stringify(normalizedPolicy?.provider_overrides || {}, null, 2));
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -171,12 +177,13 @@ export default function ToolsPage() {
       try {
         providerOverrides = JSON.parse(providerOverridesText || "{}");
       } catch {
-        throw new Error("Advanced provider overrides JSON is invalid.");
+        throw new Error(t("tools.policy.providerOverridesInvalid"));
       }
       const next = clone(policy);
       next.provider_overrides = providerOverrides;
       await postJson("/admin/tools/policy", { policy: next });
       await load();
+      try { window.dispatchEvent(new Event("pb-system-state-changed")); } catch {}
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -197,11 +204,46 @@ export default function ToolsPage() {
     }
   }
 
+  async function saveRetentionDays() {
+    setBusy(true);
+    setErr("");
+    try {
+      const out = await postJson<any>("/admin/retention", { retention_days: retentionDays });
+      setRetentionDays(Math.max(1, Math.min(365, Number(out?.retention_days || retentionDays) || retentionDays)));
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function purgeOldProposals() {
+    if (!window.confirm(t("tools.purge.confirm", { days: retentionDays }))) return;
+    setBusy(true);
+    setErr("");
+    setPurgeMsg("");
+    try {
+      const out = await postJson<any>("/admin/tools/proposals/purge", { olderThanDays: retentionDays });
+      setPurgeMsg(
+        t("tools.purge.result", {
+          proposals: Number(out?.deleted_proposals || 0),
+          runs: Number(out?.deleted_runs || 0),
+          skipped: Number(out?.skipped_pending_approval || 0),
+        })
+      );
+      await load();
+    } catch (e: any) {
+      setErr(String(e?.detail?.error || e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div style={{ display: "grid", gap: 14 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h2 style={{ margin: 0 }}>Tools</h2>
-        <button onClick={load} disabled={busy || loading} style={{ padding: "8px 12px" }}>Refresh</button>
+        <h2 style={{ margin: 0 }}>{t("page.tools.title")}</h2>
+        <button onClick={load} disabled={busy || loading} style={{ padding: "8px 12px" }}>{t("common.refresh")}</button>
       </div>
 
       {err ? (
@@ -211,49 +253,51 @@ export default function ToolsPage() {
       ) : null}
 
       <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>Tool Policy</h3>
+        <h3 style={{ margin: 0 }}>{t("tools.policy.title")}</h3>
         <div style={{ fontSize: 12, opacity: 0.8 }}>
-          Safe default: tools are blocked until explicitly allowed. High/critical tools should usually require approval.
+          {t("tools.policy.safeDefaultHelp")}
         </div>
 
-        {!policy ? <div>Loading…</div> : (
+        {!policy ? <div>{t("common.loading")}</div> : (
           <>
             <label>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>Default for all tools</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>{t("tools.policy.defaultAll")}</div>
               <select value={policy.global_default} onChange={(e) => setGlobalDefault(e.target.value as AccessMode)} style={{ padding: 8, width: 260 }}>
-                <option value="blocked">Blocked</option>
-                <option value="allowed">Allowed</option>
-                <option value="allowed_with_approval">Allowed + Approval</option>
+                <option value="blocked">{t("tools.policy.blocked")}</option>
+                <option value="allowed">{t("tools.policy.allowed")}</option>
+                <option value="allowed_with_approval">{t("tools.policy.allowedApproval")}</option>
               </select>
             </label>
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
               {(["low", "medium", "high", "critical"] as Risk[]).map((r) => (
                 <label key={r} style={{ display: "grid", gap: 6 }}>
-                  <div style={{ fontSize: 12, opacity: 0.8 }}>{r.toUpperCase()} default</div>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>
+                    {t("tools.policy.riskDefault", { risk: t(`risk.${r}`) })}
+                  </div>
                   <select value={policy.per_risk[r]} onChange={(e) => setRiskDefault(r, e.target.value as AccessMode)} style={{ padding: 8, width: 220 }}>
-                    <option value="blocked">Blocked</option>
-                    <option value="allowed">Allowed</option>
-                    <option value="allowed_with_approval">Allowed + Approval</option>
+                    <option value="blocked">{t("tools.policy.blocked")}</option>
+                    <option value="allowed">{t("tools.policy.allowed")}</option>
+                    <option value="allowed_with_approval">{t("tools.policy.allowedApproval")}</option>
                   </select>
                 </label>
               ))}
             </div>
 
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <button onClick={resetSafest} disabled={busy} style={{ padding: "8px 12px" }}>Reset to safest (Block all)</button>
-              <button onClick={applyRecommendedPreset} disabled={busy} style={{ padding: "8px 12px" }}>Recommended preset</button>
-              <button onClick={save} disabled={busy} style={{ padding: "8px 12px", fontWeight: 700 }}>Save</button>
+              <button onClick={resetSafest} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.policy.resetSafest")}</button>
+              <button onClick={applyRecommendedPreset} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.policy.recommendedPreset")}</button>
+              <button onClick={save} disabled={busy} style={{ padding: "8px 12px", fontWeight: 700 }}>{t("tools.policy.save")}</button>
             </div>
 
             <button onClick={() => setShowAdvanced((v) => !v)} style={{ padding: "6px 10px", width: 160 }}>
-              {showAdvanced ? "Hide advanced" : "Advanced…"}
+              {showAdvanced ? t("tools.policy.hideAdvanced") : t("tools.policy.advanced")}
             </button>
 
             {showAdvanced ? (
               <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10, display: "grid", gap: 8 }}>
-                <div style={{ fontWeight: 700 }}>Provider overrides (Advanced)</div>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>Optional. Keep empty unless you know you need it.</div>
+                <div style={{ fontWeight: 700 }}>{t("tools.policy.providerOverridesTitle")}</div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>{t("tools.policy.providerOverridesHelp")}</div>
                 <textarea value={providerOverridesText} onChange={(e) => setProviderOverridesText(e.target.value)} rows={6} style={{ width: "100%", padding: 8, fontFamily: "monospace" }} />
               </div>
             ) : null}
@@ -262,60 +306,60 @@ export default function ToolsPage() {
       </section>
 
       <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>Registered Tools</h3>
+        <h3 style={{ margin: 0 }}>{t("tools.registered.title")}</h3>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search tools" style={{ padding: 8, width: 320 }} />
-          <button onClick={() => bulkSet("allowed")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>Allow selected</button>
-          <button onClick={() => bulkSet("blocked")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>Block selected</button>
-          <button onClick={() => bulkSet("allowed_with_approval")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>Require approval</button>
-          <button onClick={() => selectByRisk("low")} disabled={busy} style={{ padding: "8px 12px" }}>Select all low</button>
-          <button onClick={() => selectByRisk("medium")} disabled={busy} style={{ padding: "8px 12px" }}>Select all medium</button>
-          <button onClick={() => selectByRisk("high")} disabled={busy} style={{ padding: "8px 12px" }}>Select all high</button>
-          <button onClick={() => selectByRisk("critical")} disabled={busy} style={{ padding: "8px 12px" }}>Select all critical</button>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t("tools.registered.searchPlaceholder")} style={{ padding: 8, width: 320 }} />
+          <button onClick={() => bulkSet("allowed")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>{t("tools.registered.allowSelected")}</button>
+          <button onClick={() => bulkSet("blocked")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>{t("tools.registered.blockSelected")}</button>
+          <button onClick={() => bulkSet("allowed_with_approval")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>{t("tools.registered.requireApprovalSelected")}</button>
+          <button onClick={() => selectByRisk("low")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.low") })}</button>
+          <button onClick={() => selectByRisk("medium")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.medium") })}</button>
+          <button onClick={() => selectByRisk("high")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.high") })}</button>
+          <button onClick={() => selectByRisk("critical")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.critical") })}</button>
         </div>
 
         {loading ? (
-          <div>Loading…</div>
+          <div>{t("common.loading")}</div>
         ) : tools.length === 0 ? (
-          <div>No tools registered.</div>
+          <div>{t("tools.registered.none")}</div>
         ) : !policy ? (
-          <div>Loading policy…</div>
+          <div>{t("tools.policy.loading")}</div>
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
             <thead>
               <tr style={{ background: "#fafafa" }}>
                 <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }} />
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Tool</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Risk</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Effective Access</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Override</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.tool")}</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.risk")}</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.effective")}</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.override")}</th>
               </tr>
             </thead>
             <tbody>
-              {filteredTools.map((t) => {
-                const effective = computeEffective(policy, t);
-                const overrideVal = policy.per_tool[t.id] || "";
+              {filteredTools.map((toolRow) => {
+                const effective = computeEffective(policy, toolRow);
+                const overrideVal = policy.per_tool[toolRow.id] || "";
                 return (
-                  <tr key={t.id}>
+                  <tr key={toolRow.id}>
                     <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>
                       <input
                         type="checkbox"
-                        checked={Boolean(selected[t.id])}
-                        onChange={(e) => setSelected((prev) => ({ ...prev, [t.id]: e.target.checked }))}
+                        checked={Boolean(selected[toolRow.id])}
+                        onChange={(e) => setSelected((prev) => ({ ...prev, [toolRow.id]: e.target.checked }))}
                       />
                     </td>
                     <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>
-                      <div style={{ fontWeight: 700 }}>{t.id}</div>
-                      <div style={{ fontSize: 12, opacity: 0.75 }}>{t.description}</div>
+                      <div style={{ fontWeight: 700 }}>{toolRow.id}</div>
+                      <div style={{ fontSize: 12, opacity: 0.75 }}>{toolRow.description}</div>
                     </td>
-                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{t.risk}</td>
-                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{ACCESS_LABEL[effective]}</td>
+                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{t(`risk.${toolRow.risk}`)}</td>
+                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{accessLabel(t, effective)}</td>
                     <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>
-                      <select value={overrideVal} onChange={(e) => setToolOverride(t.id, e.target.value as any)} style={{ padding: 8, width: 220 }}>
-                        <option value="">(no override)</option>
-                        <option value="blocked">Blocked</option>
-                        <option value="allowed">Allowed</option>
-                        <option value="allowed_with_approval">Allowed + Approval</option>
+                      <select value={overrideVal} onChange={(e) => setToolOverride(toolRow.id, e.target.value as any)} style={{ padding: 8, width: 220 }}>
+                        <option value="">{t("tools.registered.noOverride")}</option>
+                        <option value="blocked">{t("tools.policy.blocked")}</option>
+                        <option value="allowed">{t("tools.policy.allowed")}</option>
+                        <option value="allowed_with_approval">{t("tools.policy.allowedApproval")}</option>
                       </select>
                     </td>
                   </tr>
@@ -327,11 +371,34 @@ export default function ToolsPage() {
       </section>
 
       <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>Tool Proposals</h3>
+        <h3 style={{ margin: 0 }}>{t("tools.proposals.title")}</h3>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12, opacity: 0.8 }}>{t("retention.daysLabel")}</span>
+            <input
+              type="number"
+              min={1}
+              max={365}
+              value={retentionDays}
+              onChange={(e) => setRetentionDays(Math.max(1, Math.min(365, Number(e.target.value || 30) || 30)))}
+              style={{ width: 120, padding: 8 }}
+            />
+          </label>
+          <button onClick={saveRetentionDays} disabled={busy} style={{ padding: "8px 12px", marginTop: 18 }}>
+            {t("retention.save")}
+          </button>
+          <button onClick={purgeOldProposals} disabled={busy} style={{ padding: "8px 12px", marginTop: 18 }}>
+            {t("tools.purge.button")}
+          </button>
+          {purgeMsg ? <span style={{ fontSize: 12, opacity: 0.8, marginTop: 18 }}>{purgeMsg}</span> : null}
+        </div>
         {loading ? (
-          <div>Loading…</div>
+          <div>{t("common.loading")}</div>
         ) : proposals.length === 0 ? (
-          <div>No proposals yet.</div>
+          <div style={{ padding: 10, border: "1px solid #eee", borderRadius: 10, background: "#fafafa" }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>{t("tools.proposals.none")}</div>
+            <div style={{ fontSize: 13, opacity: 0.8 }}>{t("tools.proposals.noneHelp")}</div>
+          </div>
         ) : (
           <div style={{ display: "grid", gap: 10 }}>
             {proposals.slice(0, 30).map((p) => (
@@ -340,26 +407,26 @@ export default function ToolsPage() {
                   <div>
                     <div style={{ fontWeight: 800 }}>{p.tool_name} <span style={{ fontWeight: 400, opacity: 0.7 }}>({p.risk_level})</span></div>
                     <div style={{ fontSize: 12, opacity: 0.8 }}>{p.summary || "—"}</div>
-                    <div style={{ fontSize: 12, opacity: 0.8 }}>Args: {argsSummary(p.args_json)}</div>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>{t("tools.proposals.args")}: {argsSummary(p.args_json)}</div>
                   </div>
                   <div style={{ display: "grid", gap: 6, justifyItems: "end" }}>
-                    <div style={{ fontSize: 12 }}>Status: <b>{p.status}</b></div>
+                    <div style={{ fontSize: 12 }}>{t("tools.proposals.status")}: <b>{p.status}</b></div>
                     <div style={{ display: "flex", gap: 8 }}>
                       {p.status === "awaiting_approval" ? (
                         <button onClick={() => { window.location.hash = "#/approvals"; }} style={{ padding: "8px 12px" }}>
-                          Open Approvals
+                          {t("tools.proposals.openApprovals")}
                         </button>
                       ) : null}
                       {p.status === "ready" ? (
                         <button onClick={() => executeProposal(p.id)} disabled={busy} style={{ padding: "8px 12px" }}>
-                          Execute
+                          {t("tools.proposals.execute")}
                         </button>
                       ) : null}
                     </div>
                   </div>
                 </div>
                 <details style={{ marginTop: 8 }}>
-                  <summary style={{ cursor: "pointer" }}>View raw</summary>
+                  <summary style={{ cursor: "pointer" }}>{t("tools.proposals.viewRaw")}</summary>
                   <pre style={{ margin: 0, marginTop: 8, padding: 8, background: "#fafafa", border: "1px solid #eee", maxHeight: 160, overflow: "auto" }}>
                     {JSON.stringify(p, null, 2)}
                   </pre>
@@ -371,19 +438,19 @@ export default function ToolsPage() {
       </section>
 
       <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>Recent Tool Runs</h3>
+        <h3 style={{ margin: 0 }}>{t("tools.runs.title")}</h3>
         {loading ? (
-          <div>Loading…</div>
+          <div>{t("common.loading")}</div>
         ) : runs.length === 0 ? (
-          <div>No tool runs yet.</div>
+          <div>{t("tools.runs.none")}</div>
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
             <thead>
               <tr style={{ background: "#fafafa" }}>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Run</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Status</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Proposal</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>Started</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.run")}</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.status")}</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.proposal")}</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.started")}</th>
               </tr>
             </thead>
             <tbody>

@@ -10,8 +10,9 @@ flowchart LR
     UI["PB UI (Vite/React)\n127.0.0.1:5173"]
   end
 
-  subgraph PB["Proworkbench Server (Local)\nExpress + SQLite\n127.0.0.1:8787"]
-    Auth["Admin auth\nAuthorization: Bearer <token>"]
+  subgraph PBStack["Proworkbench Server (Local)\nExpress + SQLite\n127.0.0.1:8787"]
+    PBAPI["PB API router"]
+    Auth["Admin auth\nAuthorization: Bearer token"]
     DB["SQLite\n(app state, approvals, MCP servers,\ncanvas, events)"]
     ToolRunner["Tool runner (server-side only)"]
     Approvals["Unified approvals queue\n(tool + MCP actions)"]
@@ -25,16 +26,17 @@ flowchart LR
     Chat["/v1/chat/completions"]
   end
 
-  UI -->|/admin/* (proxied)| PB
-  PB --> DB
-  PB -->|probe/models/chat| WebUI
+  UI -->|admin API (proxied)| PBAPI
+  PBAPI --> Auth
+  PBAPI --> DB
+  PBAPI -->|probe/models/chat| WebUI
 
-  PB --> Approvals
-  PB --> ToolRunner
+  PBAPI --> Approvals
+  PBAPI --> ToolRunner
   ToolRunner --> Canvas
   MCP --> Canvas
-  PB --> MCP
-  PB --> Channels
+  PBAPI --> MCP
+  PBAPI --> Channels
 
   %% Security boundaries
   Channels -. hard blocked execution .-> ToolRunner
@@ -104,4 +106,3 @@ flowchart LR
   Start -. if high/critical .-> Appr["Approval required"]
   Appr --> Start
 ```
-

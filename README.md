@@ -1,14 +1,28 @@
-# PROWORKBENCH (PB)
+# Docs
 
-PROWORKBENCH is a local server + browser UI for private LLM workflows.
+Proworkbench documentation (Preview v0.1).
 
-## Local model provider
-PB uses Text Generation WebUI (OpenAI-compatible API) as the local model provider:
-- WebUI base: http://127.0.0.1:5000
-- Endpoints: /v1/models, /v1/chat/completions
+> [!NOTE]
+> These docs prioritize non-technical, step-by-step guidance. Advanced sections exist, but are optional.
 
-## Status
-In active development. Packaging/bundling work will happen closer to release.
+## Table of contents
+- Getting started: `docs/getting-started.md`
+- Doctor: `docs/doctor.md`
+- Tools and approvals: `docs/tools-and-approvals.md`
+- MCP servers: `docs/mcp-servers.md`
+- Canvas: `docs/canvas.md`
+- Smoke test checklist: `docs/smoke-test.md`
+- Security: `docs/security.md`
+- Troubleshooting: `docs/troubleshooting.md`
+- Architecture (diagrams): `docs/architecture.md`
+- Roadmap: `docs/roadmap.md`
+- Release checklist (Preview): `docs/release-checklist.md`
+- Website copy notes: `docs/website-copy.md`
+- Writing style guide: `docs/STYLE-GUIDE.md`
 
-## Contact
-See CONTACT.md
+## How to update docs
+1. Edit markdown in `docs/`.
+2. Keep steps short and literal (copy/paste commands, exact URLs, and expected outputs).
+3. Prefer diagrams using Mermaid in fenced blocks (` ```mermaid `).
+4. If a feature is not shipped yet, label it **Planned** (do not imply it exists).
+5. Before shipping a preview build, run every step in `docs/smoke-test.md`.

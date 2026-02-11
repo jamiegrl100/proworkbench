@@ -6,30 +6,31 @@ This page shows how the system fits together and where the security boundaries a
 
 ```mermaid
 flowchart LR
-  subgraph Browser["Browser (Local)"]
-    UI["PB UI (Vite/React)\n127.0.0.1:5173"]
+  subgraph Browser[Browser Local]
+    UI[PB UI 127.0.0.1:5173]
   end
 
-  subgraph PBStack["Proworkbench Server (Local)\nExpress + SQLite\n127.0.0.1:8787"]
-    PBAPI["PB API router"]
-    Auth["Admin auth\nAuthorization: Bearer token"]
-    DB["SQLite\n(app state, approvals, MCP servers,\ncanvas, events)"]
-    ToolRunner["Tool runner (server-side only)"]
-    Approvals["Unified approvals queue\n(tool + MCP actions)"]
-    Canvas["Canvas storage\n(persistent cards)"]
-    MCP["MCP subsystem\n(templates + servers)"]
-    Channels["Channels\nTelegram / Slack\n(chat-only)"]
+  subgraph PBStack[Proworkbench Server 127.0.0.1:8787]
+    PBAPI[PB API router]
+    Auth[Admin auth bearer token]
+    DB[(SQLite)]
+    ToolRunner[Tool runner server-side]
+    Approvals[Unified approvals queue]
+    Canvas[Canvas storage]
+    MCP[MCP subsystem]
+    Channels[Telegram and Slack chat-only]
   end
 
-  subgraph WebUI["Text Generation WebUI (Local)\nOpenAI-compatible API\n127.0.0.1:5000"]
-    Models["/v1/models"]
-    Chat["/v1/chat/completions"]
+  subgraph WebUI[Text Generation WebUI 127.0.0.1:5000]
+    Models[v1 models]
+    Chat[v1 chat completions]
   end
 
-  UI -->|admin API (proxied)| PBAPI
+  UI --> PBAPI
   PBAPI --> Auth
   PBAPI --> DB
-  PBAPI -->|probe/models/chat| WebUI
+  PBAPI --> Models
+  PBAPI --> Chat
 
   PBAPI --> Approvals
   PBAPI --> ToolRunner
@@ -38,9 +39,8 @@ flowchart LR
   PBAPI --> MCP
   PBAPI --> Channels
 
-  %% Security boundaries
-  Channels -. hard blocked execution .-> ToolRunner
-  Channels -. hard blocked execution .-> MCP
+  Channels -.-> ToolRunner
+  Channels -.-> MCP
 ```
 
 **Security boundaries**

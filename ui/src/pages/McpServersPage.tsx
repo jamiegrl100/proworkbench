@@ -221,6 +221,29 @@ export default function McpServersPage() {
     }
   }
 
+  async function requestDeleteServer(serverId: string, serverName: string) {
+    const typed = window.prompt(`Type DELETE to request removal for "${serverName}"`);
+    if (typed !== "DELETE") return;
+    setBusy(true);
+    setErr("");
+    try {
+      await postJson(`/admin/mcp/servers/${encodeURIComponent(serverId)}/delete-request`, { confirm_text: "DELETE" });
+      setErr(`${t("mcp.needsApproval")} ${t("mcp.openApprovals")}: #/approvals`);
+      await loadAll();
+    } catch (e: any) {
+      const code = String(e?.detail?.code || "");
+      if (code === "APPROVAL_REQUIRED") {
+        const url = String(e?.detail?.approvals_url || "#/approvals");
+        setErr(`${t("mcp.needsApproval")} ${t("mcp.openApprovals")}: ${url}`);
+      } else {
+        setErr(String(e?.detail?.error || e?.message || e));
+      }
+      await loadAll();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function viewLogs(serverId: string) {
     setLogServerId(serverId);
     setBusy(true);
@@ -454,6 +477,9 @@ export default function McpServersPage() {
                       </button>
                       <button onClick={() => viewLogs(s.id)} disabled={busy} style={{ padding: "6px 10px" }}>
                         {t("mcp.viewLogs")}
+                      </button>
+                      <button onClick={() => requestDeleteServer(s.id, s.name)} disabled={busy} style={{ padding: "6px 10px" }}>
+                        {t("common.delete")}
                       </button>
                     </div>
                     {s.lastError ? <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{s.lastError}</div> : null}

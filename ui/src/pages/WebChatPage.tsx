@@ -6,6 +6,7 @@ import { CommandCenterIndicator, useRuntimeStatePoll } from "../components/Comma
 type Proposal = {
   id: string;
   tool_name: string;
+  source_type?: "builtin" | "mcp" | "unknown" | null;
   mcp_server_id?: string | null;
   args_json: Record<string, unknown>;
   risk_level: string;
@@ -31,6 +32,17 @@ type ToolRun = {
   artifacts_json?: any;
   error_json?: any;
   correlation_id?: string;
+};
+
+type UploadItem = {
+  id: string;
+  session_id: string;
+  filename: string;
+  mime_type?: string | null;
+  size_bytes: number;
+  rel_path: string;
+  status: string;
+  created_at: string;
 };
 
 type SystemState = {
@@ -109,6 +121,23 @@ function summarizeArgs(args: any) {
   return parts.join(", ");
 }
 
+function proposalSourceLabel(p: Proposal) {
+  const st = String(p.source_type || "").toLowerCase();
+  if (st === "builtin") return "Built-in";
+  if (st === "mcp") return `MCP${p.mcp_server_id ? `: ${p.mcp_server_id}` : ""}`;
+  console.warn("[webchat] proposal missing/unknown source_type", p.id, p.tool_name);
+  return "Unknown";
+}
+
+function proposalDerivedStatus(p: Proposal) {
+  const eff = String(p.effective_access || "");
+  if (eff === "blocked") return "blocked";
+  if (p.executed_run_id) return "executed";
+  if (p.approval_status === "denied" || p.status === "rejected") return "rejected";
+  if (p.requires_approval && p.approval_status !== "approved") return "awaiting_approval";
+  return "ready";
+}
+
 function safeJsonParse(text: any) {
   try {
     if (!text) return null;
@@ -116,6 +145,14 @@ function safeJsonParse(text: any) {
   } catch {
     return null;
   }
+}
+
+function formatBytes(n: number) {
+  const x = Number(n || 0);
+  if (!Number.isFinite(x) || x <= 0) return "0 B";
+  if (x < 1024) return `${x} B`;
+  if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`;
+  return `${(x / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function loadHelperPresets(): HelperPreset[] {
@@ -193,7 +230,12 @@ export default function WebChatPage() {
   const [invokedRunIds, setInvokedRunIds] = useState<Record<string, string>>({});
   const [proposalUi, setProposalUi] = useState<Record<string, { showDetails: boolean; status?: string }>>({});
   const [runUi, setRunUi] = useState<Record<string, { showDetails: boolean }>>({});
+  const [deleteConfirmText, setDeleteConfirmText] = useState<Record<string, string>>({});
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [uploading, setUploading] = useState(false);
   const [systemState, setSystemState] = useState<SystemState | null>(null);
+  const [assistantName, setAssistantName] = useState("Alex");
+  const [assistantNameDraft, setAssistantNameDraft] = useState("Alex");
   const systemStateHashRef = useRef<string>("");
   const [provider, setProvider] = useState("Text WebUI");
   const [model, setModel] = useState("—");
@@ -306,6 +348,85 @@ export default function WebChatPage() {
     }
   }
 
+  async function refreshUploads() {
+    try {
+      const out = await getJson<any>(`/admin/webchat/uploads?session_id=${encodeURIComponent(sessionIdRef.current)}`);
+      setUploads(Array.isArray(out?.items) ? out.items : []);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function refreshSessionMeta() {
+    try {
+      const out = await getJson<any>(`/admin/webchat/session-meta?session_id=${encodeURIComponent(sessionIdRef.current)}`);
+      const n = String(out?.meta?.assistant_name || "Alex").trim() || "Alex";
+      setAssistantName(n);
+      setAssistantNameDraft(n);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function saveAssistantName() {
+    const next = String(assistantNameDraft || "").trim() || "Alex";
+    try {
+      const out = await postJson<any>("/admin/webchat/session-meta", {
+        session_id: sessionIdRef.current,
+        assistant_name: next,
+      });
+      const n = String(out?.meta?.assistant_name || next);
+      setAssistantName(n);
+      setAssistantNameDraft(n);
+      toast(`Assistant name set to ${n}.`);
+    } catch (e: any) {
+      setErr(String(e?.detail?.error || e?.message || e));
+    }
+  }
+
+  async function uploadFiles(fileList: FileList | null) {
+    const files = fileList ? Array.from(fileList) : [];
+    if (files.length === 0) return;
+    setUploading(true);
+    setErr("");
+    const allowed = [".zip", ".txt", ".md", ".json", ".yaml", ".yml", ".log"];
+    try {
+      for (const f of files) {
+        const lower = f.name.toLowerCase();
+        const ext = lower.includes(".") ? lower.slice(lower.lastIndexOf(".")) : "";
+        if (!allowed.includes(ext)) {
+          throw new Error(`Unsupported file type: ${f.name}`);
+        }
+        const buf = await f.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+        const b64 = btoa(bin);
+        await postJson("/admin/webchat/uploads", {
+          session_id: sessionIdRef.current,
+          filename: f.name,
+          mime_type: f.type || null,
+          content_b64: b64,
+        });
+      }
+      await refreshUploads();
+      toast(`Uploaded ${files.length} file(s).`);
+    } catch (e: any) {
+      setErr(String(e?.detail?.error || e?.message || e));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function detachUpload(uploadId: string) {
+    try {
+      await postJson(`/admin/webchat/uploads/${encodeURIComponent(uploadId)}/detach`, {});
+      await refreshUploads();
+    } catch (e: any) {
+      setErr(String(e?.detail?.error || e?.message || e));
+    }
+  }
+
   useEffect(() => {
     (async () => {
       try {
@@ -314,6 +435,8 @@ export default function WebChatPage() {
         // ignore
       }
       await refreshMcpServers();
+      await refreshUploads();
+      await refreshSessionMeta();
     })();
   }, []);
 
@@ -468,6 +591,13 @@ export default function WebChatPage() {
       const proposal = r?.proposal ? (r.proposal as Proposal) : null;
       if (r?.provider) setProvider(String(r.provider));
       if (r?.model) setModel(String(r.model));
+      if (r?.session_meta?.assistant_name) {
+        const n = String(r.session_meta.assistant_name || "").trim();
+        if (n) {
+          setAssistantName(n);
+          setAssistantNameDraft(n);
+        }
+      }
       setMessages((prev) => [
         ...prev,
         {
@@ -604,7 +734,14 @@ export default function WebChatPage() {
     setProposalUi((prev) => ({ ...prev, [pid]: { ...(prev[pid] || { showDetails: false }), status: "running" } }));
     setErr("");
     try {
-      const r = await postJson<any>("/admin/tools/execute", { proposal_id: pid });
+      const payload: any = { proposal_id: pid };
+      if (proposal.tool_name === "workspace.delete") {
+        payload.confirm_delete = String(deleteConfirmText[pid] || "").trim();
+      }
+      if (proposal.tool_name === "memory.delete_day") {
+        payload.confirm_memory_delete = String(deleteConfirmText[pid] || "").trim();
+      }
+      const r = await postJson<any>("/admin/tools/execute", payload);
       const runId = String(r?.run_id || r?.run?.id || "");
       if (!runId) throw new Error(t("webchat.errors.missingRunId"));
       setInvokedRunIds((prev) => ({ ...prev, [pid]: runId }));
@@ -645,6 +782,8 @@ export default function WebChatPage() {
         message = `${message} ${t("webchat.invokeDeniedPolicy")}`;
       } else if (code === "MCP_NEEDS_TEST") {
         message = `${message} ${t("webchat.mcpNeedsTestHint")}`;
+      } else if (code === "DELETE_CONFIRM_REQUIRED") {
+        message = `${message} Type DELETE and confirm to execute this delete proposal.`;
       }
       if (corr) message += ` ${t("webchat.correlation", { id: corr })}`;
       setErr(message);
@@ -672,8 +811,25 @@ export default function WebChatPage() {
           <div style={{ display: "grid", gap: 6 }}>
             <h2 style={{ margin: 0 }}>{t("page.webchat.title")}</h2>
             <div style={{ fontSize: 12, opacity: 0.8, marginTop: 2 }}>{statusLine}</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
+              <span>Assistant name</span>
+              <input
+                value={assistantNameDraft}
+                onChange={(e) => setAssistantNameDraft(e.target.value)}
+                maxLength={40}
+                style={{ padding: "4px 8px", minWidth: 150 }}
+              />
+              <button
+                type="button"
+                onClick={saveAssistantName}
+                disabled={sending || assistantNameDraft.trim() === assistantName}
+                style={{ padding: "4px 8px" }}
+              >
+                Save
+              </button>
+            </div>
           </div>
-          <CommandCenterIndicator state={runtimeState} />
+          <CommandCenterIndicator state={runtimeState} assistantName={assistantName} />
         </div>
         <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
           {t("webchat.toolDraftHelp")}
@@ -1009,24 +1165,30 @@ export default function WebChatPage() {
 
                 {p ? (
                   <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, background: "#fff" }}>
+                    {(() => {
+                      const derivedStatus = proposalDerivedStatus(p);
+                      const sourceLabel = proposalSourceLabel(p);
+                      return (
+                        <>
                     <div style={{ fontWeight: 700, marginBottom: 6 }}>{t("webchat.proposal.title")}</div>
                     <div style={{ fontSize: 13, marginBottom: 4 }}>
                       {t("webchat.proposal.tool")}: <b>{p.tool_name}</b> • {t("webchat.proposal.risk")}:{" "}
                       <span style={{ fontSize: 12, background: riskPill(p.risk_level).bg, color: riskPill(p.risk_level).fg, borderRadius: 999, padding: "2px 8px" }}>
                         {String(p.risk_level)}
                       </span>
+                      <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.8 }}>{sourceLabel}</span>
                     </div>
                     <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
                       {p.summary || t("webchat.proposal.noSummary")}
                     </div>
 
-                    {p.status === "blocked" || String(p.effective_access || "") === "blocked" ? (
+                    {derivedStatus === "blocked" ? (
                       <div style={{ padding: 8, borderRadius: 8, border: "1px solid #f4d0d0", background: "#fff3f3", color: "#b00020", fontSize: 12, marginBottom: 8 }}>
                         {t("webchat.invokeBlockedPolicy")} {p.effective_reason ? `(${p.effective_reason})` : ""}
                       </div>
                     ) : null}
 
-                    {p.status === "awaiting_approval" ? (
+                    {derivedStatus === "awaiting_approval" ? (
                       <div style={{ padding: 8, borderRadius: 8, border: "1px solid #fde68a", background: "#fffbeb", color: "#92400e", fontSize: 12, marginBottom: 8 }}>
                         {t("webchat.proposal.needsApproval")}
                       </div>
@@ -1034,12 +1196,12 @@ export default function WebChatPage() {
 
                     <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 8 }}>
                       <div style={{ fontSize: 12 }}>
-                        {t("webchat.proposal.status")}: <b>{proposalUi[p.id]?.status || p.status}</b>
+                        {t("webchat.proposal.status")}: <b>{proposalUi[p.id]?.status || derivedStatus}</b>
                       </div>
                       <div style={{ fontSize: 12, opacity: 0.8 }}>
                         {t("webchat.proposal.effective")}: <b>{String(p.effective_access || t("common.unknown"))}</b>
                       </div>
-                      {p.mcp_server_id ? (
+                      {p.source_type === "mcp" && p.mcp_server_id ? (
                         <div style={{ fontSize: 12, opacity: 0.8 }}>
                           {t("webchat.proposal.mcp")}: <b>{p.mcp_server_id}</b>
                         </div>
@@ -1051,18 +1213,43 @@ export default function WebChatPage() {
                       ) : null}
                     </div>
 
+                    {p.tool_name === "workspace.delete" || p.tool_name === "memory.delete_day" ? (
+                      <div style={{ marginBottom: 8, padding: 8, borderRadius: 8, border: "1px solid #f4d0d0", background: "#fff3f3" }}>
+                        <div style={{ fontSize: 12, color: "#7f1d1d", marginBottom: 6 }}>
+                          {p.tool_name === "workspace.delete"
+                            ? "High-risk delete proposal. Type DELETE to confirm execution."
+                            : `High-risk memory delete proposal. Type DELETE ${String((p.args_json as any)?.day || "YYYY-MM-DD")} to confirm execution.`}
+                        </div>
+                        <input
+                          value={deleteConfirmText[p.id] || ""}
+                          onChange={(e) =>
+                            setDeleteConfirmText((prev) => ({ ...prev, [p.id]: e.target.value }))
+                          }
+                          placeholder={
+                            p.tool_name === "workspace.delete"
+                              ? "DELETE"
+                              : `DELETE ${String((p.args_json as any)?.day || "YYYY-MM-DD")}`
+                          }
+                          style={{ padding: 8, width: 160 }}
+                        />
+                      </div>
+                    ) : null}
+
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       <button
                         onClick={() => invokeTool(p)}
                         disabled={
                           Boolean(invoking[p.id] || invokedRunIds[p.id]) ||
-                          p.status !== "ready" ||
+                          derivedStatus !== "ready" ||
                           p.executed_run_id != null ||
-                          p.status === "blocked" ||
-                          String(p.effective_access || "") === "blocked"
+                          derivedStatus === "blocked" ||
+                          String(p.effective_access || "") === "blocked" ||
+                          (p.tool_name === "workspace.delete" && String(deleteConfirmText[p.id] || "").trim() !== "DELETE") ||
+                          (p.tool_name === "memory.delete_day" &&
+                            String(deleteConfirmText[p.id] || "").trim() !== `DELETE ${String((p.args_json as any)?.day || "")}`.trim())
                         }
                         style={{ padding: "8px 12px" }}
-                        title={p.status !== "ready" ? t("webchat.proposal.notReadyTitle") : ""}
+                        title={derivedStatus !== "ready" ? t("webchat.proposal.notReadyTitle") : ""}
                       >
                         {invoking[p.id]
                           ? t("webchat.proposal.running")
@@ -1070,7 +1257,7 @@ export default function WebChatPage() {
                             ? t("webchat.proposal.invoked")
                             : t("webchat.proposal.invoke")}
                       </button>
-                      {p.status === "awaiting_approval" ? (
+                      {derivedStatus === "awaiting_approval" ? (
                         <button
                           onClick={() => {
                             const id = p.approval_id ? `apr:${p.approval_id}` : "";
@@ -1081,7 +1268,7 @@ export default function WebChatPage() {
                           {t("tools.proposals.openApprovals")}
                         </button>
                       ) : null}
-                      {p.status === "blocked" || String(p.effective_access || "") === "blocked" ? (
+                      {derivedStatus === "blocked" || String(p.effective_access || "") === "blocked" ? (
                         <button onClick={() => { window.location.hash = "#/tools"; }} style={{ padding: "8px 12px" }}>
                           {t("webchat.proposal.openToolsPolicy")}
                         </button>
@@ -1123,6 +1310,9 @@ export default function WebChatPage() {
                         <code>{summarizeArgs(p.args_json) || t("webchat.proposal.none")}</code>
                       </div>
                     )}
+                        </>
+                      );
+                    })()}
                   </div>
                 ) : null}
 
@@ -1160,6 +1350,21 @@ export default function WebChatPage() {
       </div>
 
       <div style={{ display: "flex", gap: 8 }}>
+        <label style={{ padding: "10px 12px", border: "1px solid #ddd", borderRadius: 8, background: "#fff", cursor: uploading ? "not-allowed" : "pointer", opacity: uploading ? 0.7 : 1 }}>
+          {uploading ? "Uploading..." : "Upload"}
+          <input
+            type="file"
+            multiple
+            accept=".zip,.txt,.md,.json,.yaml,.yml,.log,text/plain,text/markdown,application/json,application/zip,application/x-zip-compressed"
+            style={{ display: "none" }}
+            disabled={uploading}
+            onChange={(e) => {
+              uploadFiles(e.target.files).finally(() => {
+                e.currentTarget.value = "";
+              });
+            }}
+          />
+        </label>
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -1186,6 +1391,25 @@ export default function WebChatPage() {
           </button>
         ) : null}
       </div>
+
+      {uploads.length > 0 ? (
+        <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10, display: "grid", gap: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: 700 }}>Reference uploads (session context)</div>
+          <div style={{ display: "grid", gap: 6 }}>
+            {uploads.map((u) => (
+              <div key={u.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, border: "1px solid #f0f0f0", borderRadius: 8, padding: "6px 8px" }}>
+                <div style={{ display: "grid", gap: 2 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{u.filename}</div>
+                  <div style={{ fontSize: 11, opacity: 0.75 }}>{formatBytes(u.size_bytes)} • {u.rel_path}</div>
+                </div>
+                <button onClick={() => detachUpload(u.id)} style={{ padding: "6px 10px" }}>
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {powerUser && agentBatch ? (
         <section style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>

@@ -1,4 +1,7 @@
 # deps
+# Never commit writing content (copyrighted/user data lives in workspace)
+writing/
+writing/**
 node_modules/
 **/node_modules/
 
@@ -27,3 +30,38 @@ data/*.db
 Thumbs.db
 .vscode/
 .idea/
+
+# writing lab private/copyrighted sources and generated outputs
+writing/import_private/
+writing/extracts/
+writing/drafts/
+writing/notes/
+writing/index/
+writing/**/*.docx
+writing/**/*.pdf
+
+# =========================
+# PB user data (NEVER COMMIT)
+
+# PB workspace folder (repo-local) — keep untracked
+workspace/
+**/workspace/
+
+# PB internal state (repo-local copies should never exist, but ignore defensively)
+.pb/
+**/.pb/
+
+# Memory / watchtower user files (defensive patterns)
+**/.pb/memory/
+**/.pb/memory/**
+**/.pb/watchtower/
+**/.pb/watchtower/**
+
+# Writing Lab imports (avoid committing copyrighted manuscripts)
+writing/import/
+writing/import/**
+docs/inventory-map-*.md
+
+# Optional caches
+writing/cache/
+writing/cache/**

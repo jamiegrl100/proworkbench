@@ -114,8 +114,10 @@ export function useRuntimeStatePoll(enabled: boolean) {
   return { state, error, refresh: tick };
 }
 
-export function CommandCenterIndicator({ state }: { state: RuntimeState | null }) {
+export function CommandCenterIndicator({ state, assistantName }: { state: RuntimeState | null; assistantName?: string }) {
   const { t } = useI18n();
+  const displayName = String(assistantName || "Alex");
+  const initials = displayName.trim().slice(0, 2).toUpperCase() || "AL";
 
   const computed = useMemo(() => {
     const st = String(state?.status || "idle");
@@ -175,7 +177,7 @@ export function CommandCenterIndicator({ state }: { state: RuntimeState | null }
           title={t("commandCenter.assistant")}
         >
           <div style={{ width: 30, height: 30, borderRadius: 999, background: "#0b1220", display: "grid", placeItems: "center", color: "#e5e7eb", fontSize: 12, fontWeight: 900 }}>
-            PB
+            {initials}
           </div>
           <div
             style={{
@@ -204,6 +206,7 @@ export function CommandCenterIndicator({ state }: { state: RuntimeState | null }
         </div>
 
         <div style={{ fontSize: 12, opacity: 0.85, display: "grid" }}>
+          <div style={{ fontWeight: 800 }}>{displayName}</div>
           <div style={{ fontWeight: 800 }}>{state?.provider?.name || t("common.unknown")}</div>
           <div style={{ opacity: 0.8 }}>{modelLabel}</div>
           <div style={{ opacity: 0.65, fontSize: 11 }}>

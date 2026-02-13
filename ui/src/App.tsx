@@ -22,12 +22,20 @@ import SettingsPage from "./pages/SettingsPage";
 import McpServersPage from "./pages/McpServersPage";
 import DoctorPage from "./pages/DoctorPage";
 import CanvasPage from "./pages/CanvasPage";
+import MemoryPage from "./pages/MemoryPage";
+import WatchtowerPage from "./pages/WatchtowerPage";
+import WritingLabPage from "./pages/WritingLabPage";
+import FileBrowserPage from "./pages/FileBrowserPage";
 
 type PageKey =
   | "status"
   | "diagnostics"
   | "doctor"
   | "canvas"
+  | "memory"
+  | "watchtower"
+  | "writing-lab"
+  | "files"
   | "approvals"
   | "tools"
   | "runtime"
@@ -52,6 +60,10 @@ const ALLOWED_PAGES = new Set<PageKey>([
   "diagnostics",
   "doctor",
   "canvas",
+  "memory",
+  "watchtower",
+  "writing-lab",
+  "files",
   "approvals",
   "tools",
   "runtime",
@@ -111,6 +123,8 @@ function AdminShell({
   const [setupError, setSetupError] = useState("");
   const [pendingBadge, setPendingBadge] = useState<number>(0);
   const [toast, setToast] = useState<{ kind: "info" | "warn"; text: string } | null>(null);
+  const [watchtower, setWatchtower] = useState<any>(null);
+  const [watchtowerOpen, setWatchtowerOpen] = useState(false);
 
   async function refreshSetup() {
     try {
@@ -133,6 +147,27 @@ function AdminShell({
   useEffect(() => {
     refreshSetup();
   }, [adminToken]);
+
+  useEffect(() => {
+    let timer: any = null;
+    let stopped = false;
+    async function tick() {
+      if (stopped) return;
+      if (document.hidden) return;
+      try {
+        const out = await getJson<any>("/admin/watchtower/state");
+        if (!stopped) setWatchtower(out);
+      } catch {
+        // ignore
+      }
+    }
+    tick();
+    timer = setInterval(tick, 5000);
+    return () => {
+      stopped = true;
+      if (timer) clearInterval(timer);
+    };
+  }, []);
 
   // Track recent UI activity for the keepalive rule.
   useEffect(() => {
@@ -264,6 +299,9 @@ function AdminShell({
       { key: "diagnostics", label: t("nav.diagnostics") },
       { key: "doctor", label: t("nav.doctor") },
       { key: "canvas", label: t("nav.canvas") },
+      { key: "memory", label: "Memory" },
+      { key: "watchtower", label: "Watchtower" },
+      { key: "writing-lab", label: "Writing Lab" },
       { key: "models", label: t("nav.models") },
       { key: "webchat", label: t("nav.webchat") },
       { key: "mcp", label: t("nav.mcp") },
@@ -290,6 +328,14 @@ function AdminShell({
         return <DoctorPage />;
       case "canvas":
         return <CanvasPage />;
+      case "memory":
+        return <MemoryPage />;
+      case "watchtower":
+        return <WatchtowerPage />;
+      case "writing-lab":
+        return <WritingLabPage />;
+      case "files":
+        return <FileBrowserPage />;
       case "approvals":
         return <ApprovalsPage />;
       case "tools":
@@ -391,6 +437,35 @@ function AdminShell({
       </aside>
 
       <main style={{ flex: 1, padding: 18 }}>
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+          <button
+            onClick={() => setWatchtowerOpen((v) => !v)}
+            style={{
+              border: "1px solid #ddd",
+              background: "#fff",
+              borderRadius: 999,
+              padding: "6px 10px",
+              fontSize: 12,
+              cursor: "pointer",
+            }}
+            title="Watchtower status"
+          >
+            Watchtower: {String(watchtower?.state?.status || "unknown")}
+          </button>
+        </div>
+        {watchtowerOpen ? (
+          <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10, marginBottom: 10, fontSize: 12, background: "#fafafa" }}>
+            <div><strong>Status:</strong> {String(watchtower?.state?.status || "unknown")}</div>
+            <div><strong>Last run:</strong> {watchtower?.state?.lastRunAt ? new Date(watchtower.state.lastRunAt).toLocaleString() : "Never"}</div>
+            <div><strong>Preview:</strong> {String(watchtower?.state?.lastMessagePreview || "(none)")}</div>
+            <div><strong>Proposals from last run:</strong> {Array.isArray(watchtower?.state?.proposals) ? watchtower.state.proposals.length : 0}</div>
+            <div style={{ marginTop: 6 }}>
+              <button onClick={() => navigate("watchtower")} style={{ padding: "6px 10px", border: "1px solid #ddd", borderRadius: 8, cursor: "pointer" }}>
+                Open Watchtower settings
+              </button>
+            </div>
+          </div>
+        ) : null}
         {toast ? (
           <div
             style={{

@@ -25,12 +25,16 @@ import { seedMcpTemplates } from './mcp/seedTemplates.js';
 import { createMcpRouter } from './http/mcp.js';
 import { createDoctorRouter } from './http/doctor.js';
 import { createCanvasRouter } from './http/canvas.js';
+import { createMemoryRouter } from './http/memory.js';
+import { createWritingLabRouter } from './http/writingLab.js';
+import { validateCanonPack } from './writingLab/service.js';
+import { getMemoryRetentionDays, pruneMemoryOlderThanDays } from './memory/service.js';
 
 const app = express();
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan('dev'));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '25mb' }));
 app.use(rateLimit({ windowMs: 60_000, limit: 300 }));
 
 const dataDir = getDataDir('proworkbench');
@@ -50,6 +54,26 @@ try {
 } catch (e) {
   console.log(`MCP templates seed error: ${String(e?.message || e)}`);
 }
+try {
+  const keepDays = getMemoryRetentionDays(db);
+  const pruned = pruneMemoryOlderThanDays(db, keepDays);
+  console.log(`Memory prune: deleted=${pruned.deleted} keep_days=${pruned.keep_days}`);
+  if (pruned.deleted > 0) {
+    recordEvent(db, 'memory.prune', { keep_days: pruned.keep_days, cutoff_day: pruned.cutoff_day, deleted: pruned.deleted, trigger: 'startup' });
+  }
+} catch (e) {
+  console.log(`Memory prune error: ${String(e?.message || e)}`);
+}
+try {
+  const canon = validateCanonPack(db);
+  if (canon.ok) {
+    console.log('Writing Lab canon check: OK');
+  } else {
+    console.log(`Writing Lab canon check: missing ${canon.missing.join(', ')}`);
+  }
+} catch (e) {
+  console.log(`Writing Lab canon check error: ${String(e?.message || e)}`);
+}
 
 const telegram = createTelegramWorkerController({ db, dataDir });
 const slack = createSlackWorkerController({ db });
@@ -68,6 +92,9 @@ app.use('/admin/runtime/textwebui', createRuntimeTextWebuiRouter({ db }));
 app.use('/admin/mcp', createMcpRouter({ db }));
 app.use('/admin/doctor', createDoctorRouter({ db, dataDir, telegram, slack }));
 app.use('/admin/canvas', createCanvasRouter({ db }));
+app.use('/admin/memory', createMemoryRouter({ db }));
+app.use('/admin/writing-lab', createWritingLabRouter({ db }));
+app.use('/api/admin/memory', createMemoryRouter({ db }));
 app.use('/admin', createAdminRouter({ db, telegram, slack, dataDir }));
 
 app.get('/', (_req, res) =>

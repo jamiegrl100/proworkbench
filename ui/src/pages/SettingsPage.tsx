@@ -26,12 +26,15 @@ export default function SettingsPage() {
   const [panicNonce, setPanicNonce] = useState('');
   const [panicBusy, setPanicBusy] = useState('');
   const [showPanicConfirm, setShowPanicConfirm] = useState(false);
+  const [agentPreamble, setAgentPreamble] = useState('');
+  const [defaultPreamble, setDefaultPreamble] = useState('');
 
   async function load() {
     setErr('');
-    const [s, panic] = await Promise.all([
+    const [s, panic, preamble] = await Promise.all([
       getJson<any>('/admin/security/summary'),
       getJson<any>('/admin/settings/panic-wipe'),
+      getJson<any>('/admin/settings/agent-preamble'),
     ]);
     setSummary(s);
     setUnknownViolations(Number(s?.unknownAutoBlock?.violations || 3));
@@ -40,6 +43,8 @@ export default function SettingsPage() {
     setPanicEnabled(Boolean(panic?.enabled));
     setPanicLastWipeAt(panic?.last_wipe_at ? String(panic.last_wipe_at) : null);
     setPanicScope(panic?.default_scope || null);
+    setAgentPreamble(String(preamble?.preamble || ''));
+    setDefaultPreamble(String(preamble?.default_preamble || ''));
   }
 
   useEffect(() => {
@@ -125,6 +130,34 @@ export default function SettingsPage() {
       setPanicNonce('');
     } finally {
       setPanicBusy('');
+    }
+  }
+
+  async function saveAgentPreamble() {
+    setBusy('preamble');
+    setErr('');
+    try {
+      const out = await postJson<any>('/admin/settings/agent-preamble', { preamble: agentPreamble });
+      setAgentPreamble(String(out?.preamble || agentPreamble));
+      toast('Agent preamble saved.');
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function resetAgentPreamble() {
+    setBusy('preamble-reset');
+    setErr('');
+    try {
+      const out = await postJson<any>('/admin/settings/agent-preamble/reset', {});
+      setAgentPreamble(String(out?.preamble || defaultPreamble));
+      toast('Agent preamble reset.');
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
     }
   }
 
@@ -250,6 +283,26 @@ export default function SettingsPage() {
             </div>
           </div>
         )}
+      </Card>
+
+      <Card title="Agent Preamble">
+        <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
+          Applied to all WebChat sessions. This preamble enforces scan-first behavior before code edits.
+        </div>
+        <textarea
+          value={agentPreamble}
+          onChange={(e) => setAgentPreamble(e.target.value)}
+          rows={14}
+          style={{ width: '100%', padding: 10, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace", fontSize: 12 }}
+        />
+        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+          <button onClick={saveAgentPreamble} disabled={busy === 'preamble'} style={{ padding: '8px 12px' }}>
+            {busy === 'preamble' ? 'Saving...' : 'Save preamble'}
+          </button>
+          <button onClick={resetAgentPreamble} disabled={busy === 'preamble-reset'} style={{ padding: '8px 12px' }}>
+            {busy === 'preamble-reset' ? 'Resetting...' : 'Reset to default'}
+          </button>
+        </div>
       </Card>
 
       {showPanicConfirm ? (

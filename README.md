@@ -20,7 +20,15 @@ Local-first AI assistant with approvals, presets, and Doctor self-heal.
 - WebChat-only execution: tools and MCP run only from the Web Admin UI (never from Telegram/Slack).
 - Doctor “Fix my setup”: one place to detect issues and guide non-tech users to green.
 - Canvas command center: persistent cards for tool results, MCP actions, Doctor reports, and notes.
+- Persistent memory: daily scratch/summary with governed durable finalize flow.
+- Watchtower: idle-only proactive checks that create proposals but never auto-invoke.
 - Helper swarm (power user): optional 0-5 helper assistants with presets and budget mode, still LLM-only.
+
+## OpenClaw users
+- Website comparison article: https://proworkbench.com/openclaw-alternative/
+- Repo doc version: `docs/openclaw-alternative.md`
+
+Proworkbench’s stance is governed autonomy: explicit invoke, approvals-first for risk, and local-first operation.
 
 **Channel policy (non-negotiable)**
 - WebChat (Web Admin UI): may run tools and MCP (subject to policy + approvals).
@@ -31,19 +39,16 @@ Local-first AI assistant with approvals, presets, and Doctor self-heal.
 - Not supported: exposing PB directly to the public internet.
 
 ## Screenshots
-Expected filenames (replace placeholders when you have real images):
-- `assets/screenshots/doctor.png`
-- `assets/screenshots/mcp.png`
-- `assets/screenshots/canvas.png`
+Current preview screenshots:
+- `assets/screenshots/polish-tools-page.png`
+- `assets/screenshots/polish-mcp-page.png`
+- `assets/screenshots/polish-approvals-empty-state.png`
+- `assets/screenshots/webchat-system-chip-collapsed.png`
 
-> [!NOTE]
-> This repo currently includes placeholder screenshots. Replace them with real screenshots when ready.
-
-![Banner](./assets/banner.svg)
-
-![Doctor](./assets/screenshots/doctor.png)
-![MCP Servers](./assets/screenshots/mcp.png)
-![Canvas](./assets/screenshots/canvas.png)
+![Tools](./assets/screenshots/polish-tools-page.png)
+![MCP Servers](./assets/screenshots/polish-mcp-page.png)
+![Approvals](./assets/screenshots/polish-approvals-empty-state.png)
+![WebChat](./assets/screenshots/webchat-system-chip-collapsed.png)
 
 ## Quick Start (10 minutes)
 
@@ -103,6 +108,10 @@ Doctor will tell you what PB fixed and what you need to do (for example: “Star
 - Getting started: `docs/getting-started.md`
 - Ship gate checklist: `docs/smoke-test.md`
 - Security: `docs/security.md`
+- Security model deep dive: `docs/security-model-block-by-default.md`
+- Doctor deep dive: `docs/doctor-accident-prevention.md`
+- Memory model: `docs/MEMORY.md`
+- Watchtower: `docs/watchtower.md`
 - Architecture: `docs/architecture.md`
 - Roadmap: `docs/roadmap.md`
 

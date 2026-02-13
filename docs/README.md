@@ -7,12 +7,17 @@ Proworkbench documentation (Preview v0.1).
 
 ## Table of contents
 - Getting started: `docs/getting-started.md`
+- Persistent memory: `docs/MEMORY.md`
+- Watchtower: `docs/watchtower.md`
 - Doctor: `docs/doctor.md`
+- Security model deep dive: `docs/security-model-block-by-default.md`
+- Doctor deep dive: `docs/doctor-accident-prevention.md`
 - Tools and approvals: `docs/tools-and-approvals.md`
 - MCP servers: `docs/mcp-servers.md`
 - Canvas: `docs/canvas.md`
 - Smoke test checklist: `docs/smoke-test.md`
 - Security: `docs/security.md`
+- OpenClaw alternative (governed autonomy): `docs/openclaw-alternative.md`
 - Troubleshooting: `docs/troubleshooting.md`
 - Architecture (diagrams): `docs/architecture.md`
 - Roadmap: `docs/roadmap.md`

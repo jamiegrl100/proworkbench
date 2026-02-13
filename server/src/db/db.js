@@ -348,9 +348,34 @@ export function migrate(db) {
       truncated INTEGER NOT NULL DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS webchat_uploads (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      mime_type TEXT,
+      size_bytes INTEGER NOT NULL,
+      rel_path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'attached', -- attached | detached
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_entries (
+      id INTEGER PRIMARY KEY,
+      ts TEXT NOT NULL,
+      day TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'note',
+      content TEXT NOT NULL,
+      meta_json TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_canvas_items_created_at ON canvas_items(created_at);
     CREATE INDEX IF NOT EXISTS idx_canvas_items_kind ON canvas_items(kind);
     CREATE INDEX IF NOT EXISTS idx_canvas_items_pinned ON canvas_items(pinned, created_at);
+    CREATE INDEX IF NOT EXISTS idx_webchat_uploads_session_created ON webchat_uploads(session_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_memory_day ON memory_entries(day);
+    CREATE INDEX IF NOT EXISTS idx_memory_ts ON memory_entries(ts);
+    CREATE INDEX IF NOT EXISTS idx_memory_kind ON memory_entries(kind);
   `);
 
   // Idempotent column adds for existing DBs.

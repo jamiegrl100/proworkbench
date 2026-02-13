@@ -1,4 +1,6 @@
 import fetch from 'node-fetch';
+import { buildMemoryContext } from '../memory/context.js';
+import { getWorkspaceRoot } from '../util/workspace.js';
 
 function nowIso() { return new Date().toISOString(); }
 const REQUIRED_DEFAULT_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
@@ -106,11 +108,21 @@ export async function llmChatOnce({
 
   const start = Date.now();
   try {
+    let systemWithMemory = String(systemText || '');
+    try {
+      const mem = await buildMemoryContext({ root: getWorkspaceRoot() });
+      if (String(mem?.text || '').trim()) {
+        systemWithMemory = `${systemWithMemory ? `${systemWithMemory.trim()}\n\n` : ''}${mem.text}`;
+      }
+    } catch {
+      // Never fail LLM requests if memory context cannot be built.
+    }
+
     if (profile === 'openai') {
       const path = '/v1/chat/completions';
       const url = baseUrl + path;
       const messages = [];
-      if (systemText && systemText.trim()) messages.push({ role: 'system', content: systemText });
+      if (systemWithMemory && systemWithMemory.trim()) messages.push({ role: 'system', content: systemWithMemory });
       messages.push({ role: 'user', content: String(messageText || '') });
       const body = {
         model,
@@ -146,8 +158,8 @@ export async function llmChatOnce({
   if (!key) return { ok: false, error: 'ANTHROPIC_API_KEY missing' };
   const path = '/v1/messages';
   const url = baseUrl + path;
-  const userContent = systemText && systemText.trim()
-    ? `${systemText.trim()}\n\nUser:\n${String(messageText || '')}`
+  const userContent = systemWithMemory && systemWithMemory.trim()
+    ? `${systemWithMemory.trim()}\n\nUser:\n${String(messageText || '')}`
     : String(messageText || '');
 	  const body = {
 	    model,
@@ -172,8 +184,8 @@ export async function llmChatOnce({
 // Gateway best-effort (your legacy/custom endpoint)
     const path = '/api/v1/chat';
     const url = baseUrl + path;
-    const message = systemText && systemText.trim()
-      ? `${systemText.trim()}\n\nUser:\n${String(messageText || '')}`
+    const message = systemWithMemory && systemWithMemory.trim()
+      ? `${systemWithMemory.trim()}\n\nUser:\n${String(messageText || '')}`
       : String(messageText || '');
     const body = { model, message };
     if (typeof temperature === 'number' && Number.isFinite(temperature)) body.temperature = temperature;

@@ -246,6 +246,24 @@ function ensureApproval(db, server, kind, payload) {
   return { ok: false, requiresApproval: true, approvalId: Number(info.lastInsertRowid) };
 }
 
+function ensureDeleteApproval(db, server, payload) {
+  if (!hasTable(db, 'approvals')) {
+    const err = new Error('Approvals table missing');
+    err.code = 'APPROVALS_MISSING';
+    throw err;
+  }
+  const latest = db.prepare(
+    'SELECT id, status, created_at FROM approvals WHERE server_id = ? AND kind = ? ORDER BY created_at DESC LIMIT 1'
+  ).get(server.id, 'mcp_delete');
+  if (latest?.status === 'approved') return { ok: true, approvalId: latest.id, approved: true };
+  if (latest?.status === 'pending') return { ok: false, approvalId: latest.id, pending: true };
+  const info = db.prepare(
+    `INSERT INTO approvals (kind, status, risk_level, tool_name, proposal_id, server_id, payload_json, session_id, message_id, reason, created_at, resolved_at, resolved_by_token_fingerprint)
+     VALUES ('mcp_delete', 'pending', ?, NULL, NULL, ?, ?, NULL, NULL, NULL, ?, NULL, NULL)`
+  ).run(server.risk || 'high', server.id, JSON.stringify(payload || {}), nowIso());
+  return { ok: false, approvalId: Number(info.lastInsertRowid), pending: true };
+}
+
 export function createMcpRouter({ db }) {
   const r = express.Router();
   r.use(requireAuth(db));
@@ -388,17 +406,39 @@ export function createMcpRouter({ db }) {
     }
   });
 
-  r.delete('/servers/:id', (req, res) => {
+  r.post('/servers/:id/delete-request', (req, res) => {
     if (!assertWebchatOnly(req, res)) return;
     const id = String(req.params.id || '').trim();
     if (id === CANVAS_MCP_ID) {
       return res.status(403).json({ ok: false, code: 'MCP_BUILTIN', error: 'This MCP server is built-in and cannot be deleted.' });
     }
-    db.prepare('DELETE FROM mcp_servers WHERE id = ?').run(id);
-    if (hasTable(db, 'mcp_server_logs')) db.prepare('DELETE FROM mcp_server_logs WHERE server_id = ?').run(id);
-    if (hasTable(db, 'mcp_approvals')) db.prepare('DELETE FROM mcp_approvals WHERE server_id = ?').run(id);
-    if (hasTable(db, 'approvals')) db.prepare("DELETE FROM approvals WHERE server_id = ? AND kind LIKE 'mcp_%'").run(id);
-    return res.json({ ok: true });
+    const row = db.prepare('SELECT * FROM mcp_servers WHERE id = ?').get(id);
+    if (!row) return res.status(404).json({ ok: false, error: 'Server not found' });
+    const confirmText = String(req.body?.confirm_text || '').trim();
+    if (confirmText !== 'DELETE') {
+      return res.status(400).json({ ok: false, error: 'Type DELETE to confirm removal request.' });
+    }
+    const gate = ensureDeleteApproval(db, row, {
+      server_id: row.id,
+      server_name: row.name,
+      action: 'delete_server',
+    });
+    if (!gate.ok) {
+      insertLog(db, id, 'WARN', `delete requested: approval ${gate.approvalId}`);
+      return res.status(403).json({
+        ok: false,
+        code: 'APPROVAL_REQUIRED',
+        approval_id: `apr:${gate.approvalId}`,
+        approvals_url: '#/approvals?request=apr:' + gate.approvalId,
+        error: 'Approval required to delete this MCP server.',
+      });
+    }
+    return res.json({ ok: true, approval_id: `apr:${gate.approvalId}` });
+  });
+
+  // Direct delete is disabled in favor of approval-gated delete request.
+  r.delete('/servers/:id', (_req, res) => {
+    return res.status(403).json({ ok: false, code: 'APPROVAL_REQUIRED', error: 'Use delete request with approvals.' });
   });
 
   r.post('/servers/purge', (req, res) => {

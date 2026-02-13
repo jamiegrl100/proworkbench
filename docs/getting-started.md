@@ -62,6 +62,7 @@ Doctor will guide you to a green setup and tell you what PB can’t do automatic
 3. If tools/MCP are enabled, confirm:
    - execution is WebChat-only
    - risky actions go through Approvals
+4. The default assistant preferred name is **Alex** (you can rename it in WebChat).
 
 ## Browser support
 
@@ -77,4 +78,3 @@ If you see odd UI behavior in Firefox:
 **Recommended:** Chrome / Chromium  
 **Works:** Firefox (best-effort)  
 If something feels “stuck” in Firefox, Chrome is the fastest way to confirm it’s not a server/provider issue.
-

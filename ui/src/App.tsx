@@ -25,15 +25,21 @@ import CanvasPage from "./pages/CanvasPage";
 import MemoryPage from "./pages/MemoryPage";
 import WatchtowerPage from "./pages/WatchtowerPage";
 import WritingLabPage from "./pages/WritingLabPage";
+import WritingProjectsPage from "./pages/WritingProjectsPage";
+import ExtensionsPage from "./pages/ExtensionsPage";
+import WritingLibrariesPage from "./pages/WritingLibrariesPage";
 import FileBrowserPage from "./pages/FileBrowserPage";
+import { getDefaultEnabledPluginIds, getNavItemsFromPlugins, getRoutesFromPlugins } from "./plugins/loader";
 
 type PageKey =
   | "status"
   | "diagnostics"
-  | "doctor"
+  | "er"
   | "canvas"
   | "memory"
   | "watchtower"
+  | "writing-projects"
+  | "writing-libraries"
   | "writing-lab"
   | "files"
   | "approvals"
@@ -47,7 +53,8 @@ type PageKey =
   | "events"
   | "security"
   | "reports"
-  | "settings";
+  | "settings"
+  | "extensions";
 
 type NavItem = {
   key: PageKey;
@@ -58,10 +65,12 @@ type NavItem = {
 const ALLOWED_PAGES = new Set<PageKey>([
   "status",
   "diagnostics",
-  "doctor",
+  "er",
   "canvas",
   "memory",
   "watchtower",
+  "writing-projects",
+  "writing-libraries",
   "writing-lab",
   "files",
   "approvals",
@@ -76,16 +85,19 @@ const ALLOWED_PAGES = new Set<PageKey>([
   "security",
   "reports",
   "settings",
+  "extensions",
 ]);
 
 function getHashPage(): PageKey {
   const rawHash = window.location.hash || "";
   const trimmed = rawHash.startsWith("#/") ? rawHash.slice(2) : rawHash.replace(/^#/, "");
   const candidateHash = trimmed.split("?")[0].split("/")[0] || "";
+  if (candidateHash === "doctor") return "er";
   if (candidateHash && ALLOWED_PAGES.has(candidateHash as PageKey)) return candidateHash as PageKey;
 
-  // Path fallback for first-screen deep links like /doctor, /login etc.
+  // Path fallback for first-screen deep links like /er, /doctor, /login etc.
   const p = String(window.location.pathname || "/").replace(/^\/+/, "");
+  if (p === "doctor" || p.startsWith("doctor/")) return "er";
   const candidatePath = p.split("?")[0].split("/")[0] || "status";
   return ALLOWED_PAGES.has(candidatePath as PageKey) ? (candidatePath as PageKey) : "status";
 }
@@ -94,7 +106,7 @@ function navigate(page: PageKey) {
   const next = `#/${page}`;
   if (window.location.hash !== next) window.location.hash = next;
   try {
-    // Keep a clean path for direct navigation (e.g. /doctor), while still using hash state.
+    // Keep a clean path for direct navigation (e.g. /er), while still using hash state.
     const path = page === "status" ? "/" : `/${page}`;
     if (window.location.pathname !== path) window.history.pushState(null, "", path);
   } catch {
@@ -125,6 +137,7 @@ function AdminShell({
   const [toast, setToast] = useState<{ kind: "info" | "warn"; text: string } | null>(null);
   const [watchtower, setWatchtower] = useState<any>(null);
   const [watchtowerOpen, setWatchtowerOpen] = useState(false);
+  const [enabledPluginIds, setEnabledPluginIds] = useState<string[]>(() => getDefaultEnabledPluginIds());
 
   async function refreshSetup() {
     try {
@@ -140,12 +153,27 @@ function AdminShell({
   useEffect(() => {
     const onHash = () => setPage(getHashPage());
     window.addEventListener("hashchange", onHash);
-    if (!window.location.hash || window.location.hash === "#") navigate("status");
+    if (!window.location.hash || window.location.hash === "#") navigate(getHashPage());
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
   useEffect(() => {
     refreshSetup();
+  }, [adminToken]);
+  useEffect(() => {
+    let stop = false;
+    getJson<any>("/api/plugins/enabled")
+      .then((out) => {
+        if (stop) return;
+        const ids = Array.isArray(out?.enabled) ? out.enabled : getDefaultEnabledPluginIds();
+        setEnabledPluginIds(ids);
+      })
+      .catch(() => {
+        if (!stop) setEnabledPluginIds(getDefaultEnabledPluginIds());
+      });
+    return () => {
+      stop = true;
+    };
   }, [adminToken]);
 
   useEffect(() => {
@@ -293,16 +321,29 @@ function AdminShell({
     return () => clearTimeout(t0);
   }, [toast]);
 
+  const pluginRoutes = useMemo(() => getRoutesFromPlugins(enabledPluginIds), [enabledPluginIds]);
+  const pluginNav = useMemo(() => getNavItemsFromPlugins(enabledPluginIds), [enabledPluginIds]);
+
+  useEffect(() => {
+    const writingEnabled = pluginRoutes.some((r) => r.pageKey === "writing-lab");
+    if (page === "writing-lab" && !writingEnabled) {
+      navigate("status");
+      setToast({ kind: "info", text: "Plugin disabled: Writing Lab" });
+    }
+  }, [page, pluginRoutes]);
+
   const nav = useMemo<NavItem[]>(
-    () => [
+    () => {
+      const base: NavItem[] = [
       { key: "status", label: t("nav.status") },
       { key: "diagnostics", label: t("nav.diagnostics") },
-      { key: "doctor", label: t("nav.doctor") },
+      { key: "er", label: t("nav.doctor") },
       { key: "canvas", label: t("nav.canvas") },
       { key: "memory", label: "Memory" },
       { key: "watchtower", label: "Watchtower" },
-      { key: "writing-lab", label: "Writing Lab" },
-      { key: "models", label: t("nav.models") },
+      { key: "writing-projects", label: "Writing Projects" },
+      { key: "writing-libraries", label: "Writing Libraries" },
+            { key: "models", label: t("nav.models") },
       { key: "webchat", label: t("nav.webchat") },
       { key: "mcp", label: t("nav.mcp") },
       { key: "telegram", label: t("nav.telegram"), badge: pendingBadge > 0 ? pendingBadge : undefined },
@@ -314,8 +355,19 @@ function AdminShell({
       { key: "reports", label: t("nav.reports") },
       { key: "security", label: t("nav.security") },
       { key: "settings", label: t("nav.settings") },
-    ],
-    [pendingBadge, t]
+      { key: "extensions", label: "Extensions" },
+      ];
+      const pluginItems: NavItem[] = pluginNav
+        .map((n) => {
+          const raw = String(n.path || "").replace(/^\/+|\/+$/g, "");
+          const pageKey = (raw.split("/")[0] || "status") as PageKey;
+          if (!ALLOWED_PAGES.has(pageKey)) return null;
+          return { key: pageKey, label: n.label } as NavItem;
+        })
+        .filter((x): x is NavItem => Boolean(x));
+      return [...base, ...pluginItems];
+    },
+    [pendingBadge, t, pluginNav]
   );
 
   const content = (() => {
@@ -324,7 +376,7 @@ function AdminShell({
         return <StatusPage setup={setup} error={setupError} onRefreshSetup={refreshSetup} />;
       case "diagnostics":
         return <DiagnosticsPage />;
-      case "doctor":
+      case "er":
         return <DoctorPage />;
       case "canvas":
         return <CanvasPage />;
@@ -332,8 +384,14 @@ function AdminShell({
         return <MemoryPage />;
       case "watchtower":
         return <WatchtowerPage />;
+      case "writing-projects":
+        return <WritingProjectsPage />;
+      case "writing-libraries":
+        return <WritingLibrariesPage />;
       case "writing-lab":
-        return <WritingLabPage />;
+        return pluginRoutes.some((r) => r.pageKey === "writing-lab") ? <WritingLabPage /> : <StatusPage setup={setup} error={setupError} onRefreshSetup={refreshSetup} />;
+      case "extensions":
+        return <ExtensionsPage enabledPluginIds={enabledPluginIds} onChange={setEnabledPluginIds} />;
       case "files":
         return <FileBrowserPage />;
       case "approvals":
@@ -498,12 +556,16 @@ export default function App() {
   const [switchTokenMode, setSwitchTokenMode] = useState(false);
 
   useEffect(() => {
-    // If a user lands on /doctor while logged out, redirect to /login first.
+    // If a user lands on /er or /doctor while logged out, redirect to /login first.
     try {
       const path = String(window.location.pathname || "/");
-      if (!getToken() && path === "/doctor") {
-        sessionStorage.setItem("pb_next_page", "doctor");
+      if (!getToken() && (path === "/er" || path === "/doctor")) {
+        sessionStorage.setItem("pb_next_page", "er");
         window.history.replaceState(null, "", "/login");
+      }
+      if (path === "/doctor") {
+        window.history.replaceState(null, "", "/er");
+        if (!window.location.hash) window.location.hash = "#/er";
       }
     } catch {
       // ignore
@@ -541,9 +603,9 @@ export default function App() {
         setSwitchTokenMode(false);
         try {
           const next = String(sessionStorage.getItem("pb_next_page") || "");
-          if (next === "doctor") {
+          if (next === "er") {
             sessionStorage.removeItem("pb_next_page");
-            navigate("doctor");
+            navigate("er");
           }
         } catch {
           // ignore

@@ -6,8 +6,9 @@ import rateLimit from 'express-rate-limit';
 
 import { getDataDir } from './util/dataDir.js';
 import { ensureWorkspaceBootstrap, ensureDataHomeBootstrap } from './util/workspaceBootstrap.js';
+import { getWorkspaceRoot } from './util/workspace.js';
 import { openDb, migrate } from './db/db.js';
-import { countAdminTokens } from './auth/adminToken.js';
+import { countAdminTokens, verifyAdminToken } from './auth/adminToken.js';
 import path from 'node:path';
 import { createAuthRouter } from './http/auth.js';
 import { createAdminRouter } from './http/admin.js';
@@ -90,10 +91,20 @@ telegram.startIfReady();
 app.get('/admin/meta', (_req, res) => res.json(meta()));
 
 
+app.get('/admin/health/auth', (req, res) => {
+  const authz = String(req.headers.authorization || '');
+  const bearer = authz.startsWith('Bearer ') ? authz.slice(7).trim() : '';
+  const legacy = String(req.headers['x-pb-admin-token'] || '').trim();
+  const token = bearer || legacy;
+  const tokenCount = countAdminTokens(db);
+  const loggedIn = token ? verifyAdminToken(db, token) : false;
+  res.json({ ok: true, loggedIn, tokenCount, setupComplete: tokenCount > 0 });
+});
+
 app.get('/health', (_req, res) => {
   const bind = process.env.PROWORKBENCH_BIND || '127.0.0.1';
   const port = Number(process.env.PROWORKBENCH_PORT || 8787);
-  res.json({ ok: true, workdir: String(process.env.PB_WORKDIR || ''), dataHome: String(process.env.XDG_DATA_HOME || ''), bind, port, bootstrapped: true });
+  res.json({ ok: true, workdir: getWorkspaceRoot(), dataHome: getDataDir('proworkbench'), bind, port, bootstrapped: true });
 });
 
 app.use('/admin/auth', createAuthRouter({ db }));

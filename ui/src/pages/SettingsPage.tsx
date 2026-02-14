@@ -28,13 +28,15 @@ export default function SettingsPage() {
   const [showPanicConfirm, setShowPanicConfirm] = useState(false);
   const [agentPreamble, setAgentPreamble] = useState('');
   const [defaultPreamble, setDefaultPreamble] = useState('');
+  const [onlineDirectoryEnabled, setOnlineDirectoryEnabled] = useState(false);
 
   async function load() {
     setErr('');
-    const [s, panic, preamble] = await Promise.all([
+    const [s, panic, preamble, ext] = await Promise.all([
       getJson<any>('/admin/security/summary'),
       getJson<any>('/admin/settings/panic-wipe'),
       getJson<any>('/admin/settings/agent-preamble'),
+      getJson<any>('/admin/extensions/settings'),
     ]);
     setSummary(s);
     setUnknownViolations(Number(s?.unknownAutoBlock?.violations || 3));
@@ -45,11 +47,29 @@ export default function SettingsPage() {
     setPanicScope(panic?.default_scope || null);
     setAgentPreamble(String(preamble?.preamble || ''));
     setDefaultPreamble(String(preamble?.default_preamble || ''));
+    setOnlineDirectoryEnabled(Boolean(ext?.onlineDirectoryEnabled));
   }
 
   useEffect(() => {
     load().catch((e: any) => setErr(String(e?.message || e)));
   }, []);
+
+
+  async function saveExtensionsSecurity() {
+    setBusy('extensions');
+    setErr('');
+    try {
+      await postJson('/admin/extensions/settings', {
+        onlineDirectoryEnabled,
+      });
+      toast('Extensions security settings saved.');
+      await load();
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
+    }
+  }
 
   async function saveAdvanced() {
     setBusy('save');
@@ -216,6 +236,29 @@ export default function SettingsPage() {
               r: summary?.rateLimit?.per_minute ?? 20,
             })}
           </div>
+        </div>
+      </Card>
+
+
+      <Card title="Extensions Security">
+        <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
+          Online extensions directory browsing is optional and disabled by default.
+        </div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={onlineDirectoryEnabled}
+            onChange={(e) => setOnlineDirectoryEnabled(e.target.checked)}
+          />
+          <span>Enable online directory browsing</span>
+        </label>
+        <div style={{ marginTop: 10, fontSize: 12, opacity: 0.8 }}>
+          This setting only controls browsing metadata. Installation still requires signed upload and server-side verification.
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <button disabled={busy === 'extensions'} onClick={saveExtensionsSecurity} style={{ padding: '8px 12px' }}>
+            Save extensions security
+          </button>
         </div>
       </Card>
 

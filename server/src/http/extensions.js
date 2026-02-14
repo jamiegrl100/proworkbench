@@ -10,6 +10,26 @@ import {
   uninstallExtension,
 } from '../extensions/installer.js';
 
+
+const ONLINE_DIR_KEY = 'extensions.onlineDirectoryEnabled';
+
+function getOnlineDirectoryEnabled(db) {
+  try {
+    const row = db.prepare('SELECT value_json FROM app_kv WHERE key = ?').get(ONLINE_DIR_KEY);
+    if (!row) return false;
+    const parsed = JSON.parse(String(row.value_json || 'false'));
+    return Boolean(parsed);
+  } catch {
+    return false;
+  }
+}
+
+function setOnlineDirectoryEnabled(db, enabled) {
+  db.prepare('INSERT INTO app_kv (key, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json')
+    .run(ONLINE_DIR_KEY, JSON.stringify(Boolean(enabled)));
+  return Boolean(enabled);
+}
+
 function enabledFilePath() {
   return path.join(path.resolve(getWorkspaceRoot()), '.pb', 'plugins', 'enabled.json');
 }
@@ -33,6 +53,26 @@ async function disablePluginId(id) {
 export function createExtensionsRouter({ db }) {
   const r = express.Router();
   r.use(requireAuth(db));
+
+
+  r.get('/settings', (_req, res) => {
+    try {
+      res.json({ ok: true, onlineDirectoryEnabled: getOnlineDirectoryEnabled(db) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+  r.post('/settings', (req, res) => {
+    try {
+      const enabled = Boolean(req.body?.onlineDirectoryEnabled);
+      const next = setOnlineDirectoryEnabled(db, enabled);
+      recordEvent(db, 'extensions.settings.updated', { onlineDirectoryEnabled: next });
+      res.json({ ok: true, onlineDirectoryEnabled: next });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
 
   r.get('/installed', async (_req, res) => {
     try {

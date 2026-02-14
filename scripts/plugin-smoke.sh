@@ -76,6 +76,25 @@ fi
 curl -sf -X POST "http://127.0.0.1:${PROWORKBENCH_PORT}/api/plugins/enabled" -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"enabled":[]}' >/tmp/pb-plugin-disable.out
 curl -sf -X POST "http://127.0.0.1:${PROWORKBENCH_PORT}/api/plugins/enabled" -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"enabled":["writing-lab"]}' >/tmp/pb-plugin-enable.out
 
+
+# F) upload fails closed without signature
+mkdir -p /tmp/pb-plugin-smoke-pkg/dist
+cat > /tmp/pb-plugin-smoke-pkg/manifest.json <<'JSON'
+{"id":"sample-lab","name":"Sample Lab","version":"0.1.0","entry":"dist/index.js"}
+JSON
+printf 'console.log("ok")\n' > /tmp/pb-plugin-smoke-pkg/dist/index.js
+(cd /tmp/pb-plugin-smoke-pkg && zip -qr /tmp/pb-plugin-smoke.zip manifest.json dist)
+upload_status=$(curl -s -o /tmp/pb-plugin-upload.out -w '%{http_code}' -X POST "http://127.0.0.1:${PROWORKBENCH_PORT}/admin/extensions/upload" -H "Authorization: Bearer $token" -F "file=@/tmp/pb-plugin-smoke.zip")
+if [[ "$upload_status" != "400" ]]; then
+  echo "FAIL: unsigned upload must be blocked (expected 400, got $upload_status)"
+  cat /tmp/pb-plugin-upload.out
+  exit 1
+fi
+if ! rg -q 'SIGNATURE_REQUIRED|SIGNATURE_INVALID' /tmp/pb-plugin-upload.out; then
+  echo "FAIL: unsigned upload did not report signature failure"
+  cat /tmp/pb-plugin-upload.out
+  exit 1
+fi
 # E) writing-lab context still healthy
 wl_status=$(curl -s -o /tmp/pb-plugin-wl.out -w '%{http_code}' "http://127.0.0.1:${PROWORKBENCH_PORT}/admin/writing-lab/context" -H "Authorization: Bearer $token")
 if [[ "$wl_status" != "200" ]]; then

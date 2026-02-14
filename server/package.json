@@ -20,6 +20,7 @@
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2",
-    "@slack/bolt": "^3.17.0"
+    "@slack/bolt": "^3.17.0",
+    "busboy": "^1.6.0"
   }
 }

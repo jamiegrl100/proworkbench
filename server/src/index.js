@@ -31,6 +31,7 @@ import { createMemoryRouter } from './http/memory.js';
 import { createWritingLabRouter } from './http/writingLab.js';
 import { createWritingProjectsRouter } from './http/writingProjects.js';
 import { createPluginsRouter } from './http/plugins.js';
+import { createExtensionsRouter } from './http/extensions.js';
 import { validateCanonPack } from './writingLab/service.js';
 import { getMemoryRetentionDays, pruneMemoryOlderThanDays } from './memory/service.js';
 
@@ -121,6 +122,7 @@ app.use('/admin/memory', createMemoryRouter({ db }));
 app.use('/admin/writing-lab', createWritingLabRouter({ db }));
 app.use('/admin/writing', createWritingProjectsRouter({ db }));
 app.use('/api/plugins', createPluginsRouter({ db }));
+app.use('/admin/extensions', createExtensionsRouter({ db }));
 app.use('/api/admin/memory', createMemoryRouter({ db }));
 app.use('/admin', createAdminRouter({ db, telegram, slack, dataDir }));
 app.get(['/doctor', '/doctor/'], (_req, res) => res.redirect(302, '/er'));

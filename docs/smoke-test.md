@@ -9,8 +9,8 @@ Use this checklist before shipping a preview build.
 - Text WebUI API: `http://127.0.0.1:5000`
 - Admin token available in `localStorage.pb_admin_token`
 
-## 1) Doctor
-1. Open `#/doctor`.
+## 1) ER+
+1. Open `#/er`.
 2. Click `Run checks only`.
 3. Confirm sequential step progress appears and completes.
 4. Click `Fix my setup`.
@@ -20,7 +20,7 @@ Use this checklist before shipping a preview build.
 Expected:
 - No crash.
 - Last report is persisted and visible on reload.
-- If WebUI is down, Doctor says `Needs you` with clear instructions.
+- If WebUI is down, ER+ says `Needs you` with clear instructions.
 
 Common fixes:
 - WebUI down: start Text WebUI manually with API mode.
@@ -56,7 +56,7 @@ Expected:
 
 Common fixes:
 - 401 in requests: set valid `pb_admin_token`.
-- `LLM_NOT_READY`: check Runtime page and Doctor.
+- `LLM_NOT_READY`: check Runtime page and ER+.
 
 ## 4) Tools
 1. Open `#/tools`.
@@ -129,7 +129,7 @@ Expected:
 - Structured cards render without raw JSON spam by default.
 
 Common fixes:
-- If empty, run Doctor or execute a tool to generate Canvas entries.
+- If empty, run ER+ or execute a tool to generate Canvas entries.
 
 ## 9) Final pass
 1. Run `npm run i18n:audit`.
@@ -139,3 +139,17 @@ Common fixes:
 Expected:
 - `i18n:audit` reports no obvious hardcoded UI strings.
 - Build succeeds for UI and server package.
+
+
+## 10) Extensions (Plugin System)
+1. Open `#/extensions`.
+2. Confirm `Writing Lab` is shown and enabled by default.
+3. Disable `Writing Lab` and verify it disappears from nav.
+4. Navigate to `#/writing-lab` and confirm redirect to `#/status` with no crash.
+5. Re-enable `Writing Lab` and verify route/nav return.
+6. Run `npm run plugins:smoke`.
+
+Expected:
+- Missing/corrupt plugin state file falls back to built-in defaults.
+- Unknown plugin IDs are rejected by server API.
+- Disabling a plugin does not break core pages.

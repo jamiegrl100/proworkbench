@@ -27,6 +27,16 @@ export default function LoginScreen({
   const [info, setInfo] = useState("");
   const [bootstrapMode, setBootstrapMode] = useState(false);
 
+  async function recoverLocalToken() {
+    const out = await postJson<{ token: string }>("/admin/setup/bootstrap", { recover: true, confirm: "RECOVER" });
+    const token = String(out?.token || "").trim();
+    if (!token) throw new Error("Recovery token was not returned.");
+    setTokenInput(token);
+    setToken(token);
+    onAuthenticated(token);
+    return token;
+  }
+
   React.useEffect(() => {
     (async () => {
       try {
@@ -60,16 +70,20 @@ export default function LoginScreen({
     setInfo("");
 
     try {
-      // Verify token against a lightweight authenticated endpoint.
-      const verifyRes = await fetch("/admin/health/auth", {
+      // Verify token using auth state endpoint (returns 200 with loggedIn true/false).
+      const verifyRes = await fetch("/admin/auth/state", {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
           "X-PB-Admin-Token": token,
         },
       });
+      const verifyJson = await verifyRes.json().catch(() => ({}));
       if (!verifyRes.ok) {
         throw new Error(t("auth.tokenCheckFailed", { status: verifyRes.status }));
+      }
+      if (!verifyJson?.loggedIn) {
+        throw new Error("This token is not valid for this PB instance.");
       }
 
       setToken(token);
@@ -99,10 +113,16 @@ export default function LoginScreen({
         return;
       }
 
-      // Rotation requires an already-valid token stored in localStorage.
-      // Never overwrite a working token with whatever is in the input box.
+      // If not logged in but setup already completed, allow local recovery bootstrap.
       const current = getToken();
-      if (!current) throw new Error(t("auth.rotateRequiresLogin"));
+      if (!current) {
+        const okRecover = window.confirm("Generate a new local recovery token for this PB instance? This is for when your old token is lost.");
+        if (!okRecover) {
+          throw new Error(t("auth.rotateRequiresLogin"));
+        }
+        await recoverLocalToken();
+        return;
+      }
 
       const rotateRes = await fetch("/admin/security/token/rotate", {
         method: "POST",
@@ -123,6 +143,13 @@ export default function LoginScreen({
             }
           })()
         : null;
+
+      if (!rotateRes.ok && (rotateRes.status === 401 || rotateRes.status === 403)) {
+        // Stale local token: recover locally in one click for day-one resilience.
+        await recoverLocalToken();
+        return;
+      }
+
       if (!rotateRes.ok) {
         throw new Error(t("auth.tokenCheckFailed", { status: rotateRes.status }));
       }

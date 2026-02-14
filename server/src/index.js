@@ -5,6 +5,7 @@ import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 
 import { getDataDir } from './util/dataDir.js';
+import { ensureWorkspaceBootstrap, ensureDataHomeBootstrap } from './util/workspaceBootstrap.js';
 import { openDb, migrate } from './db/db.js';
 import { countAdminTokens } from './auth/adminToken.js';
 import path from 'node:path';
@@ -27,10 +28,15 @@ import { createDoctorRouter } from './http/doctor.js';
 import { createCanvasRouter } from './http/canvas.js';
 import { createMemoryRouter } from './http/memory.js';
 import { createWritingLabRouter } from './http/writingLab.js';
+import { createWritingProjectsRouter } from './http/writingProjects.js';
+import { createPluginsRouter } from './http/plugins.js';
 import { validateCanonPack } from './writingLab/service.js';
 import { getMemoryRetentionDays, pruneMemoryOlderThanDays } from './memory/service.js';
 
 const app = express();
+
+await ensureDataHomeBootstrap('proworkbench');
+await ensureWorkspaceBootstrap();
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan('dev'));
@@ -83,6 +89,13 @@ telegram.startIfReady();
 
 app.get('/admin/meta', (_req, res) => res.json(meta()));
 
+
+app.get('/health', (_req, res) => {
+  const bind = process.env.PROWORKBENCH_BIND || '127.0.0.1';
+  const port = Number(process.env.PROWORKBENCH_PORT || 8787);
+  res.json({ ok: true, workdir: String(process.env.PB_WORKDIR || ''), dataHome: String(process.env.XDG_DATA_HOME || ''), bind, port, bootstrapped: true });
+});
+
 app.use('/admin/auth', createAuthRouter({ db }));
 app.use('/admin/setup', createSetupRouter({ db, dataDir, telegram, slack }));
 app.use('/admin/llm', createLlmRouter({ db, dataDir }));
@@ -90,12 +103,16 @@ app.use('/admin/events', createEventsRouter({ db }));
 app.use('/admin/security', createSecurityRouter({ db }));
 app.use('/admin/runtime/textwebui', createRuntimeTextWebuiRouter({ db }));
 app.use('/admin/mcp', createMcpRouter({ db }));
+app.use('/admin/er', createDoctorRouter({ db, dataDir, telegram, slack }));
 app.use('/admin/doctor', createDoctorRouter({ db, dataDir, telegram, slack }));
 app.use('/admin/canvas', createCanvasRouter({ db }));
 app.use('/admin/memory', createMemoryRouter({ db }));
 app.use('/admin/writing-lab', createWritingLabRouter({ db }));
+app.use('/admin/writing', createWritingProjectsRouter({ db }));
+app.use('/api/plugins', createPluginsRouter({ db }));
 app.use('/api/admin/memory', createMemoryRouter({ db }));
 app.use('/admin', createAdminRouter({ db, telegram, slack, dataDir }));
+app.get(['/doctor', '/doctor/'], (_req, res) => res.redirect(302, '/er'));
 
 app.get('/', (_req, res) =>
   res.type('text/plain').send('Proworkbench server is running. Start the UI dev server.')

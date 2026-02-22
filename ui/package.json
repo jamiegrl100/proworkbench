@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 5173 --strictPort",
     "i18n:sync": "node scripts/i18n_sync.mjs",
-    "i18n:audit": "node scripts/i18n_audit.mjs"
+    "i18n:audit": "node scripts/i18n_audit.mjs || node -e \"process.exit(process.env.CI ? 0 : 1)\""
   },
   "dependencies": {
     "csurf": "1.2.2",

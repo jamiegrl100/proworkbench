@@ -1,0 +1,65 @@
+name: Build Desktop Installers (Artifacts)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Server
+        working-directory: server
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Desktop
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package Desktop
+        working-directory: desktop
+        run: npm run dist
+
+      - name: Upload installers (artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: |
+            desktop/dist-installers/**/*.AppImage
+            desktop/dist-installers/**/*.deb
+            desktop/dist-installers/**/*.exe
+            desktop/dist-installers/**/*.dmg
+          if-no-files-found: error
+          retention-days: 14

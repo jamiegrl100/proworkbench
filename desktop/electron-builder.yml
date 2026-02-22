@@ -1,5 +1,6 @@
 appId: com.proworkbench.app
 productName: ProWorkbench
+
 directories:
   output: dist-installers
 
@@ -17,6 +18,7 @@ asar: true
 win:
   target:
     - nsis
+
 nsis:
   oneClick: true
   perMachine: false
@@ -26,8 +28,8 @@ mac:
     - dmg
 
 linux:
+  maintainer: "Jamie <jamiegrl100@proworkbench.com>"
+  category: Utility
   target:
     - AppImage
     - deb
-    linux:
-  maintainer: "Jamie <jamiegrl100@proworkbench.com>"

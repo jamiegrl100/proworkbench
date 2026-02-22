@@ -1,0 +1,31 @@
+appId: com.proworkbench.app
+productName: ProWorkbench
+directories:
+  output: dist-installers
+
+files:
+  - package.json
+  - from: dist
+    to: dist
+  - from: ../server/dist
+    to: server/dist
+  - from: ../ui/dist
+    to: ui
+
+asar: true
+
+win:
+  target:
+    - nsis
+nsis:
+  oneClick: true
+  perMachine: false
+
+mac:
+  target:
+    - dmg
+
+linux:
+  target:
+    - AppImage
+    - deb

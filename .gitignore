@@ -65,3 +65,21 @@ docs/inventory-map-*.md
 # Optional caches
 writing/cache/
 writing/cache/**
+
+# Desktop build outputs / installers
+desktop/dist-installers/
+desktop/dist/
+dist-installers/
+*.AppImage
+*.dmg
+*.exe
+*.msi
+*.deb
+*.rpm
+*.snap
+
+# Common build outputs
+**/dist/
+**/build/
+**/.vite/
+**/.cache/

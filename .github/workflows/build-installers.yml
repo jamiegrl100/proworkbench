@@ -15,6 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -68,10 +69,10 @@ jobs:
           echo "DMG=$DMG"
 
           echo "Mounting DMG..."
-          hdiutil attach "$DMG" -nobrowse -quiet
-
-          MOUNT="$(mount | grep -i '/Volumes/' | tail -n 1 | awk '{print $3}')"
+          PLIST="$(hdiutil attach "$DMG" -nobrowse -plist)"
+          MOUNT="$(echo "$PLIST" | /usr/libexec/PlistBuddy -c 'Print :system-entities:0:mount-point' /dev/stdin)"
           echo "MOUNT=$MOUNT"
+
           ls -la "$MOUNT"
 
           APP="$(find "$MOUNT" -maxdepth 2 -name '*.app' -print -quit)"
@@ -87,9 +88,6 @@ jobs:
           echo "Info.plist summary:"
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" || true
           /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP/Contents/Info.plist" || true
-
-          echo "codesign verify (may warn if unsigned):"
-          codesign --verify --deep --strict "$APP" || true
 
           echo "Unmounting..."
           hdiutil detach "$MOUNT" -quiet

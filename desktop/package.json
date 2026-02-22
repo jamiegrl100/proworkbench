@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "main": "dist/main.js",
+  "description": "ProWorkbench desktop app",
+  "homepage": "https://proworkbench.com",
+  "author": { "name": "Jamie", "email": "jamiegrl100@proworkbench.com" },
   "type": "commonjs",
   "scripts": {
     "dev": "electron .",

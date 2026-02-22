@@ -29,3 +29,5 @@ linux:
   target:
     - AppImage
     - deb
+    linux:
+  maintainer: "Jamie <jamiegrl100@proworkbench.com>"

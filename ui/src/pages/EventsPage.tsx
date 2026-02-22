@@ -63,7 +63,7 @@ export default function EventsPage() {
   return (
     <div style={{ padding: 16, maxWidth: 1100 }}>
       <h2 style={{ marginTop: 0 }}>{t('page.events.title')}</h2>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title={t('events.filters.title')}>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -102,7 +102,7 @@ export default function EventsPage() {
 
       <Card title={t('events.recent.title')}>
         {filteredEvents.length === 0 ? (
-          <div style={{ marginBottom: 10, padding: 10, border: '1px solid #e5e7eb', borderRadius: 10, background: '#fafafa', fontSize: 13 }}>
+          <div style={{ marginBottom: 10, padding: 10, border: '1px solid var(--border-soft)', borderRadius: 10, background: 'var(--panel-2)', fontSize: 13 }}>
             {typeFilter ? t('events.emptyHelpForType', { type: typeFilter }) : t('events.emptyHelp')}
           </div>
         ) : null}
@@ -111,7 +111,7 @@ export default function EventsPage() {
             <thead>
               <tr>
                 {['ts', 'type', 'summary'].map((h) => (
-                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
+                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>
                     {t(`events.col.${h}`)}
                   </th>
                 ))}
@@ -120,9 +120,9 @@ export default function EventsPage() {
             <tbody>
               {filteredEvents.map((ev) => (
                 <tr key={ev.id}>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.ts}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.type}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.ts}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.type}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>
                     <code style={{ fontSize: 12 }}>{JSON.stringify(ev.payload).slice(0, 400)}</code>
                   </td>
                 </tr>

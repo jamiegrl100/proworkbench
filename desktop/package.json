@@ -1,0 +1,21 @@
+{
+  "name": "proworkbench-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "electron .",
+    "build": "tsc -p tsconfig.json",
+    "dist": "electron-builder -c electron-builder.yml"
+  },
+  "dependencies": {
+    "wait-on": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/wait-on": "^5.3.4",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "typescript": "^5.5.4"
+  }
+}

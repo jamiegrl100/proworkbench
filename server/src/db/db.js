@@ -263,11 +263,45 @@ export function migrate(db) {
       resolved_by_token_fingerprint TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS capability_grants (
+      id TEXT PRIMARY KEY,
+      approval_id INTEGER,
+      job_id TEXT,
+      session_id TEXT,
+      message_id TEXT,
+      tier TEXT NOT NULL,
+      scope_type TEXT NOT NULL,
+      scope_value TEXT NOT NULL,
+      actions_json TEXT NOT NULL,
+      limits_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      granted_by TEXT,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'active'
+    );
+
+    CREATE TABLE IF NOT EXISTS approval_requests (
+      id TEXT PRIMARY KEY,
+      approval_id INTEGER,
+      job_id TEXT,
+      tier TEXT NOT NULL,
+      requested_action_summary TEXT NOT NULL,
+      proposed_grant_json TEXT NOT NULL,
+      why TEXT,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT,
+      resolved_by TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS mcp_templates (
       id TEXT PRIMARY KEY,
       schema_version INTEGER NOT NULL,
       name TEXT NOT NULL,
       description TEXT NOT NULL,
+      template_path TEXT,
+      default_capabilities_json TEXT NOT NULL DEFAULT '[]',
       risk TEXT NOT NULL,
       allowed_channels_json TEXT NOT NULL,
       requires_approval_by_default INTEGER NOT NULL DEFAULT 0,
@@ -292,6 +326,12 @@ export function migrate(db) {
       last_test_message TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mcp_capabilities (
+      server_id TEXT NOT NULL,
+      capability TEXT NOT NULL,
+      UNIQUE(server_id, capability)
     );
 
     CREATE TABLE IF NOT EXISTS mcp_server_logs (
@@ -366,7 +406,123 @@ export function migrate(db) {
       day TEXT NOT NULL,
       kind TEXT NOT NULL DEFAULT 'note',
       content TEXT NOT NULL,
-      meta_json TEXT
+      meta_json TEXT,
+      state TEXT NOT NULL DEFAULT 'committed',
+      committed_at TEXT,
+      title TEXT,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      source_session_id TEXT,
+      user_id TEXT,
+      workspace_id TEXT,
+      agent_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_archive (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      memory_entry_id INTEGER UNIQUE,
+      ts TEXT NOT NULL,
+      day TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'note',
+      content TEXT NOT NULL,
+      title TEXT,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      source_session_id TEXT,
+      user_id TEXT,
+      workspace_id TEXT,
+      agent_id TEXT,
+      meta_json TEXT,
+      committed_at TEXT NOT NULL
+    );
+
+
+    CREATE TABLE IF NOT EXISTS memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      kind TEXT NOT NULL, -- profile | summary
+      content TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(agent_id, chat_id, kind)
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_facts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.8,
+      updated_at TEXT NOT NULL,
+      UNIQUE(agent_id, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS directory_targets (
+      id TEXT PRIMARY KEY,
+      url TEXT NOT NULL UNIQUE,
+      domain TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'directory',
+      status TEXT NOT NULL DEFAULT 'new',
+      last_checked_at TEXT,
+      notes TEXT,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS directory_profiles (
+      id TEXT PRIMARY KEY,
+      site_name TEXT NOT NULL,
+      site_url TEXT NOT NULL,
+      site_description_short TEXT,
+      site_description_long TEXT,
+      contact_email TEXT,
+      category TEXT,
+      keywords TEXT,
+      country TEXT,
+      rss_url TEXT,
+      social_links_json TEXT NOT NULL DEFAULT '{}',
+      logo_url TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS directory_attempts (
+      id TEXT PRIMARY KEY,
+      target_id TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      attempted_at TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      result TEXT NOT NULL,
+      evidence_path TEXT,
+      fields_detected_json TEXT NOT NULL DEFAULT '[]',
+      prefill_map_json TEXT NOT NULL DEFAULT '{}',
+      error TEXT,
+      approval_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS directory_projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      primary_domain TEXT,
+      notes TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS directory_project_targets (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'new',
+      last_submitted_at TEXT,
+      submission_history_json TEXT NOT NULL DEFAULT '[]',
+      pricing_status TEXT NOT NULL DEFAULT 'unknown',
+      cost TEXT,
+      vetted INTEGER NOT NULL DEFAULT 0,
+      last_checked_at TEXT,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(project_id, target_id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_canvas_items_created_at ON canvas_items(created_at);
@@ -376,6 +532,18 @@ export function migrate(db) {
     CREATE INDEX IF NOT EXISTS idx_memory_day ON memory_entries(day);
     CREATE INDEX IF NOT EXISTS idx_memory_ts ON memory_entries(ts);
     CREATE INDEX IF NOT EXISTS idx_memory_kind ON memory_entries(kind);
+    CREATE INDEX IF NOT EXISTS idx_memory_archive_day ON memory_archive(day);
+    CREATE INDEX IF NOT EXISTS idx_memory_archive_committed ON memory_archive(committed_at);
+    CREATE INDEX IF NOT EXISTS idx_memory_archive_source ON memory_archive(source_session_id, committed_at);
+    CREATE INDEX IF NOT EXISTS idx_memories_agent_chat_kind ON memories(agent_id, chat_id, kind);
+    CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_directory_targets_status ON directory_targets(status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_directory_targets_domain ON directory_targets(domain);
+    CREATE INDEX IF NOT EXISTS idx_directory_attempts_target ON directory_attempts(target_id, attempted_at);
+    CREATE INDEX IF NOT EXISTS idx_directory_attempts_domain ON directory_attempts(domain, attempted_at);
+    CREATE INDEX IF NOT EXISTS idx_directory_projects_updated ON directory_projects(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_directory_project_targets_project_status ON directory_project_targets(project_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_mcp_capabilities_server ON mcp_capabilities(server_id);
   `);
 
   // Idempotent column adds for existing DBs.
@@ -383,7 +551,60 @@ export function migrate(db) {
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN last_test_at TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN last_test_status TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN last_test_message TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN health_url TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN entry_cmd TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN install_path TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN version TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_templates ADD COLUMN template_path TEXT').run(); } catch {}
+  try { db.prepare("ALTER TABLE mcp_templates ADD COLUMN default_capabilities_json TEXT NOT NULL DEFAULT '[]'").run(); } catch {}
   try { db.prepare('ALTER TABLE agent_runs ADD COLUMN config_json TEXT').run(); } catch {}
+  try { db.prepare("ALTER TABLE memory_entries ADD COLUMN state TEXT NOT NULL DEFAULT 'committed'").run(); } catch {}
+  try { db.prepare('ALTER TABLE memory_entries ADD COLUMN committed_at TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE memory_entries ADD COLUMN title TEXT').run(); } catch {}
+  try { db.prepare("ALTER TABLE memory_entries ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'").run(); } catch {}
+  try { db.prepare('ALTER TABLE memory_entries ADD COLUMN source_session_id TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE memory_entries ADD COLUMN user_id TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE memory_entries ADD COLUMN workspace_id TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE memory_entries ADD COLUMN agent_id TEXT').run(); } catch {}
+  try { db.prepare('CREATE INDEX IF NOT EXISTS idx_memory_state ON memory_entries(state, ts)').run(); } catch {}
+  try {
+    db.exec(`
+      UPDATE memory_entries
+      SET state = 'committed'
+      WHERE state IS NULL OR TRIM(state) = '';
+      UPDATE memory_entries
+      SET committed_at = ts
+      WHERE state = 'committed' AND (committed_at IS NULL OR TRIM(committed_at) = '');
+    `);
+  } catch {}
+  try {
+    db.exec(`
+      INSERT OR IGNORE INTO memory_archive
+        (memory_entry_id, ts, day, kind, content, title, tags_json, source_session_id, user_id, workspace_id, agent_id, meta_json, committed_at)
+      SELECT
+        id,
+        ts,
+        day,
+        kind,
+        content,
+        title,
+        COALESCE(tags_json, '[]'),
+        source_session_id,
+        user_id,
+        workspace_id,
+        agent_id,
+        meta_json,
+        COALESCE(committed_at, ts)
+      FROM memory_entries
+      WHERE state = 'committed' OR state IS NULL OR TRIM(state) = '';
+    `);
+  } catch {}
+
+  try { db.prepare("ALTER TABLE directory_project_targets ADD COLUMN pricing_status TEXT NOT NULL DEFAULT 'unknown'").run(); } catch {}
+  try { db.prepare('ALTER TABLE directory_project_targets ADD COLUMN cost TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE directory_project_targets ADD COLUMN vetted INTEGER NOT NULL DEFAULT 0').run(); } catch {}
+  try { db.prepare('ALTER TABLE directory_project_targets ADD COLUMN last_checked_at TEXT').run(); } catch {}
+  try { db.prepare("ALTER TABLE directory_project_targets ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'").run(); } catch {}
 
   // Back-compat cleanup: legacy canvas write tool id. Canvas writes never require approval.
   try {
@@ -414,6 +635,52 @@ export function migrate(db) {
     `);
   } catch {}
 
+  // Migrate old approval-gated memory write proposals into durable draft memory entries.
+  try {
+    const proposals = db.prepare(`
+      SELECT id, session_id, args_json, status
+      FROM web_tool_proposals
+      WHERE tool_name IN ('memory.write_scratch', 'memory.append')
+        AND status IN ('awaiting_approval', 'ready', 'blocked')
+    `).all();
+    const now = new Date().toISOString();
+    const insertDraft = db.prepare(`
+      INSERT INTO memory_entries
+        (ts, day, kind, content, meta_json, state, committed_at, source_session_id, workspace_id, title, tags_json)
+      VALUES (?, ?, 'note', ?, ?, 'draft', NULL, ?, ?, ?, ?)
+    `);
+    const markDone = db.prepare(`
+      UPDATE web_tool_proposals
+      SET status = 'migrated_to_draft', requires_approval = 0, approval_id = NULL
+      WHERE id = ?
+    `);
+    for (const row of proposals) {
+      const args = (() => {
+        try { return JSON.parse(String(row.args_json || '{}')) || {}; } catch { return {}; }
+      })();
+      const text = String(args.text ?? args.content ?? '').trim();
+      if (!text) {
+        markDone.run(row.id);
+        continue;
+      }
+      const day = String(args.day || now.slice(0, 10));
+      insertDraft.run(
+        now,
+        day,
+        text,
+        JSON.stringify({ migrated_from_proposal: row.id, migrated_at: now }),
+        String(row.session_id || 'migrated'),
+        process.env.PB_WORKDIR || process.env.PROWORKBENCH_WORKDIR || '',
+        null,
+        '[]'
+      );
+      markDone.run(row.id);
+      try {
+        db.prepare(`UPDATE approvals SET status = 'superseded', resolved_at = ? WHERE proposal_id = ? AND status = 'pending'`).run(now, row.id);
+      } catch {}
+    }
+  } catch {}
+
   // Ensure admin_auth row exists
   const row = db.prepare('SELECT id FROM admin_auth WHERE id = 1').get();
   if (!row) {
@@ -421,6 +688,44 @@ export function migrate(db) {
   }
 
   db.prepare('DELETE FROM admin_tokens WHERE datetime(expires_at) <= datetime(?)').run(new Date().toISOString());
+
+
+  // Startup cleanup for ephemeral capability grants (session/job scoped).
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_capability_grants_status_exp
+      ON capability_grants(status, expires_at);
+      CREATE INDEX IF NOT EXISTS idx_capability_grants_job_scope
+      ON capability_grants(job_id, tier, scope_type, scope_value);
+      CREATE INDEX IF NOT EXISTS idx_approval_requests_approval_status
+      ON approval_requests(approval_id, status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_approval_requests_job_status
+      ON approval_requests(job_id, status, created_at);
+    `);
+  } catch {}
+
+  try {
+    const now = new Date().toISOString();
+    if (hasTable(db, 'capability_grants')) {
+      db.prepare(`
+        UPDATE capability_grants
+        SET status = 'expired', expires_at = ?
+        WHERE status = 'active' AND (job_id IS NOT NULL OR session_id IS NOT NULL OR message_id IS NOT NULL)
+      `).run(now);
+      db.prepare(`
+        UPDATE capability_grants
+        SET status = 'expired'
+        WHERE status = 'active' AND datetime(expires_at) <= datetime(?)
+      `).run(now);
+    }
+    if (hasTable(db, 'approval_requests')) {
+      db.prepare(`
+        UPDATE approval_requests
+        SET status = 'denied', resolved_at = COALESCE(resolved_at, ?), why = COALESCE(why, 'expired_on_startup')
+        WHERE status = 'pending' AND created_at <= datetime(?, '-8 hours')
+      `).run(now, now);
+    }
+  } catch {}
 
   // One-time compatibility migration: merge legacy approvals tables into unified approvals table
   // when running the first time after upgrading.

@@ -5,7 +5,6 @@ export type TableColumn<T> = { key: string; label: string; render?: (r: T) => Re
 export default function Table<T>({
   rows,
   columns,
-  // actions is accepted for compatibility but intentionally unused to preserve current behavior
   actions,
 }: {
   rows: T[];
@@ -14,11 +13,11 @@ export default function Table<T>({
 }) {
   return (
     <div style={{ overflowX: 'auto' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+      <table className="pb-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
           <tr>
             {columns.map((c) => (
-              <th key={c.key} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
+              <th key={c.key} style={{ textAlign: 'left', fontSize: 12, padding: '8px 6px' }}>
                 {c.label}
               </th>
             ))}
@@ -28,7 +27,7 @@ export default function Table<T>({
           {rows.map((r, idx) => (
             <tr key={`${(r as any)?.chat_id}:${idx}`}>
               {columns.map((c) => (
-                <td key={c.key} style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>
+                <td key={c.key} style={{ padding: '10px 6px', fontSize: 13 }}>
                   {c.render ? c.render(r) : ((r as any)?.[c.key] ?? '—')}
                 </td>
               ))}

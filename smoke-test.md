@@ -9,8 +9,8 @@ Use this checklist before shipping a preview build.
 - Text WebUI API: `http://127.0.0.1:5000`
 - Admin token available in `localStorage.pb_admin_token`
 
-## 1) Doctor
-1. Open `#/doctor`.
+## 1) ER+
+1. Open `#/er`.
 2. Click `Run checks only`.
 3. Confirm sequential step progress appears and completes.
 4. Click `Fix my setup`.
@@ -20,7 +20,7 @@ Use this checklist before shipping a preview build.
 Expected:
 - No crash.
 - Last report is persisted and visible on reload.
-- If WebUI is down, Doctor says `Needs you` with clear instructions.
+- If WebUI is down, ER+ says `Needs you` with clear instructions.
 
 Common fixes:
 - WebUI down: start Text WebUI manually with API mode.
@@ -56,7 +56,7 @@ Expected:
 
 Common fixes:
 - 401 in requests: set valid `pb_admin_token`.
-- `LLM_NOT_READY`: check Runtime page and Doctor.
+- `LLM_NOT_READY`: check Runtime page and ER+.
 
 ## 4) Tools
 1. Open `#/tools`.
@@ -129,7 +129,7 @@ Expected:
 - Structured cards render without raw JSON spam by default.
 
 Common fixes:
-- If empty, run Doctor or execute a tool to generate Canvas entries.
+- If empty, run ER+ or execute a tool to generate Canvas entries.
 
 ## 9) Final pass
 1. Run `npm run i18n:audit`.

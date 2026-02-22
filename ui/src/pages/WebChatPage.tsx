@@ -68,13 +68,46 @@ type SystemState = {
   };
 };
 
+
+
+type McpTemplateOption = {
+  id: string;
+  name: string;
+  enabledInWebChat?: boolean;
+  defaultCapabilities?: string[];
+};
+
+type Context7Info = {
+  libraryId?: string | null;
+  query?: string | null;
+  sources?: string[];
+  snippets?: string[];
+};
+
+type BrowseTrace = {
+  route?: 'direct' | 'mcp' | string;
+  mcp_server_id?: string | null;
+  urls_visited?: string[];
+  chars_extracted?: number;
+  durations?: Record<string, number>;
+  total_duration_ms?: number;
+  stages?: Array<Record<string, any>>;
+};
+
 type Msg = {
   id: string;
   role: "user" | "assistant" | "system";
   text: string;
   ts: string;
+  source_type?: 'builtin' | 'mcp' | 'unknown' | null;
+  mcp_server_id?: string | null;
+  sources?: string[];
+  browse_trace?: BrowseTrace | null;
+  context7?: Context7Info | null;
   proposal?: Proposal | null;
   run?: ToolRun | null;
+  memory_injected_preview?: string | null;
+  memory_last_updated_at?: string | null;
 };
 
 type HelperPreset = {
@@ -84,10 +117,24 @@ type HelperPreset = {
   helperTitles: string[];
   helperInstructions: string[];
 };
+type ApiDiagEntry = {
+  method: string;
+  url: string;
+  status: number;
+  durationMs: number;
+  ok: boolean;
+  requestId?: string | null;
+  error?: string | null;
+  at: string;
+};
+
 
 function nowTs() {
   return new Date().toISOString();
 }
+
+const MCP_SELECTED_KEY = 'pb_webchat_mcp_server_id';
+const MCP_TEMPLATE_SELECTED_KEY = 'pb_webchat_mcp_template_id';
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -101,12 +148,24 @@ function shortJson(v: any) {
   }
 }
 
+
+function hasRawHtmlLeak(text: string) {
+  const s = String(text || '');
+  if (!s) return false;
+  if (/<html|<head|<body|<script|<style/i.test(s)) return true;
+  const tagCount = (s.match(/<[^>]+>/g) || []).length;
+  if (tagCount >= 12) return true;
+  if (/all regions\s+argentina\s+australia/i.test(s)) return true;
+  if (/duckduckgo|result__a|safe search/i.test(s)) return true;
+  return false;
+}
+
 function riskPill(risk: string) {
   const r = String(risk || "").toLowerCase();
-  if (r === "low") return { bg: "#dcfce7", fg: "#166534" };
-  if (r === "medium") return { bg: "#fef9c3", fg: "#92400e" };
-  if (r === "high") return { bg: "#ffedd5", fg: "#9a3412" };
-  return { bg: "#fee2e2", fg: "#b00020" };
+  if (r === "low") return { bg: "color-mix(in srgb, var(--ok) 16%, var(--panel))", fg: "var(--ok)" };
+  if (r === "medium") return { bg: "color-mix(in srgb, var(--warn) 18%, var(--panel))", fg: "var(--warn)" };
+  if (r === "high") return { bg: "color-mix(in srgb, var(--warn) 22%, var(--panel))", fg: "var(--warn)" };
+  return { bg: "color-mix(in srgb, var(--bad) 18%, var(--panel))", fg: "var(--bad)" };
 }
 
 function summarizeArgs(args: any) {
@@ -153,6 +212,24 @@ function formatBytes(n: number) {
   if (x < 1024) return `${x} B`;
   if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KB`;
   return `${(x / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+
+function getStableWebchatSessionId() {
+  try {
+    const existing = String(localStorage.getItem('pb_webchat_session_id') || '').trim();
+    if (existing) return existing;
+    const next = 'webchat-main';
+    localStorage.setItem('pb_webchat_session_id', next);
+    return next;
+  } catch {
+    return 'webchat-main';
+  }
+}
+
+function isAbortLikeWebchatError(err: any) {
+  const s = String(err?.detail?.error || err?.message || err || '').toLowerCase();
+  return s.includes('abort') || s.includes('client_disconnected') || s.includes('client disconnected') || s.includes('cancel');
 }
 
 function loadHelperPresets(): HelperPreset[] {
@@ -209,11 +286,13 @@ function parseHelpersFile(text: string) {
 export default function WebChatPage() {
   const { t } = useI18n();
   const { state: runtimeState } = useRuntimeStatePoll(true);
-  const sessionIdRef = useRef<string>(`web-${Math.random().toString(36).slice(2, 10)}`);
+  const sessionIdRef = useRef<string>(getStableWebchatSessionId());
   const [messages, setMessages] = useState<Msg[]>([]);
   const messagesRef = useRef<Msg[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const [activeSendMessageId, setActiveSendMessageId] = useState<string | null>(null);
+  const activeSendAbortRef = useRef<AbortController | null>(null);
   const [powerUser, setPowerUser] = useState<boolean>(() => localStorage.getItem("pb_power_user") === "1");
   const [helpersCount, setHelpersCount] = useState<number>(0);
   const [helpersConfigOpen, setHelpersConfigOpen] = useState(false);
@@ -239,16 +318,55 @@ export default function WebChatPage() {
   const systemStateHashRef = useRef<string>("");
   const [provider, setProvider] = useState("Text WebUI");
   const [model, setModel] = useState("—");
-  const [mcpServers, setMcpServers] = useState<{ id: string; name: string; status: string; approvedForUse: boolean; lastTestStatus?: string; lastTestAt?: string | null; needsTest?: boolean }[]>([]);
-  const [mcpServerId, setMcpServerId] = useState<string>("");
+  const [memoryState, setMemoryState] = useState<{ enabled: boolean; lastUpdatedAt: string | null; profileChars: number; summaryChars: number }>(() => ({ enabled: true, lastUpdatedAt: null, profileChars: 0, summaryChars: 0 }));
+  const [mcpServers, setMcpServers] = useState<{ id: string; name: string; status: string; templateId: string; approvedForUse: boolean; enabledInWebChat?: boolean; hasBrowser?: boolean; lastTestStatus?: string; lastTestAt?: string | null; needsTest?: boolean }[]>([]);
+  const [mcpTemplates, setMcpTemplates] = useState<McpTemplateOption[]>([]);
+  const [mcpServerId, setMcpServerId] = useState<string>(() => String(localStorage.getItem(MCP_SELECTED_KEY) || '').trim());
+  const [mcpTemplateId, setMcpTemplateId] = useState<string>(() => { const v = String(localStorage.getItem(MCP_TEMPLATE_SELECTED_KEY) || '').trim(); return v === 'context7' ? 'code1' : (v === 'context7_docs_default' ? 'code1_docs_default' : v); });
   const [err, setErr] = useState("");
   const [toastMsg, setToastMsg] = useState("");
+  const [diagCalls, setDiagCalls] = useState<ApiDiagEntry[]>([]);
+  const [diagLastError, setDiagLastError] = useState<{ message: string; requestId?: string | null } | null>(null);
+  const [diagOpen, setDiagOpen] = useState(false);
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
   const [systemInfoRawOpen, setSystemInfoRawOpen] = useState(false);
+  const composerInputRef = useRef<HTMLInputElement | null>(null);
+  const [sendDebug, setSendDebug] = useState<string>("idle");
+  const [sendSeq, setSendSeq] = useState<number>(0);
 
   function toast(msg: string) {
     setToastMsg(msg);
     window.setTimeout(() => setToastMsg(""), 3000);
+  }
+
+  useEffect(() => {
+    function onApiCall(ev: Event) {
+      const detail = (ev as CustomEvent).detail as ApiDiagEntry | undefined;
+      if (!detail || typeof detail !== "object") return;
+      setDiagCalls((prev) => [detail, ...prev].slice(0, 20));
+      if (!detail.ok) {
+        setDiagLastError({ message: String(detail.error || "Unknown API error"), requestId: detail.requestId || null });
+      }
+    }
+    window.addEventListener("pb-api-call", onApiCall as EventListener);
+    return () => window.removeEventListener("pb-api-call", onApiCall as EventListener);
+  }, []);
+
+  function copyDiagnostics() {
+    const lines: string[] = [];
+    lines.push(`Generated: ${new Date().toISOString()}`);
+    if (diagLastError) {
+      lines.push(`Last error: ${diagLastError.message}`);
+      lines.push(`Last requestId: ${diagLastError.requestId || "(none)"}`);
+    }
+    lines.push("Recent API calls:");
+    for (const c of diagCalls) {
+      lines.push(`${c.at} ${c.method} ${c.url} -> ${c.status} (${c.durationMs}ms) req=${c.requestId || "-"} ${c.ok ? "OK" : `ERR:${c.error || ""}`}`);
+    }
+    const textOut = lines.join("\n");
+    navigator.clipboard?.writeText(textOut)
+      .then(() => toast("Diagnostics copied"))
+      .catch(() => toast("Copy failed"));
   }
 
   function fillDefaultHelpers() {
@@ -285,6 +403,22 @@ export default function WebChatPage() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    const sid = String(mcpServerId || '').trim();
+    const tid = String(mcpTemplateId || '').trim();
+    if (sid) localStorage.setItem(MCP_SELECTED_KEY, sid);
+    else localStorage.removeItem(MCP_SELECTED_KEY);
+    if (tid) localStorage.setItem(MCP_TEMPLATE_SELECTED_KEY, tid);
+    else localStorage.removeItem(MCP_TEMPLATE_SELECTED_KEY);
+    postJson('/admin/webchat/session-meta', {
+      session_id: sessionIdRef.current,
+      assistant_name: assistantName,
+      mcp_server_id: sid,
+      mcp_template_id: tid,
+    }).catch(() => {});
+  }, [mcpServerId, mcpTemplateId]);
+
 
   async function refreshSystemState({ toastOnChange }: { toastOnChange: boolean }) {
     const next = await getJson<SystemState>("/admin/system/state");
@@ -324,25 +458,79 @@ export default function WebChatPage() {
 
   async function refreshMcpServers() {
     try {
-      const list = await getJson<any[]>("/admin/mcp/servers");
+      const [tplRaw, list] = await Promise.all([
+        getJson<any[]>('/api/mcp/templates').catch(() => []),
+        getJson<any[]>('/api/mcp/servers'),
+      ]);
+      const templates = (Array.isArray(tplRaw) ? tplRaw : []).map((t) => ({
+        id: String(t?.id || ''),
+        name: String(t?.name || t?.id || ''),
+        enabledInWebChat: Boolean(t?.enabledInWebChat ?? true),
+        defaultCapabilities: Array.isArray(t?.defaultCapabilities) ? t.defaultCapabilities.map((x: any) => String(x || '')) : [],
+      })).filter((t) => t.id);
+      setMcpTemplates(templates);
+
       const rows = Array.isArray(list) ? list : [];
       const maxAgeMs = 24 * 60 * 60 * 1000;
       const usable = rows
-        .filter((s) => String(s?.status) === "running" && Boolean(s?.approvedForUse))
-        .map((s) => ({
-          id: String(s.id),
-          name: String(s.name || s.id),
-          status: String(s.status),
-          approvedForUse: Boolean(s.approvedForUse),
-          lastTestStatus: String(s.lastTestStatus || "never"),
-          lastTestAt: s.lastTestAt ? String(s.lastTestAt) : null,
-          needsTest:
-            String(s.lastTestStatus || "never") !== "pass" ||
-            !s.lastTestAt ||
-            (Date.now() - new Date(String(s.lastTestAt)).getTime() > maxAgeMs),
-        }));
+        .filter((s) => !Boolean((s as any)?.hidden))
+        .map((s) => {
+          const caps = Array.isArray(s?.capabilities) ? s.capabilities.map((x: any) => String(x || '')) : [];
+          const hasBrowser = caps.includes('browser.open_url') || caps.includes('browser.extract_text') || caps.includes('browser.search');
+          return {
+            id: String(s.id),
+            name: String(s.name || s.id),
+            status: String(s.status),
+            templateId: String(s.templateId || s.template_id || ''),
+            approvedForUse: Boolean(s.approvedForUse ?? s.enabled),
+            enabledInWebChat: Boolean(s.enabledInWebChat ?? s.enabled ?? s.approvedForUse),
+            hasBrowser,
+            lastTestStatus: String(s.lastTestStatus || "never"),
+            lastTestAt: s.lastTestAt ? String(s.lastTestAt) : null,
+            needsTest:
+              String(s.lastTestStatus || "never") !== "pass" ||
+              !s.lastTestAt ||
+              (Date.now() - new Date(String(s.lastTestAt)).getTime() > maxAgeMs),
+          };
+        });
       setMcpServers(usable);
-      if (!mcpServerId && usable.length > 0) setMcpServerId(usable[0].id);
+
+      const enabledTemplateIds = new Set(templates.filter((t) => Boolean(t.enabledInWebChat)).map((t) => t.id));
+      const stored = String(localStorage.getItem(MCP_SELECTED_KEY) || '').trim();
+      const storedTemplateRaw = String(localStorage.getItem(MCP_TEMPLATE_SELECTED_KEY) || '').trim();
+      const storedTemplate = storedTemplateRaw === 'context7' ? 'code1' : (storedTemplateRaw === 'context7_docs_default' ? 'code1_docs_default' : storedTemplateRaw);
+      const preferredTemplate = (mcpTemplateId || storedTemplate).trim();
+      const preferred = (mcpServerId || stored).trim();
+
+      if (preferredTemplate && enabledTemplateIds.has(preferredTemplate)) {
+        const fromTemplate = usable.find((u) => u.templateId === preferredTemplate && u.status === 'running') || usable.find((u) => u.templateId === preferredTemplate);
+        setMcpTemplateId(preferredTemplate);
+        localStorage.setItem(MCP_TEMPLATE_SELECTED_KEY, preferredTemplate);
+        if (fromTemplate) {
+          setMcpServerId(fromTemplate.id);
+          localStorage.setItem(MCP_SELECTED_KEY, fromTemplate.id);
+          return;
+        }
+      }
+
+      if (preferred && usable.some((u) => u.id === preferred)) {
+        setMcpServerId(preferred);
+        const match = usable.find((u) => u.id === preferred);
+        if (match?.templateId) {
+          setMcpTemplateId(match.templateId);
+          localStorage.setItem(MCP_TEMPLATE_SELECTED_KEY, match.templateId);
+        }
+      } else if (usable.length > 0) {
+        const pick = usable.find((u) => u.status === 'running') || usable[0];
+        setMcpServerId(pick.id);
+        localStorage.setItem(MCP_SELECTED_KEY, pick.id);
+        if (pick.templateId) {
+          setMcpTemplateId(pick.templateId);
+          localStorage.setItem(MCP_TEMPLATE_SELECTED_KEY, pick.templateId);
+        }
+      } else {
+        setMcpServerId('');
+      }
     } catch {
       // ignore
     }
@@ -363,6 +551,17 @@ export default function WebChatPage() {
       const n = String(out?.meta?.assistant_name || "Alex").trim() || "Alex";
       setAssistantName(n);
       setAssistantNameDraft(n);
+      const sid = String(out?.meta?.mcp_server_id || '').trim();
+      const tidRaw = String(out?.meta?.mcp_template_id || '').trim();
+      const tid = tidRaw === 'context7' ? 'code1' : (tidRaw === 'context7_docs_default' ? 'code1_docs_default' : tidRaw);
+      if (tid) {
+        setMcpTemplateId(tid);
+        localStorage.setItem(MCP_TEMPLATE_SELECTED_KEY, tid);
+      }
+      if (sid) {
+        setMcpServerId(sid);
+        localStorage.setItem(MCP_SELECTED_KEY, sid);
+      }
     } catch {
       // ignore
     }
@@ -567,30 +766,55 @@ export default function WebChatPage() {
     }
   }
 
-  async function send() {
-    const payload = text.trim();
+  async function send(rawText?: string) {
+    const payload = [rawText, text, composerInputRef.current?.value]
+      .map((v) => String(v ?? "").trim())
+      .find((v) => v.length > 0) || "";
+    setSendSeq((n) => n + 1);
+    setSendDebug(`handler-fired payload_len=${payload.length}`);
     if (!payload) return;
 
     const messageId = `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const pendingId = `assistant-pending-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const abortController = new AbortController();
+    activeSendAbortRef.current = abortController;
+    setActiveSendMessageId(pendingId);
     setSending(true);
     setErr("");
     setMessages((prev) => [
       ...prev,
       { id: messageId, role: "user", text: payload, ts: nowTs() },
+      { id: pendingId, role: "assistant", text: "Sending…", ts: nowTs() },
     ]);
+    setSendDebug(`pending-added id=${pendingId}`);
     setText("");
 
     try {
-      const r = await postJson<any>("/admin/webchat/send", {
+      setSendDebug("network-start /admin/webchat/send");
+      const reqPayload = {
         session_id: sessionIdRef.current,
         message_id: messageId,
         message: payload,
+        agent_id: 'alex',
         mcp_server_id: mcpServerId || null,
-      });
+        mcp_template_id: mcpTemplateId || null,
+      };
+      console.debug('[webchat.send]', { mcpServerId, mcpTemplateId, session_id: reqPayload.session_id, message_id: reqPayload.message_id });
+      const r = await postJson<any>("/admin/webchat/send", reqPayload, { signal: abortController.signal });
+      console.debug('[webchat.send.response]', { ok: r?.ok, source_type: r?.source_type, mcp_server_id: r?.mcp_server_id, mcp_template_id: r?.mcp_template_id });
+      setSendDebug("network-success");
       const reply = String(r?.reply || "").trim() || t("webchat.noAssistantReply");
       const proposal = r?.proposal ? (r.proposal as Proposal) : null;
       if (r?.provider) setProvider(String(r.provider));
       if (r?.model) setModel(String(r.model));
+      if (r?.memory && typeof r.memory === 'object') {
+        setMemoryState({
+          enabled: Boolean(r.memory.enabled),
+          lastUpdatedAt: r.memory.last_updated_at ? String(r.memory.last_updated_at) : null,
+          profileChars: Number(r.memory.profile_chars || 0),
+          summaryChars: Number(r.memory.summary_chars || 0),
+        });
+      }
       if (r?.session_meta?.assistant_name) {
         const n = String(r.session_meta.assistant_name || "").trim();
         if (n) {
@@ -598,32 +822,72 @@ export default function WebChatPage() {
           setAssistantNameDraft(n);
         }
       }
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `assistant-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-          role: "assistant",
-          text: reply,
-          ts: nowTs(),
-          proposal,
-        },
-      ]);
+      setMessages((prev) => {
+        let replaced = false;
+        const next = prev.map((m) => {
+          if (m.id !== pendingId) return m;
+          replaced = true;
+          return {
+            ...m,
+            text: reply,
+            source_type: String(r?.source_type || '').trim() ? String(r.source_type) as any : 'builtin',
+            mcp_server_id: r?.mcp_server_id ? String(r.mcp_server_id) : null,
+            sources: Array.isArray(r?.sources) ? r.sources.map((x: any) => String(x || '')).filter(Boolean) : [],
+            browse_trace: (r?.browse_trace && typeof r.browse_trace === 'object') ? r.browse_trace : null,
+            proposal,
+            memory_injected_preview: r?.memory?.injected_preview ? String(r.memory.injected_preview) : null,
+            memory_last_updated_at: r?.memory?.last_updated_at ? String(r.memory.last_updated_at) : null,
+            ts: nowTs(),
+          };
+        });
+        if (!replaced) {
+          next.push({ id: `assistant-${Date.now().toString(36)}`, role: "assistant", text: reply, ts: nowTs(), proposal, memory_injected_preview: r?.memory?.injected_preview ? String(r.memory.injected_preview) : null, memory_last_updated_at: r?.memory?.last_updated_at ? String(r.memory.last_updated_at) : null });
+        }
+        return next;
+      });
     } catch (e: any) {
-      const message = String(e?.detail?.error || e?.message || e);
-      setErr(message);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `system-${Date.now().toString(36)}`,
-          role: "system",
-          text: message,
-          ts: nowTs(),
-        },
-      ]);
+      console.debug('[webchat.send.error]', e?.detail || e);
+      setSendDebug(`network-error ${String(e?.detail?.error || e?.message || e)}`);
+      const aborted = isAbortLikeWebchatError(e);
+      const detailObj = e?.detail && typeof e.detail === 'object' ? e.detail : null;
+      const stage = detailObj?.detail?.stage || detailObj?.stage || '';
+      const stageUrl = detailObj?.detail?.url || detailObj?.url || '';
+      const remediation = detailObj?.detail?.remediation || detailObj?.remediation || '';
+      const baseMessage = String(e?.detail?.error || e?.detail?.message || e?.message || e);
+      const message = stage
+        ? `${baseMessage}${stage ? ` | stage=${stage}` : ''}${stageUrl ? ` | url=${stageUrl}` : ''}${remediation ? ` | remediation=${remediation}` : ''}`
+        : baseMessage;
+      if (!aborted) setErr(message);
+      setMessages((prev) => {
+        let replaced = false;
+        const next = prev.map((m) => {
+          if (m.id !== pendingId) return m;
+          replaced = true;
+          return {
+            ...m,
+            text: aborted ? "Canceled." : `Error: ${message}`,
+            role: aborted ? "assistant" : "system",
+            ts: nowTs(),
+          };
+        });
+        if (!replaced) {
+          next.push({
+            id: `assistant-err-${Date.now().toString(36)}`,
+            role: aborted ? "assistant" : "system",
+            text: aborted ? "Canceled." : `Error: ${message}`,
+            ts: nowTs(),
+          });
+        }
+        return next;
+      });
     } finally {
+      setSendDebug((s) => `${s} | finally`);
       setSending(false);
+      setActiveSendMessageId(null);
+      activeSendAbortRef.current = null;
     }
   }
+
 
   async function runWithHelpers() {
     const payload = text.trim();
@@ -697,6 +961,53 @@ export default function WebChatPage() {
     return latest?.run as ToolRun;
   }
 
+  async function runMemoryActionProbe(proposal: Proposal) {
+    const tool = String(proposal.tool_name || "");
+    const args = (proposal.args_json || {}) as any;
+    if (tool !== "memory.search" && tool !== "memory_search" && tool !== "memory.write_scratch" && tool !== "memory.append" && tool !== "memory_get" && tool !== "memory.get") {
+      return;
+    }
+
+    try {
+      if (tool === "memory.search" || tool === "memory_search") {
+        const q = String(args.q || "").trim();
+        const scope = String(args.scope || "all");
+        const limit = Math.max(1, Math.min(Number(args.limit || 80) || 80, 200));
+        toast("Searching memory...");
+        console.info("[webchat] memory.search", { endpoint: "/api/memory/search", scope, limit, qPresent: Boolean(q) });
+        await postJson<any>("/api/memory/search", { q, scope, limit, session_id: sessionIdRef.current, source: "webchat-proposal", proposal_id: proposal.id });
+        toast("Memory search completed");
+        return;
+      }
+      if (tool === "memory.write_scratch" || tool === "memory.append") {
+        const day = String(args.day || "").trim() || undefined;
+        const textValue = String(args.text ?? args.content ?? "");
+        toast("Writing memory...");
+        console.info("[webchat] memory.write", { endpoint: "/api/memory/write", day: day || "(default)", bytes: textValue.length });
+        await postJson<any>("/api/memory/write", { day, text: textValue, session_id: sessionIdRef.current, source: "webchat-proposal", proposal_id: proposal.id });
+        toast("Memory write completed");
+        return;
+      }
+      if (tool === "memory_get" || tool === "memory.get") {
+        const relPath = String(args.path || "").trim();
+        const mode = String(args.mode || "tail");
+        const maxBytes = Math.max(256, Math.min(Number(args.maxBytes || 16384) || 16384, 1024 * 1024));
+        toast("Loading memory...");
+        console.info("[webchat] memory.get", { endpoint: "/api/memory/get", path: relPath, mode, maxBytes });
+        await getJson<any>(`/api/memory/get?path=${encodeURIComponent(relPath)}&mode=${encodeURIComponent(mode)}&maxBytes=${maxBytes}`);
+        toast("Memory load completed");
+      }
+    } catch (preErr: any) {
+      const msg = String(preErr?.detail?.message || preErr?.detail?.error || preErr?.message || preErr);
+      const reqId = String(preErr?.detail?.requestId || "");
+      const withReq = reqId ? `${msg} (requestId: ${reqId})` : msg;
+      console.error("[webchat] memory action failed", { tool, error: withReq });
+      setDiagLastError({ message: withReq, requestId: reqId || null });
+      toast(`Memory action failed${reqId ? ` (req ${reqId})` : ""}`);
+      throw new Error(withReq);
+    }
+  }
+
   async function invokeTool(proposal: Proposal) {
     const pid = proposal.id;
     if (!pid) return;
@@ -734,6 +1045,8 @@ export default function WebChatPage() {
     setProposalUi((prev) => ({ ...prev, [pid]: { ...(prev[pid] || { showDetails: false }), status: "running" } }));
     setErr("");
     try {
+      await runMemoryActionProbe(proposal);
+
       const payload: any = { proposal_id: pid };
       if (proposal.tool_name === "workspace.delete") {
         payload.confirm_delete = String(deleteConfirmText[pid] || "").trim();
@@ -811,6 +1124,9 @@ export default function WebChatPage() {
           <div style={{ display: "grid", gap: 6 }}>
             <h2 style={{ margin: 0 }}>{t("page.webchat.title")}</h2>
             <div style={{ fontSize: 12, opacity: 0.8, marginTop: 2 }}>{statusLine}</div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginTop: 2 }}>
+              Memory: {memoryState.enabled ? 'ON' : 'OFF'} · profile {memoryState.profileChars} chars · chat {memoryState.summaryChars} chars{memoryState.lastUpdatedAt ? ` · updated ${new Date(memoryState.lastUpdatedAt).toLocaleTimeString()}` : ''}
+            </div>
             <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
               <span>Assistant name</span>
               <input
@@ -831,6 +1147,48 @@ export default function WebChatPage() {
           </div>
           <CommandCenterIndicator state={runtimeState} assistantName={assistantName} />
         </div>
+        <div style={{ marginTop: 8, border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10, background: "var(--panel)" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+            <strong style={{ fontSize: 13 }}>Diagnostics</strong>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button type="button" onClick={() => setDiagOpen((v) => !v)} style={{ padding: "4px 8px" }}>
+                {diagOpen ? "Hide" : "Show"}
+              </button>
+              <button type="button" onClick={copyDiagnostics} style={{ padding: "4px 8px" }}>
+                Copy diagnostics
+              </button>
+            </div>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}>
+            Last error: {diagLastError ? `${diagLastError.message}${diagLastError.requestId ? ` (requestId: ${diagLastError.requestId})` : ""}` : "None"}
+          </div>
+          {diagOpen ? (
+            <div style={{ marginTop: 8, maxHeight: 220, overflow: "auto", border: "1px solid var(--border-soft)", borderRadius: 8 }}>
+              <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ textAlign: "left", background: "var(--panel-2)" }}>
+                    <th style={{ padding: "6px 8px" }}>Time</th>
+                    <th style={{ padding: "6px 8px" }}>Method</th>
+                    <th style={{ padding: "6px 8px" }}>URL</th>
+                    <th style={{ padding: "6px 8px" }}>Status</th>
+                    <th style={{ padding: "6px 8px" }}>Duration</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {diagCalls.map((c, idx) => (
+                    <tr key={`${c.at}-${idx}`} style={{ borderTop: "1px solid var(--border-soft)" }}>
+                      <td style={{ padding: "6px 8px", whiteSpace: "nowrap" }}>{new Date(c.at).toLocaleTimeString()}</td>
+                      <td style={{ padding: "6px 8px" }}>{c.method}</td>
+                      <td style={{ padding: "6px 8px", maxWidth: 380, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.url}>{c.url}</td>
+                      <td style={{ padding: "6px 8px" }}>{c.status}{c.requestId ? ` · ${c.requestId}` : ""}</td>
+                      <td style={{ padding: "6px 8px" }}>{c.durationMs}ms</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </div>
         <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
           {t("webchat.toolDraftHelp")}
         </div>
@@ -841,9 +1199,9 @@ export default function WebChatPage() {
             style={{
               padding: "6px 10px",
               borderRadius: 999,
-              border: "1px solid #bfdbfe",
-              background: "#eff6ff",
-              color: "#1e3a8a",
+              border: "1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))",
+              background: "color-mix(in srgb, var(--accent-2) 10%, var(--panel))",
+              color: "var(--accent-2)",
               fontSize: 12,
               maxWidth: "100%",
               whiteSpace: "nowrap",
@@ -859,10 +1217,10 @@ export default function WebChatPage() {
           {systemInfoOpen ? (
             <div
               style={{
-                border: "1px solid #bfdbfe",
+                border: "1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))",
                 borderRadius: 10,
-                background: "#eff6ff",
-                color: "#1e3a8a",
+                background: "color-mix(in srgb, var(--accent-2) 10%, var(--panel))",
+                color: "var(--accent-2)",
                 padding: "8px 10px",
                 fontSize: 12,
                 width: "100%",
@@ -896,7 +1254,7 @@ export default function WebChatPage() {
                 <button
                   type="button"
                   onClick={() => setSystemInfoRawOpen((v) => !v)}
-                  style={{ padding: "4px 8px", borderRadius: 8, border: "1px solid #dbeafe", background: "#fff" }}
+                  style={{ padding: "4px 8px", borderRadius: 8, border: "1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))", background: "var(--panel)" }}
                 >
                   {systemInfoRawOpen ? t("webchat.systemSummary.hideRaw") : t("webchat.systemSummary.viewRaw")}
                 </button>
@@ -910,8 +1268,8 @@ export default function WebChatPage() {
                     margin: 0,
                     padding: 8,
                     borderRadius: 8,
-                    border: "1px solid #dbeafe",
-                    background: "#fff",
+                    border: "1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))",
+                    background: "var(--panel)",
                     overflow: "auto",
                     maxHeight: 220,
                   }}
@@ -934,7 +1292,7 @@ export default function WebChatPage() {
             </select>
             <button
               onClick={() => setHelpersConfigOpen((v) => !v)}
-              style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+              style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--panel)" }}
             >
               {helpersConfigOpen ? t("common.close") : t("webchat.helpers.config.open")}
             </button>
@@ -945,7 +1303,7 @@ export default function WebChatPage() {
           </div>
         ) : null}
         {powerUser && helpersConfigOpen ? (
-          <div style={{ marginTop: 10, border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: "#fafafa", display: "grid", gap: 10 }}>
+          <div style={{ marginTop: 10, border: "1px solid var(--border-soft)", borderRadius: 12, padding: 12, background: "var(--panel-2)", display: "grid", gap: 10 }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
               <div style={{ fontWeight: 900 }}>{t("webchat.helpers.config.title")}</div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -1027,7 +1385,7 @@ export default function WebChatPage() {
                 >
                   {t("common.delete")}
                 </button>
-                <label style={{ padding: "6px 10px", border: "1px solid #ddd", background: "#fff", borderRadius: 10, cursor: "pointer", fontSize: 12 }}>
+                <label style={{ padding: "6px 10px", border: "1px solid var(--border)", background: "var(--panel)", borderRadius: 10, cursor: "pointer", fontSize: 12 }}>
                   {t("webchat.helpers.config.importFile")}
                   <input
                     type="file"
@@ -1064,10 +1422,10 @@ export default function WebChatPage() {
                 const ins = helperInstructions[idx] || "";
                 const errMsg = helperErrors[i] || "";
                 return (
-                  <div key={i} style={{ border: "1px solid #eee", borderRadius: 12, padding: 10, background: "#fff", display: "grid", gap: 8 }}>
+                  <div key={i} style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 10, background: "var(--panel)", display: "grid", gap: 8 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                       <div style={{ fontWeight: 900 }}>{t("webchat.helpers.config.helperN", { n: i })}</div>
-                      {errMsg ? <div style={{ fontSize: 12, color: "#b00020" }}>{errMsg}</div> : null}
+                      {errMsg ? <div style={{ fontSize: 12, color: "var(--bad)" }}>{errMsg}</div> : null}
                     </div>
                     <div style={{ display: "grid", gap: 6 }}>
                       <label style={{ fontSize: 12, opacity: 0.85 }}>{t("webchat.helpers.config.titleLabel")}</label>
@@ -1105,33 +1463,61 @@ export default function WebChatPage() {
         ) : null}
         <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ fontSize: 12, opacity: 0.8 }}>{t("webchat.mcp.label")}</div>
-          <select value={mcpServerId} onChange={(e) => setMcpServerId(e.target.value)} style={{ padding: 6, minWidth: 280 }}>
+          <select
+            value={mcpTemplateId}
+            onChange={(e) => {
+              const tid = String(e.target.value || '').trim();
+              setMcpTemplateId(tid);
+              if (!tid) return;
+              const match = mcpServers.find((x) => x.templateId === tid);
+              if (match) setMcpServerId(match.id);
+            }}
+            style={{ padding: 6, minWidth: 220 }}
+          >
+            <option value="">Template (auto)</option>
+            {Array.from(new Set(mcpServers.map((x) => x.templateId).filter(Boolean))).map((tid) => (
+              <option key={tid} value={tid}>{tid}</option>
+            ))}
+          </select>
+          <select
+            value={mcpServerId}
+            onChange={(e) => {
+              const sid = String(e.target.value || '').trim();
+              setMcpServerId(sid);
+              const match = mcpServers.find((x) => x.id === sid);
+              if (match?.templateId) setMcpTemplateId(match.templateId);
+            }}
+            style={{ padding: 6, minWidth: 280 }}
+          >
             <option value="">{t("webchat.mcp.none")}</option>
             {mcpServers.map((s) => (
               <option key={s.id} value={s.id}>
-                {s.name} ({s.id}){s.needsTest ? ` - ${t("webchat.mcp.needsTest")}` : ""}
+                {s.name} ({s.id}) [{s.templateId || 'no-template'}] {s.status}{s.hasBrowser ? ' • browser' : ''}{s.needsTest ? ` - ${t("webchat.mcp.needsTest")}` : ""}
               </option>
             ))}
           </select>
           <a href="#/mcp" style={{ fontSize: 12 }}>{t("webchat.mcp.manage")}</a>
+          {!mcpServerId ? (
+            <span style={{ fontSize: 12, color: 'var(--warn)' }}>No MCP server selected.</span>
+          ) : null}
         </div>
       </div>
 
       {toastMsg ? (
-        <div style={{ padding: 10, border: "1px solid #c8e6c9", background: "#e8f5e9", borderRadius: 8, color: "#065f46" }}>
+        <div style={{ padding: 10, border: "1px solid color-mix(in srgb, var(--ok) 45%, var(--border))", background: "color-mix(in srgb, var(--ok) 14%, var(--panel))", borderRadius: 8, color: "var(--ok)" }}>
           {toastMsg}
         </div>
       ) : null}
 
       {err ? (
-        <div style={{ padding: 10, border: "1px solid #f1c6c6", background: "#fff4f4", borderRadius: 8, color: "#b00020" }}>
+        <div style={{ padding: 10, border: "1px solid color-mix(in srgb, var(--bad) 45%, var(--border))", background: "color-mix(in srgb, var(--bad) 12%, var(--panel))", borderRadius: 8, color: "var(--bad)" }}>
           {err}
         </div>
       ) : null}
 
       <div
         style={{
-          border: "1px solid #e5e7eb",
+          border: "1px solid var(--border-soft)",
           borderRadius: 10,
           padding: 10,
           minHeight: 260,
@@ -1154,17 +1540,69 @@ export default function WebChatPage() {
                 style={{
                   padding: 8,
                   borderRadius: 8,
-                  background: m.role === "user" ? "#eef6ff" : m.role === "assistant" ? "#f7f7f7" : "#fff8ed",
-                  border: "1px solid #ececec",
+                  background: m.role === "user" ? "color-mix(in srgb, var(--accent-2) 10%, var(--panel))" : m.role === "assistant" ? "var(--panel-2)" : "color-mix(in srgb, var(--warn) 10%, var(--panel))",
+                  border: "1px solid var(--border-soft)",
                   display: "grid",
                   gap: 8,
                 }}
               >
                 <div style={{ fontSize: 11, opacity: 0.7 }}>{m.role.toUpperCase()} • {m.ts}</div>
                 <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+                {m.role === 'assistant' && hasRawHtmlLeak(m.text) ? (
+                  <div style={{ padding: 8, borderRadius: 8, border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 16%, var(--panel))', fontSize: 12 }}>
+                    Raw HTML detected — extraction failed.
+                    <button
+                      style={{ marginLeft: 10 }}
+                      onClick={() => {
+                        console.warn('[webchat.raw_html_detected]', { messageId: m.id, preview: String(m.text || '').slice(0, 500) });
+                        window.alert('Raw HTML was detected and logged to browser console as webchat.raw_html_detected.');
+                      }}
+                    >
+                      Report
+                    </button>
+                  </div>
+                ) : null}
+                {m.role === 'assistant' && m.source_type ? (
+                  <div style={{ fontSize: 12, opacity: 0.78 }}>
+                    Route: {m.source_type === 'mcp' ? `MCP Browse${m.mcp_server_id ? ` (${m.mcp_server_id})` : ''}` : 'Direct'}
+                    {Array.isArray(m.sources) && m.sources.length ? ` • sources: ${m.sources.slice(0, 3).join(', ')}` : ''}
+                  </div>
+                ) : null}
+                {m.role === 'assistant' && m.context7 ? (
+                  <div style={{ fontSize: 12, opacity: 0.82 }}>
+                    Code1 used: libraryId={String(m.context7.libraryId || '-')} • query={String(m.context7.query || '-')}
+                    {Array.isArray(m.context7.sources) && m.context7.sources.length ? ` • docs: ${m.context7.sources.slice(0, 3).join(', ')}` : ''}
+                  </div>
+                ) : null}
+
+                {m.role === 'assistant' && m.memory_injected_preview ? (
+                  <details style={{ border: '1px solid var(--border-soft)', borderRadius: 8, padding: '6px 8px', background: 'var(--panel)' }}>
+                    <summary style={{ cursor: 'pointer', fontSize: 12 }}>
+                      Injected memory preview{m.memory_last_updated_at ? ` • updated ${new Date(m.memory_last_updated_at).toLocaleTimeString()}` : ''}
+                    </summary>
+                    <div style={{ fontSize: 12, marginTop: 6, whiteSpace: 'pre-wrap' }}>{m.memory_injected_preview}</div>
+                  </details>
+                ) : null}
+
+                {m.role === 'assistant' && m.browse_trace ? (
+                  <details style={{ border: '1px solid var(--border-soft)', borderRadius: 8, padding: '6px 8px', background: 'var(--panel)' }}>
+                    <summary style={{ cursor: 'pointer', fontSize: 12 }}>
+                      Tool Trace: route={String(m.browse_trace.route || 'unknown')} • chars={Number(m.browse_trace.chars_extracted || 0)} • duration={Number(m.browse_trace.total_duration_ms || 0)}ms
+                    </summary>
+                    <div style={{ fontSize: 12, marginTop: 6, whiteSpace: 'pre-wrap' }}>
+                      server: {String(m.browse_trace.mcp_server_id || '-')}
+
+                      urls: {Array.isArray(m.browse_trace.urls_visited) ? m.browse_trace.urls_visited.join(', ') : '-'}
+
+                      durations: {shortJson(m.browse_trace.durations || {})}
+
+                      stages: {shortJson(m.browse_trace.stages || [])}
+                    </div>
+                  </details>
+                ) : null}
 
                 {p ? (
-                  <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, background: "#fff" }}>
+                  <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 10, background: "var(--panel)" }}>
                     {(() => {
                       const derivedStatus = proposalDerivedStatus(p);
                       const sourceLabel = proposalSourceLabel(p);
@@ -1183,13 +1621,13 @@ export default function WebChatPage() {
                     </div>
 
                     {derivedStatus === "blocked" ? (
-                      <div style={{ padding: 8, borderRadius: 8, border: "1px solid #f4d0d0", background: "#fff3f3", color: "#b00020", fontSize: 12, marginBottom: 8 }}>
+                      <div style={{ padding: 8, borderRadius: 8, border: "1px solid color-mix(in srgb, var(--bad) 40%, var(--border))", background: "color-mix(in srgb, var(--bad) 14%, var(--panel))", color: "var(--bad)", fontSize: 12, marginBottom: 8 }}>
                         {t("webchat.invokeBlockedPolicy")} {p.effective_reason ? `(${p.effective_reason})` : ""}
                       </div>
                     ) : null}
 
                     {derivedStatus === "awaiting_approval" ? (
-                      <div style={{ padding: 8, borderRadius: 8, border: "1px solid #fde68a", background: "#fffbeb", color: "#92400e", fontSize: 12, marginBottom: 8 }}>
+                      <div style={{ padding: 8, borderRadius: 8, border: "1px solid color-mix(in srgb, var(--warn) 45%, var(--border))", background: "color-mix(in srgb, var(--warn) 16%, var(--panel))", color: "var(--warn)", fontSize: 12, marginBottom: 8 }}>
                         {t("webchat.proposal.needsApproval")}
                       </div>
                     ) : null}
@@ -1207,15 +1645,15 @@ export default function WebChatPage() {
                         </div>
                       ) : null}
                       {p.requires_approval ? (
-                        <div style={{ fontSize: 12, color: "#92400e" }}>
+                        <div style={{ fontSize: 12, color: "var(--warn)" }}>
                           {t("webchat.proposal.needsApproval")}
                         </div>
                       ) : null}
                     </div>
 
                     {p.tool_name === "workspace.delete" || p.tool_name === "memory.delete_day" ? (
-                      <div style={{ marginBottom: 8, padding: 8, borderRadius: 8, border: "1px solid #f4d0d0", background: "#fff3f3" }}>
-                        <div style={{ fontSize: 12, color: "#7f1d1d", marginBottom: 6 }}>
+                      <div style={{ marginBottom: 8, padding: 8, borderRadius: 8, border: "1px solid color-mix(in srgb, var(--bad) 40%, var(--border))", background: "color-mix(in srgb, var(--bad) 14%, var(--panel))" }}>
+                        <div style={{ fontSize: 12, color: "var(--bad)", marginBottom: 6 }}>
                           {p.tool_name === "workspace.delete"
                             ? "High-risk delete proposal. Type DELETE to confirm execution."
                             : `High-risk memory delete proposal. Type DELETE ${String((p.args_json as any)?.day || "YYYY-MM-DD")} to confirm execution.`}
@@ -1296,8 +1734,8 @@ export default function WebChatPage() {
                           marginTop: 8,
                           maxHeight: 160,
                           overflow: "auto",
-                          background: "#fafafa",
-                          border: "1px solid #eee",
+                          background: "var(--panel-2)",
+                          border: "1px solid var(--border-soft)",
                           padding: 8,
                           fontSize: 12,
                         }}
@@ -1317,7 +1755,7 @@ export default function WebChatPage() {
                 ) : null}
 
                 {run ? (
-                  <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, background: "#fff" }}>
+                  <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 10, background: "var(--panel)" }}>
                     <div style={{ fontWeight: 700, marginBottom: 6 }}>{t("webchat.runResult.title")}</div>
                     <div style={{ fontSize: 13, marginBottom: 6 }}>
                       {t("webchat.runResult.run")}: <b>{run.id}</b> · {t("webchat.runResult.status")}: <b>{run.status}</b>
@@ -1328,7 +1766,7 @@ export default function WebChatPage() {
                       ) : null}
                       <button
                         onClick={() => setRunUi((prev) => ({ ...prev, [run.id]: { showDetails: !runDetails } }))}
-                        style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+                        style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--panel)" }}
                       >
                         {runDetails ? t("webchat.runResult.hideDetails") : t("webchat.runResult.viewDetails")}
                       </button>
@@ -1336,9 +1774,9 @@ export default function WebChatPage() {
 
                     {runDetails ? (
                       <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
-                        {run.stdout ? <pre style={{ margin: 0, padding: 8, background: "#fafafa", border: "1px solid #eee", maxHeight: 120, overflow: "auto" }}>{run.stdout}</pre> : null}
-                        {run.stderr ? <pre style={{ margin: 0, padding: 8, background: "#fff3f3", border: "1px solid #f4d0d0", maxHeight: 120, overflow: "auto" }}>{run.stderr}</pre> : null}
-                        {run.result_json ? <pre style={{ margin: 0, padding: 8, background: "#f8fafc", border: "1px solid #e2e8f0", maxHeight: 180, overflow: "auto" }}>{shortJson(run.result_json)}</pre> : null}
+                        {run.stdout ? <pre style={{ margin: 0, padding: 8, background: "var(--panel-2)", border: "1px solid var(--border-soft)", maxHeight: 120, overflow: "auto" }}>{run.stdout}</pre> : null}
+                        {run.stderr ? <pre style={{ margin: 0, padding: 8, background: "color-mix(in srgb, var(--bad) 14%, var(--panel))", border: "1px solid color-mix(in srgb, var(--bad) 40%, var(--border))", maxHeight: 120, overflow: "auto" }}>{run.stderr}</pre> : null}
+                        {run.result_json ? <pre style={{ margin: 0, padding: 8, background: "var(--panel-2)", border: "1px solid var(--border-soft)", maxHeight: 180, overflow: "auto" }}>{shortJson(run.result_json)}</pre> : null}
                       </div>
                     ) : null}
                   </div>
@@ -1349,8 +1787,12 @@ export default function WebChatPage() {
         )}
       </div>
 
+      <div style={{ fontSize: 12, opacity: 0.85, border: "1px dashed var(--border-soft)", borderRadius: 8, padding: "6px 8px" }}>
+        send_debug: seq={sendSeq} sending={sending ? "1" : "0"} active={activeSendMessageId || "-"} text_len={text.length} step={sendDebug}
+      </div>
+
       <div style={{ display: "flex", gap: 8 }}>
-        <label style={{ padding: "10px 12px", border: "1px solid #ddd", borderRadius: 8, background: "#fff", cursor: uploading ? "not-allowed" : "pointer", opacity: uploading ? 0.7 : 1 }}>
+        <label style={{ padding: "10px 12px", border: "1px solid var(--border)", borderRadius: 8, background: "var(--panel)", cursor: uploading ? "not-allowed" : "pointer", opacity: uploading ? 0.7 : 1 }}>
           {uploading ? "Uploading..." : "Upload"}
           <input
             type="file"
@@ -1366,22 +1808,37 @@ export default function WebChatPage() {
           />
         </label>
         <input
+          ref={composerInputRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              send();
+              e.stopPropagation();
+              if (!sending) void send();
             }
           }}
           placeholder={t("webchat.input.placeholder")}
           style={{ flex: 1, padding: 10 }}
         />
-        <button onClick={send} disabled={sending || !text.trim()} style={{ padding: "10px 14px" }}>
+        <button type="button" onClick={() => { void send(); }} disabled={sending} style={{ padding: "10px 14px" }}>
           {sending ? t("webchat.input.sending") : t("webchat.input.send")}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            const ctrl = activeSendAbortRef.current;
+            if (!ctrl) return;
+            ctrl.abort();
+          }}
+          disabled={!sending || !activeSendMessageId}
+          style={{ padding: "10px 14px" }}
+        >
+          Stop
         </button>
         {powerUser ? (
           <button
+            type="button"
             onClick={runWithHelpers}
             disabled={sending || agentBusy || helpersCount <= 0 || !text.trim()}
             style={{ padding: "10px 14px", fontWeight: 900 }}
@@ -1393,11 +1850,11 @@ export default function WebChatPage() {
       </div>
 
       {uploads.length > 0 ? (
-        <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10, display: "grid", gap: 8 }}>
+        <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10, display: "grid", gap: 8 }}>
           <div style={{ fontSize: 12, fontWeight: 700 }}>Reference uploads (session context)</div>
           <div style={{ display: "grid", gap: 6 }}>
             {uploads.map((u) => (
-              <div key={u.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, border: "1px solid #f0f0f0", borderRadius: 8, padding: "6px 8px" }}>
+              <div key={u.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, border: "1px solid var(--border-soft)", borderRadius: 8, padding: "6px 8px" }}>
                 <div style={{ display: "grid", gap: 2 }}>
                   <div style={{ fontSize: 13, fontWeight: 600 }}>{u.filename}</div>
                   <div style={{ fontSize: 11, opacity: 0.75 }}>{formatBytes(u.size_bytes)} • {u.rel_path}</div>
@@ -1412,12 +1869,12 @@ export default function WebChatPage() {
       ) : null}
 
       {powerUser && agentBatch ? (
-        <section style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>
+        <section style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
               <div style={{ fontWeight: 900 }}>{t("webchat.helpers.swarmTitle")}</div>
               {budgetMode ? (
-                <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "#e0f2fe", color: "#075985", border: "1px solid #bae6fd" }}>
+                <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "color-mix(in srgb, var(--accent-2) 14%, var(--panel))", color: "var(--accent-2)", border: "1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))" }}>
                   {t("webchat.helpers.config.budgetBadge")}
                 </span>
               ) : null}
@@ -1447,12 +1904,12 @@ export default function WebChatPage() {
               const errText = String(r?.error_text || "");
               const isBudget = Boolean(cfg?.budgetMode);
               return (
-                <div key={id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 10, background: "#fafafa" }}>
+                <div key={id} style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 10, background: "var(--panel-2)" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                       <div style={{ fontWeight: 900 }}>{t("webchat.helpers.helperCard", { n: idx + 1, role })}</div>
                       {isBudget ? (
-                        <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "#e0f2fe", color: "#075985", border: "1px solid #bae6fd" }}>
+                        <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "color-mix(in srgb, var(--accent-2) 14%, var(--panel))", color: "var(--accent-2)", border: "1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))" }}>
                           {t("webchat.helpers.config.budgetBadge")}
                         </span>
                       ) : null}
@@ -1460,11 +1917,11 @@ export default function WebChatPage() {
                     <div style={{ fontSize: 12, opacity: 0.8 }}>{t("webchat.helpers.status", { status })}</div>
                   </div>
                   {status === "done" ? (
-                    <pre style={{ margin: "10px 0 0", padding: 10, background: "#0b1220", color: "#e5e7eb", borderRadius: 10, overflow: "auto", fontSize: 12 }}>
+                    <pre style={{ margin: "10px 0 0", padding: 10, background: "var(--bg)", color: "var(--border-soft)", borderRadius: 10, overflow: "auto", fontSize: 12 }}>
                       {outText.slice(0, 2000)}
                     </pre>
                   ) : status === "error" ? (
-                    <div style={{ marginTop: 10, color: "#b00020", fontSize: 12 }}>{errText || t("common.unknown")}</div>
+                    <div style={{ marginTop: 10, color: "var(--bad)", fontSize: 12 }}>{errText || t("common.unknown")}</div>
                   ) : status === "cancelled" ? (
                     <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>{t("webchat.helpers.cancelled")}</div>
                   ) : (

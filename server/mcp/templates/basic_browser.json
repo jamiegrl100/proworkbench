@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "basic_browser",
+  "name": "Basic Browser MCP",
+  "description": "Open URL, extract text, and screenshot for web/media browsing.",
+  "risk": "low",
+  "allowedChannels": [
+    "webchat"
+  ],
+  "requiresApprovalByDefault": false,
+  "fields": [
+    {
+      "key": "baseUrl",
+      "label": "Base URL",
+      "type": "text",
+      "required": false,
+      "default": ""
+    }
+  ],
+  "securityDefaults": {
+    "testPlan": [
+      "GET /health",
+      "browser.open_url https://example.com",
+      "browser.extract_text https://example.com",
+      "browser.screenshot https://example.com"
+    ]
+  },
+  "defaultCapabilities": [
+    "browser.open_url",
+    "browser.extract_text",
+    "browser.screenshot"
+  ]
+}

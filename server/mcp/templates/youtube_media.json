@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "youtube_media",
+  "name": "YouTube MCP",
+  "description": "Open video URL and basic media controls (stub).",
+  "risk": "low",
+  "allowedChannels": [
+    "webchat"
+  ],
+  "requiresApprovalByDefault": false,
+  "fields": [],
+  "securityDefaults": {
+    "testPlan": [
+      "GET /health",
+      "open youtube video url",
+      "play/pause",
+      "seek/volume"
+    ]
+  },
+  "defaultCapabilities": [
+    "browser.open_url",
+    "video.play",
+    "video.pause",
+    "video.seek",
+    "video.volume"
+  ]
+}

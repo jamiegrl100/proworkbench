@@ -8,9 +8,9 @@ Use this as the source copy for `proworkbench.com` landing pages.
 - WebChat-only execution: Telegram/Slack remain chat-only (notifications/inbox), no execution.
 
 ## Feature highlights
-- Doctor self-heal checks with clear `OK / FIXED / NEEDS YOU / CAN'T FIX`.
+- ER+ self-heal checks with clear `OK / FIXED / NEEDS YOU / CAN'T FIX`.
 - MCP presets gallery (15 templates) with Test/Start/Stop/Logs.
-- Canvas command center with persistent cards for tools, MCP, Doctor, and helper outputs.
+- Canvas command center with persistent cards for tools, MCP, ER+, and helper outputs.
 - Optional helper swarm (power user mode) with presets and budget mode.
 - Telegram allowlist editor with silent-ignore behavior for unknown users.
 

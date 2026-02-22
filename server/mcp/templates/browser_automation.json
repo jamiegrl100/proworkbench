@@ -2,13 +2,11 @@
   "schemaVersion": 1,
   "id": "browser_automation",
   "name": "Browser Automation (Headless)",
-  "description": "Headless browser tasks restricted to allowlisted domains.",
+  "description": "Headless browser tasks restricted by Global Allowlist (Admin -> Security -> Browser Access).",
   "risk": "high",
   "allowedChannels": ["webchat"],
   "requiresApprovalByDefault": true,
-  "fields": [
-    { "key": "domainAllowlistCsv", "label": "Allowed domains (comma separated)", "type": "csv", "required": true }
-  ],
+  "fields": [],
   "securityDefaults": {
     "workdirOnly": true,
     "pathAllowlist": ["{PB_WORKDIR}"],

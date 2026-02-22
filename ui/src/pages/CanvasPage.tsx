@@ -25,15 +25,15 @@ type CanvasItem = {
 };
 
 function pill(status: CanvasStatus) {
-  if (status === "ok") return { bg: "#dcfce7", fg: "#166534", label: "OK" };
-  if (status === "warn") return { bg: "#fef9c3", fg: "#92400e", label: "WARN" };
-  return { bg: "#fee2e2", fg: "#b00020", label: "ERROR" };
+  if (status === "ok") return { bg: "color-mix(in srgb, var(--ok) 16%, var(--panel))", fg: "var(--ok)", label: "OK" };
+  if (status === "warn") return { bg: "color-mix(in srgb, var(--warn) 18%, var(--panel))", fg: "var(--warn)", label: "WARN" };
+  return { bg: "color-mix(in srgb, var(--bad) 18%, var(--panel))", fg: "var(--bad)", label: "ERROR" };
 }
 
 function kindLabel(kind: CanvasKind) {
   if (kind === "tool_result") return "Tool";
   if (kind === "mcp_result") return "MCP";
-  if (kind === "doctor_report") return "Doctor";
+  if (kind === "doctor_report") return "ER+";
   if (kind === "report") return "Report";
   return "Note";
 }
@@ -72,8 +72,8 @@ function MarkdownView({ text }: { text: string }) {
         key={key}
         style={{
           margin: 0,
-          background: "#0b1020",
-          color: "#e5e7eb",
+          background: "var(--bg)",
+          color: "var(--border-soft)",
           padding: 10,
           borderRadius: 10,
           overflow: "auto",
@@ -149,12 +149,12 @@ function TableView({ data }: { data: any[] }) {
   ).slice(0, 12);
   if (rows.length === 0) return <div style={{ opacity: 0.8 }}>{t("canvas.table.noRows")}</div>;
   return (
-    <div style={{ overflow: "auto", border: "1px solid #eee", borderRadius: 10 }}>
+    <div style={{ overflow: "auto", border: "1px solid var(--border-soft)", borderRadius: 10 }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
         <thead>
-          <tr style={{ background: "#fafafa" }}>
+          <tr style={{ background: "var(--panel-2)" }}>
             {cols.map((c) => (
-              <th key={c} style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>
+              <th key={c} style={{ textAlign: "left", padding: 8, borderBottom: "1px solid var(--border-soft)" }}>
                 {c}
               </th>
             ))}
@@ -164,7 +164,7 @@ function TableView({ data }: { data: any[] }) {
           {rows.slice(0, 200).map((r, idx) => (
             <tr key={idx}>
               {cols.map((c) => (
-                <td key={c} style={{ padding: 8, borderTop: "1px solid #f3f4f6", verticalAlign: "top" }}>
+                <td key={c} style={{ padding: 8, borderTop: "1px solid var(--panel-2)", verticalAlign: "top" }}>
                   {(() => {
                     const v = (r as any)?.[c];
                     if (v === null || v === undefined) return "";
@@ -345,7 +345,7 @@ export default function CanvasPage() {
       { key: "all", label: "All" },
       { key: "tools", label: "Tools" },
       { key: "mcp", label: "MCP" },
-      { key: "doctor", label: "Doctor" },
+      { key: "doctor", label: "ER+" },
       { key: "helpers", label: "Helpers" },
       { key: "reports", label: "Reports" },
       { key: "notes", label: "Notes" },
@@ -379,14 +379,14 @@ export default function CanvasPage() {
       </div>
 
       {powerUser ? (
-        <section style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: "#fff", display: "grid", gap: 10 }}>
+        <section style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 12, background: "var(--panel)", display: "grid", gap: 10 }}>
           {powerUserBannerMode === "full" ? (
             <div style={{ display: "grid", gap: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                 <div style={{ fontWeight: 900 }}>{t("canvas.powerUserBanner.title")}</div>
                 <button
                   onClick={() => setPowerUserBannerMode("chip")}
-                  style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+                  style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--panel)" }}
                 >
                   {t("canvas.powerUserBanner.collapse")}
                 </button>
@@ -417,16 +417,16 @@ export default function CanvasPage() {
                   fontSize: 12,
                   padding: "4px 10px",
                   borderRadius: 999,
-                  background: "#f1f5f9",
-                  border: "1px solid #e2e8f0",
-                  color: "#0f172a",
+                  background: "var(--panel-2)",
+                  border: "1px solid var(--border-soft)",
+                  color: "var(--text-inverse)",
                 }}
               >
                 {t("canvas.powerUserChip")}
               </span>
               <button
                 onClick={() => setPowerUserDetailsOpen((v) => !v)}
-                style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+                style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--panel)" }}
               >
                 {powerUserDetailsOpen ? t("canvas.powerUserBanner.hideDetails") : t("canvas.powerUserBanner.showDetails")}
               </button>
@@ -434,7 +434,7 @@ export default function CanvasPage() {
           )}
 
           {powerUserBannerMode === "chip" && powerUserDetailsOpen ? (
-            <div style={{ padding: 10, borderRadius: 10, border: "1px solid #e5e7eb", background: "#fafafa", fontSize: 12, lineHeight: 1.5 }}>
+            <div style={{ padding: 10, borderRadius: 10, border: "1px solid var(--border-soft)", background: "var(--panel-2)", fontSize: 12, lineHeight: 1.5 }}>
               <div style={{ fontWeight: 900, marginBottom: 6 }}>{t("canvas.powerUserBanner.title")}</div>
               <div style={{ opacity: 0.9 }}>{t("canvas.powerUserBanner.body")}</div>
             </div>
@@ -442,7 +442,7 @@ export default function CanvasPage() {
         </section>
       ) : null}
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>
+      <section style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {(["latest", "history", "pinned"] as const).map((k) => (
             <button
@@ -451,8 +451,8 @@ export default function CanvasPage() {
               style={{
                 padding: "6px 10px",
                 borderRadius: 999,
-                border: "1px solid #ddd",
-                background: tab === k ? "#f2f2f2" : "#fff",
+                border: "1px solid var(--border)",
+                background: tab === k ? "var(--panel-2)" : "var(--text-inverse)",
               }}
             >
               {k === "latest" ? t("canvas.tabs.latest") : k === "history" ? t("canvas.tabs.history") : t("canvas.tabs.pinned")}
@@ -463,7 +463,7 @@ export default function CanvasPage() {
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder={t("common.search")}
-              style={{ padding: 8, border: "1px solid #ddd", borderRadius: 10, minWidth: 260 }}
+              style={{ padding: 8, border: "1px solid var(--border)", borderRadius: 10, minWidth: 260 }}
             />
             <button onClick={() => { setOffset(0); load(); }} disabled={busy || loading} style={{ padding: "8px 12px" }}>
               {t("canvas.search")}
@@ -479,8 +479,8 @@ export default function CanvasPage() {
               style={{
                 padding: "6px 10px",
                 borderRadius: 999,
-                border: "1px solid #ddd",
-                background: filter === b.key ? "#f2f2f2" : "#fff",
+                border: "1px solid var(--border)",
+                background: filter === b.key ? "var(--panel-2)" : "var(--text-inverse)",
               }}
             >
               {b.label}
@@ -506,19 +506,19 @@ export default function CanvasPage() {
       </section>
 
       {err ? (
-        <div style={{ padding: 10, border: "1px solid #f1c6c6", background: "#fff4f4", borderRadius: 10, color: "#b00020" }}>
+        <div style={{ padding: 10, border: "1px solid color-mix(in srgb, var(--bad) 45%, var(--border))", background: "color-mix(in srgb, var(--bad) 12%, var(--panel))", borderRadius: 10, color: "var(--bad)" }}>
           {err}
         </div>
       ) : null}
 
       {empty ? (
-        <section style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 18, display: "grid", gap: 8 }}>
+        <section style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 18, display: "grid", gap: 8 }}>
           <div style={{ fontSize: 18, fontWeight: 900 }}>{t("canvas.empty.title")}</div>
           <div style={{ fontSize: 13, opacity: 0.85 }}>{t("canvas.empty.body")}</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <a href="#/webchat" style={{ fontSize: 13 }}>{t("canvas.empty.openWebchat")}</a>
             <a href="#/mcp" style={{ fontSize: 13 }}>{t("canvas.empty.openMcp")}</a>
-            <a href="#/doctor" style={{ fontSize: 13 }}>{t("canvas.empty.openDoctor")}</a>
+            <a href="#/er" style={{ fontSize: 13 }}>{t("canvas.empty.openDoctor")}</a>
           </div>
         </section>
       ) : null}
@@ -542,32 +542,32 @@ export default function CanvasPage() {
             if (it.content_type === "json") {
               const j = safeJsonParse(it.content_text);
               return (
-                <pre style={{ margin: 0, background: "#fafafa", border: "1px solid #eee", padding: 10, borderRadius: 10, overflow: "auto", fontSize: 12 }}>
+                <pre style={{ margin: 0, background: "var(--panel-2)", border: "1px solid var(--border-soft)", padding: 10, borderRadius: 10, overflow: "auto", fontSize: 12 }}>
                   {JSON.stringify(j ?? it.content_text, null, 2)}
                 </pre>
               );
             }
             return (
-              <pre style={{ margin: 0, background: "#0b1020", color: "#e5e7eb", padding: 10, borderRadius: 10, overflow: "auto", fontSize: 12 }}>
+              <pre style={{ margin: 0, background: "var(--bg)", color: "var(--border-soft)", padding: 10, borderRadius: 10, overflow: "auto", fontSize: 12 }}>
                 {it.content_text}
               </pre>
             );
           })();
 
           return (
-            <section key={it.id} style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>
+            <section key={it.id} style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 12, display: "grid", gap: 10 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
                 <div style={{ display: "grid", gap: 4 }}>
                   <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                     <div style={{ fontWeight: 900 }}>{it.title}</div>
-                    <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "#f3f4f6" }}>
+                    <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "var(--panel-2)" }}>
                       {kindLabel(it.kind)}
                     </span>
                     <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: st.bg, color: st.fg }}>
                       {st.label}
                     </span>
                     {it.truncated ? (
-                      <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "#fffbeb", color: "#92400e", border: "1px solid #fde68a" }}>
+                      <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 999, background: "color-mix(in srgb, var(--warn) 16%, var(--panel))", color: "var(--warn)", border: "1px solid color-mix(in srgb, var(--warn) 45%, var(--border))" }}>
                         {t("canvas.truncated")}
                       </span>
                     ) : null}
@@ -590,7 +590,7 @@ export default function CanvasPage() {
                   <button onClick={() => setShowRaw((p) => ({ ...p, [it.id]: !rawOpen }))} disabled={busy} style={{ padding: "6px 10px" }}>
                     {rawOpen ? t("canvas.hideRaw") : t("canvas.viewRaw")}
                   </button>
-                  <button onClick={() => deleteItem(it)} disabled={busy} style={{ padding: "6px 10px", color: "#b00020" }}>
+                  <button onClick={() => deleteItem(it)} disabled={busy} style={{ padding: "6px 10px", color: "var(--bad)" }}>
                     {t("common.delete")}
                   </button>
                 </div>
@@ -598,7 +598,7 @@ export default function CanvasPage() {
 
               {isExpanded ? <div>{contentNode}</div> : null}
               {rawOpen ? (
-                <pre style={{ margin: 0, background: "#fafafa", border: "1px solid #eee", padding: 10, borderRadius: 10, overflow: "auto", fontSize: 12 }}>
+                <pre style={{ margin: 0, background: "var(--panel-2)", border: "1px solid var(--border-soft)", padding: 10, borderRadius: 10, overflow: "auto", fontSize: 12 }}>
                   {it.raw_text || it.content_text}
                 </pre>
               ) : null}
@@ -608,8 +608,8 @@ export default function CanvasPage() {
       </div>
 
       {noteOpen ? (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", display: "grid", placeItems: "center", padding: 16, zIndex: 100 }}>
-          <div style={{ width: 720, maxWidth: "100%", background: "#fff", borderRadius: 14, border: "1px solid #111827", padding: 12, display: "grid", gap: 10 }}>
+        <div style={{ position: "fixed", inset: 0, background: "color-mix(in srgb, var(--bg) 60%, transparent)", display: "grid", placeItems: "center", padding: 16, zIndex: 100 }}>
+          <div style={{ width: 720, maxWidth: "100%", background: "var(--panel)", borderRadius: 14, border: "1px solid var(--text)", padding: 12, display: "grid", gap: 10 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ fontWeight: 900 }}>{t("canvas.newNote")}</div>
               <button onClick={() => setNoteOpen(false)} disabled={busy} style={{ padding: "6px 10px" }}>{t("common.close")}</button>

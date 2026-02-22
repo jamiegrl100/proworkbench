@@ -54,7 +54,8 @@ type PageKey =
   | "security"
   | "reports"
   | "settings"
-  | "extensions";
+  | "extensions"
+  | `plugin-${string}`;
 
 type NavItem = {
   key: PageKey;
@@ -93,6 +94,8 @@ function getHashPage(): PageKey {
   const trimmed = rawHash.startsWith("#/") ? rawHash.slice(2) : rawHash.replace(/^#/, "");
   const candidateHash = trimmed.split("?")[0].split("/")[0] || "";
   if (candidateHash === "doctor") return "er";
+  if (candidateHash.startsWith("plugin-")) return candidateHash as PageKey;
+  if (["approvals"].includes(candidateHash)) return "status" as PageKey;
   if (candidateHash && ALLOWED_PAGES.has(candidateHash as PageKey)) return candidateHash as PageKey;
 
   // Path fallback for first-screen deep links like /er, /doctor, /login etc.
@@ -138,6 +141,13 @@ function AdminShell({
   const [watchtower, setWatchtower] = useState<any>(null);
   const [watchtowerOpen, setWatchtowerOpen] = useState(false);
   const [enabledPluginIds, setEnabledPluginIds] = useState<string[]>(() => getDefaultEnabledPluginIds());
+  const [availablePlugins, setAvailablePlugins] = useState<any[]>([]);
+  const [memoryDraftCount, setMemoryDraftCount] = useState(0);
+  const [draftGuardOpen, setDraftGuardOpen] = useState(false);
+  const [pendingNav, setPendingNav] = useState<PageKey | null>(null);
+  const [startupDraftPromptShown, setStartupDraftPromptShown] = useState(false);
+  const [stoppingRun, setStoppingRun] = useState(false);
+
 
   async function refreshSetup() {
     try {
@@ -147,6 +157,108 @@ function AdminShell({
     } catch (e: any) {
       setSetup(null);
       setSetupError(String(e?.message || e));
+    }
+  }
+
+  async function refreshPlugins() {
+    try {
+      const [enabledOut, availableOut] = await Promise.all([
+        getJson<any>("/api/plugins/enabled"),
+        getJson<any>("/api/plugins/available"),
+      ]);
+      const ids = Array.isArray(enabledOut?.enabled) ? enabledOut.enabled : getDefaultEnabledPluginIds();
+      const list = Array.isArray(availableOut?.plugins)
+        ? availableOut.plugins
+        : Array.isArray(availableOut)
+          ? availableOut
+          : [];
+      setEnabledPluginIds(ids);
+      setAvailablePlugins(list);
+    } catch {
+      setEnabledPluginIds(getDefaultEnabledPluginIds());
+      setAvailablePlugins([]);
+    }
+  }
+
+  async function refreshMemoryDrafts() {
+    try {
+      const out = await getJson<any>("/api/memory/drafts");
+      const n = Number(out?.draftsCount || (Array.isArray(out?.drafts) ? out.drafts.length : 0) || 0);
+      setMemoryDraftCount(n);
+      try {
+        if (n > 0) localStorage.setItem("pb_memory_commit_prompt_required", "1");
+        else localStorage.removeItem("pb_memory_commit_prompt_required");
+      } catch {
+        // ignore
+      }
+      return n;
+    } catch {
+      setMemoryDraftCount(0);
+      return 0;
+    }
+  }
+
+  function requestNavigate(next: PageKey) {
+    if (setup && !setup.setupComplete && next !== "status") {
+      setToast({ kind: "warn", text: "Finish setup first: configure Slack or Telegram and pass Test Connection." });
+      navigate("status");
+      return;
+    }
+    if (page === "webchat" && next !== "webchat" && memoryDraftCount > 0) {
+      setPendingNav(next);
+      setDraftGuardOpen(true);
+      return;
+    }
+    navigate(next);
+  }
+
+  async function handleCommitAndContinue() {
+    try {
+      await postJson<any>("/api/memory/commit_all", {});
+      await refreshMemoryDrafts();
+      try { localStorage.removeItem("pb_memory_commit_prompt_required"); } catch {}
+      setToast({ kind: "info", text: "Draft memories committed." });
+      const next = pendingNav;
+      setPendingNav(null);
+      setDraftGuardOpen(false);
+      if (next) navigate(next);
+    } catch (e: any) {
+      setToast({ kind: "warn", text: `Commit failed: ${String(e?.detail?.message || e?.message || e)}` });
+    }
+  }
+
+  async function handleDiscardAndContinue() {
+    try {
+      await postJson<any>("/api/memory/discard_all", {});
+      await refreshMemoryDrafts();
+      try { localStorage.removeItem("pb_memory_commit_prompt_required"); } catch {}
+      setToast({ kind: "info", text: "Draft memories discarded." });
+      const next = pendingNav;
+      setPendingNav(null);
+      setDraftGuardOpen(false);
+      if (next) navigate(next);
+    } catch (e: any) {
+      setToast({ kind: "warn", text: `Discard failed: ${String(e?.detail?.message || e?.message || e)}` });
+    }
+  }
+
+  function handleReviewDrafts() {
+    setPendingNav(null);
+    setDraftGuardOpen(false);
+    navigate("memory");
+  }
+
+  async function handlePanicStop() {
+    if (!window.confirm("STOP RUN will cancel active runners immediately. Continue?")) return;
+    setStoppingRun(true);
+    try {
+      const out = await postJson<any>("/admin/panic-stop", { reason: "manual_stop_from_shell" });
+      setToast({ kind: "warn", text: `STOP RUN executed. Cancelled batches: ${Number(out?.cancelled_batches || 0)}.` });
+      window.dispatchEvent(new Event("pb-system-state-changed"));
+    } catch (e: any) {
+      setToast({ kind: "warn", text: `STOP RUN failed: ${String(e?.detail?.error || e?.message || e)}` });
+    } finally {
+      setStoppingRun(false);
     }
   }
 
@@ -161,20 +273,48 @@ function AdminShell({
     refreshSetup();
   }, [adminToken]);
   useEffect(() => {
-    let stop = false;
-    getJson<any>("/api/plugins/enabled")
-      .then((out) => {
-        if (stop) return;
-        const ids = Array.isArray(out?.enabled) ? out.enabled : getDefaultEnabledPluginIds();
-        setEnabledPluginIds(ids);
-      })
-      .catch(() => {
-        if (!stop) setEnabledPluginIds(getDefaultEnabledPluginIds());
-      });
+    refreshPlugins();
+  }, [adminToken]);
+
+  useEffect(() => {
+    refreshMemoryDrafts();
+    const t = setInterval(() => {
+      refreshMemoryDrafts();
+    }, 5000);
+    function onDraftChanged(ev: Event) {
+      const count = Number((ev as CustomEvent)?.detail?.count || 0);
+      if (Number.isFinite(count)) setMemoryDraftCount(count);
+      else refreshMemoryDrafts();
+    }
+    window.addEventListener("pb-memory-drafts-changed", onDraftChanged as EventListener);
     return () => {
-      stop = true;
+      clearInterval(t);
+      window.removeEventListener("pb-memory-drafts-changed", onDraftChanged as EventListener);
     };
   }, [adminToken]);
+
+  useEffect(() => {
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (memoryDraftCount <= 0) return;
+      try {
+        localStorage.setItem("pb_memory_commit_prompt_required", "1");
+      } catch {
+        // ignore
+      }
+      e.preventDefault();
+      e.returnValue = `You have ${memoryDraftCount} unsaved memory drafts. Commit or discard before leaving.`;
+      return e.returnValue;
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [memoryDraftCount]);
+
+  useEffect(() => {
+    if (memoryDraftCount > 0 && !startupDraftPromptShown && !draftGuardOpen) {
+      setDraftGuardOpen(true);
+      setStartupDraftPromptShown(true);
+    }
+  }, [memoryDraftCount, startupDraftPromptShown, draftGuardOpen]);
 
   useEffect(() => {
     let timer: any = null;
@@ -321,8 +461,9 @@ function AdminShell({
     return () => clearTimeout(t0);
   }, [toast]);
 
-  const pluginRoutes = useMemo(() => getRoutesFromPlugins(enabledPluginIds), [enabledPluginIds]);
-  const pluginNav = useMemo(() => getNavItemsFromPlugins(enabledPluginIds), [enabledPluginIds]);
+  const pluginRoutes = useMemo(() => getRoutesFromPlugins(enabledPluginIds, availablePlugins), [enabledPluginIds, availablePlugins]);
+  const pluginNav = useMemo(() => getNavItemsFromPlugins(enabledPluginIds, availablePlugins), [enabledPluginIds, availablePlugins]);
+
 
   useEffect(() => {
     const writingEnabled = pluginRoutes.some((r) => r.pageKey === "writing-lab");
@@ -334,12 +475,15 @@ function AdminShell({
 
   const nav = useMemo<NavItem[]>(
     () => {
+      if (setup && !setup.setupComplete) {
+        return [{ key: "status", label: t("nav.status") }];
+      }
       const base: NavItem[] = [
       { key: "status", label: t("nav.status") },
       { key: "diagnostics", label: t("nav.diagnostics") },
       { key: "er", label: t("nav.doctor") },
       { key: "canvas", label: t("nav.canvas") },
-      { key: "memory", label: "Memory" },
+      { key: "memory", label: "Memory", badge: memoryDraftCount > 0 ? memoryDraftCount : undefined },
       { key: "watchtower", label: "Watchtower" },
       { key: "writing-projects", label: "Writing Projects" },
       { key: "writing-libraries", label: "Writing Libraries" },
@@ -348,9 +492,8 @@ function AdminShell({
       { key: "mcp", label: t("nav.mcp") },
       { key: "telegram", label: t("nav.telegram"), badge: pendingBadge > 0 ? pendingBadge : undefined },
       { key: "slack", label: t("nav.slack") },
-      { key: "approvals", label: t("nav.approvals") },
-      { key: "tools", label: t("nav.tools") },
       { key: "runtime", label: t("nav.runtime") },
+      { key: "tools", label: t("nav.tools") },
       { key: "events", label: t("nav.events") },
       { key: "reports", label: t("nav.reports") },
       { key: "security", label: t("nav.security") },
@@ -361,16 +504,36 @@ function AdminShell({
         .map((n) => {
           const raw = String(n.path || "").replace(/^\/+|\/+$/g, "");
           const pageKey = (raw.split("/")[0] || "status") as PageKey;
-          if (!ALLOWED_PAGES.has(pageKey)) return null;
-          return { key: pageKey, label: n.label } as NavItem;
+          if (ALLOWED_PAGES.has(pageKey)) return { key: pageKey, label: n.label } as NavItem;
+          const pluginId = String((n as any).pluginId || "").trim();
+          if (!pluginId) return null;
+          return { key: (`plugin-${pluginId}` as PageKey), label: n.label } as NavItem;
         })
         .filter((x): x is NavItem => Boolean(x));
       return [...base, ...pluginItems];
     },
-    [pendingBadge, t, pluginNav]
+    [pendingBadge, t, pluginNav, setup?.setupComplete]
   );
 
   const content = (() => {
+    if (setup && !setup.setupComplete && page !== "status") {
+      return <StatusPage setup={setup} error={setupError} onRefreshSetup={refreshSetup} />;
+    }
+    if (page.startsWith("plugin-")) {
+      const pluginId = page.slice("plugin-".length);
+      const src = `/plugins/${pluginId}/`;
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, height: "100%" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontWeight: 800 }}>{pluginId}</div>
+            <a href={src} target="_blank" rel="noreferrer" style={{ fontSize: 12 }}>
+              Open in new tab
+            </a>
+          </div>
+          <iframe title={pluginId} src={src} style={{ width: "100%", flex: 1, border: "1px solid var(--border)", borderRadius: 12, background: "var(--panel)" }} />
+        </div>
+      );
+    }
     switch (page) {
       case "status":
         return <StatusPage setup={setup} error={setupError} onRefreshSetup={refreshSetup} />;
@@ -391,11 +554,11 @@ function AdminShell({
       case "writing-lab":
         return pluginRoutes.some((r) => r.pageKey === "writing-lab") ? <WritingLabPage /> : <StatusPage setup={setup} error={setupError} onRefreshSetup={refreshSetup} />;
       case "extensions":
-        return <ExtensionsPage enabledPluginIds={enabledPluginIds} onChange={setEnabledPluginIds} />;
+        return <ExtensionsPage enabledPluginIds={enabledPluginIds} availablePlugins={availablePlugins} onChange={setEnabledPluginIds} onPluginsChanged={refreshPlugins} />;
       case "files":
         return <FileBrowserPage />;
       case "approvals":
-        return <ApprovalsPage />;
+        return <div style={{ padding: 12, border: "1px solid var(--border-soft)", borderRadius: 10 }}>Approvals is disabled in bare-bones mode.</div>;
       case "tools":
         return <ToolsPage />;
       case "runtime":
@@ -424,11 +587,12 @@ function AdminShell({
   })();
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", fontFamily: "system-ui, sans-serif" }}>
+    <div style={{ display: "flex", minHeight: "100vh", fontFamily: "system-ui, sans-serif", color: "var(--text)" }}>
       <aside
         style={{
           width: 250,
-          borderRight: "1px solid #ddd",
+          borderRight: "1px solid var(--border)",
+          background: "linear-gradient(180deg, color-mix(in srgb, var(--panel) 95%, transparent), var(--panel-2))",
           padding: 12,
           display: "flex",
           flexDirection: "column",
@@ -442,13 +606,13 @@ function AdminShell({
             return (
               <button
                 key={item.key}
-                onClick={() => navigate(item.key)}
+                onClick={() => requestNavigate(item.key)}
                 style={{
                   textAlign: "left",
                   padding: "8px 10px",
                   borderRadius: 8,
-                  border: "1px solid #ddd",
-                  background: active ? "#f2f2f2" : "white",
+                  border: "1px solid var(--border)",
+                  background: active ? "var(--panel-2)" : "var(--panel)",
                   cursor: "pointer",
                   display: "flex",
                   justifyContent: "space-between",
@@ -458,8 +622,8 @@ function AdminShell({
                 {item.badge ? (
                   <span
                     style={{
-                      background: "#ef4444",
-                      color: "#fff",
+                      background: "var(--bad)",
+                      color: "var(--text-inverse)",
                       borderRadius: 999,
                       minWidth: 18,
                       textAlign: "center",
@@ -481,13 +645,27 @@ function AdminShell({
           </div>
           <button
             onClick={onSwitchToken}
-            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)", cursor: "pointer" }}
           >
             {t("app.switchToken")}
           </button>
           <button
+            onClick={handlePanicStop}
+            disabled={stoppingRun}
+            style={{
+              padding: "8px 10px",
+              borderRadius: 8,
+              border: "1px solid color-mix(in srgb, var(--bad) 45%, var(--border))",
+              color: "var(--bad)",
+              background: "color-mix(in srgb, var(--bad) 12%, var(--panel))",
+              cursor: stoppingRun ? "not-allowed" : "pointer",
+            }}
+          >
+            {stoppingRun ? "Stopping..." : "STOP RUN"}
+          </button>
+          <button
             onClick={onLogout}
-            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border)", cursor: "pointer" }}
           >
             {t("app.logout")}
           </button>
@@ -499,8 +677,9 @@ function AdminShell({
           <button
             onClick={() => setWatchtowerOpen((v) => !v)}
             style={{
-              border: "1px solid #ddd",
-              background: "#fff",
+              border: "1px solid var(--border)",
+              background: "var(--panel-2)",
+              color: "var(--text)",
               borderRadius: 999,
               padding: "6px 10px",
               fontSize: 12,
@@ -512,13 +691,13 @@ function AdminShell({
           </button>
         </div>
         {watchtowerOpen ? (
-          <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10, marginBottom: 10, fontSize: 12, background: "#fafafa" }}>
+          <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10, marginBottom: 10, fontSize: 12, background: "var(--panel)" }}>
             <div><strong>Status:</strong> {String(watchtower?.state?.status || "unknown")}</div>
             <div><strong>Last run:</strong> {watchtower?.state?.lastRunAt ? new Date(watchtower.state.lastRunAt).toLocaleString() : "Never"}</div>
             <div><strong>Preview:</strong> {String(watchtower?.state?.lastMessagePreview || "(none)")}</div>
             <div><strong>Proposals from last run:</strong> {Array.isArray(watchtower?.state?.proposals) ? watchtower.state.proposals.length : 0}</div>
             <div style={{ marginTop: 6 }}>
-              <button onClick={() => navigate("watchtower")} style={{ padding: "6px 10px", border: "1px solid #ddd", borderRadius: 8, cursor: "pointer" }}>
+              <button onClick={() => requestNavigate("watchtower")} style={{ padding: "6px 10px", border: "1px solid var(--border)", borderRadius: 8, cursor: "pointer" }}>
                 Open Watchtower settings
               </button>
             </div>
@@ -533,16 +712,29 @@ function AdminShell({
               zIndex: 1000,
               padding: "10px 12px",
               borderRadius: 10,
-              border: "1px solid #fde68a",
-              background: toast.kind === "warn" ? "#fffbeb" : "#f1f5f9",
-              color: "#92400e",
+              border: "1px solid color-mix(in srgb, var(--warn) 45%, var(--border))",
+              background: toast.kind === "warn" ? "color-mix(in srgb, var(--warn) 12%, var(--panel))" : "var(--panel-2)",
+              color: "var(--warn)",
               maxWidth: 420,
-              boxShadow: "0 10px 30px rgba(0,0,0,0.10)",
+              boxShadow: "var(--shadow-card)",
               fontSize: 12,
               lineHeight: 1.45,
             }}
           >
             {toast.text}
+          </div>
+        ) : null}
+        {draftGuardOpen ? (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 1100, display: "grid", placeItems: "center" }}>
+            <div style={{ width: "min(560px, 92vw)", background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 12, padding: 14, display: "grid", gap: 10 }}>
+              <h3 style={{ margin: 0 }}>Unsaved memory drafts</h3>
+              <div style={{ fontSize: 13, opacity: 0.9 }}>You have {memoryDraftCount} unsaved memory drafts. Choose an action before leaving WebChat.</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button onClick={handleCommitAndContinue} style={{ padding: "8px 10px" }}>Save & Commit</button>
+                <button onClick={handleDiscardAndContinue} style={{ padding: "8px 10px" }}>Wipe/Discard</button>
+                <button onClick={handleReviewDrafts} style={{ padding: "8px 10px" }}>Review Drafts</button>
+              </div>
+            </div>
           </div>
         ) : null}
         {content}
@@ -554,6 +746,14 @@ function AdminShell({
 export default function App() {
   const [adminToken, setAdminTokenState] = useState<string | null>(getToken());
   const [switchTokenMode, setSwitchTokenMode] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    try {
+      return localStorage.getItem("pb_site_theme") === "light" ? "light" : "dark";
+    } catch {
+      return "dark";
+    }
+  });
 
   useEffect(() => {
     // If a user lands on /er or /doctor while logged out, redirect to /login first.
@@ -572,9 +772,10 @@ export default function App() {
     }
 
     const onAuthLogout = () => {
+      clearToken();
       setAdminTokenState(null);
       setSwitchTokenMode(false);
-      window.location.assign("/login?expired=1");
+      setAuthReady(true);
     };
     const onTokenChanged = () => setAdminTokenState(getToken());
     window.addEventListener("pb-auth-logout", onAuthLogout as EventListener);
@@ -587,31 +788,65 @@ export default function App() {
     };
   }, []);
 
+  // Probe on mount: verify the stored token is still valid and check if a password exists.
+  useEffect(() => {
+    fetch('/admin/auth/state')
+      .then((r) => r.json())
+      .then((data) => {
+        if (!Boolean(data?.passwordSet) || !Boolean(data?.loggedIn)) {
+          clearToken();
+          setAdminTokenState(null);
+        }
+      })
+      .catch(() => {
+        clearToken();
+        setAdminTokenState(null);
+      })
+      .finally(() => setAuthReady(true));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function logout() {
     clearToken();
     setAdminTokenState(null);
     setSwitchTokenMode(false);
-    window.location.assign("/login");
   }
 
-  const showLogin = adminToken == null || switchTokenMode;
-  const content = showLogin ? (
+  function toggleTheme() {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    try {
+      localStorage.setItem("pb_site_theme", next);
+    } catch {
+      // ignore
+    }
+    document.documentElement.classList.remove("dark", "light");
+    document.documentElement.classList.add(next);
+  }
+
+  const onAuthenticated = (token: string) => {
+    setAdminTokenState(token);
+    setSwitchTokenMode(false);
+    try {
+      const next = String(sessionStorage.getItem("pb_next_page") || "");
+      if (next === "er") {
+        sessionStorage.removeItem("pb_next_page");
+        navigate("er");
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const content = !authReady ? (
+    <div style={{ minHeight: "calc(100vh - 48px)", display: "grid", placeItems: "center" }}>
+      <div style={{ opacity: 0.5, fontSize: 14 }}>Connecting…</div>
+    </div>
+  ) : (adminToken == null || switchTokenMode) ? (
     <LoginScreen
       initialToken={adminToken}
-      onAuthenticated={(token) => {
-        setAdminTokenState(token);
-        setSwitchTokenMode(false);
-        try {
-          const next = String(sessionStorage.getItem("pb_next_page") || "");
-          if (next === "er") {
-            sessionStorage.removeItem("pb_next_page");
-            navigate("er");
-          }
-        } catch {
-          // ignore
-        }
-      }}
-      allowCancel={Boolean(adminToken && switchTokenMode)}
+      onAuthenticated={onAuthenticated}
+      allowCancel={switchTokenMode && adminToken !== null}
       onCancel={() => setSwitchTokenMode(false)}
     />
   ) : (
@@ -634,12 +869,20 @@ export default function App() {
           display: "flex",
           alignItems: "center",
           justifyContent: "flex-end",
+          gap: 8,
           padding: "0 12px",
-          background: "#fff",
-          borderBottom: "1px solid #e5e7eb",
+          background: "var(--panel)",
+          borderBottom: "1px solid var(--border)",
           zIndex: 50,
         }}
       >
+        <button
+          onClick={toggleTheme}
+          style={{ borderRadius: 999, padding: "5px 10px", border: "1px solid var(--border)" }}
+          title="Toggle theme"
+        >
+          {theme === "dark" ? "Dark" : "Light"}
+        </button>
         <LanguageSelector />
       </header>
       {content}

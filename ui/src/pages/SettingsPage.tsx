@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import Card from '../components/Card';
 import { getJson, postJson } from '../components/api';
 import { useI18n } from '../i18n/LanguageProvider';
+import { clearToken } from '../auth';
 
 declare function toast(msg: string): void;
 
@@ -26,6 +27,8 @@ export default function SettingsPage() {
   const [panicNonce, setPanicNonce] = useState('');
   const [panicBusy, setPanicBusy] = useState('');
   const [showPanicConfirm, setShowPanicConfirm] = useState(false);
+  const [resetConfirm, setResetConfirm] = useState('');
+  const [resetBusy, setResetBusy] = useState('');
   const [agentPreamble, setAgentPreamble] = useState('');
   const [defaultPreamble, setDefaultPreamble] = useState('');
   const [onlineDirectoryEnabled, setOnlineDirectoryEnabled] = useState(false);
@@ -153,6 +156,22 @@ export default function SettingsPage() {
     }
   }
 
+  async function factoryResetAll() {
+    setResetBusy('working');
+    setErr('');
+    try {
+      await postJson('/admin/settings/factory-reset', { confirm: resetConfirm });
+      clearToken();
+      setResetConfirm('');
+      // Server is about to exit; reload once it comes back.
+      setTimeout(() => window.location.reload(), 1800);
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+      setResetBusy('');
+      setResetConfirm('');
+    }
+  }
+
   async function saveAgentPreamble() {
     setBusy('preamble');
     setErr('');
@@ -184,7 +203,7 @@ export default function SettingsPage() {
   if (err) {
     return (
       <Card title={t('page.settings.title')}>
-        <div style={{ color: '#b00020', whiteSpace: 'pre-wrap' }}>{err}</div>
+        <div style={{ color: 'var(--bad)', whiteSpace: 'pre-wrap' }}>{err}</div>
         <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
           {t('settings.hint')}
         </div>
@@ -195,7 +214,7 @@ export default function SettingsPage() {
   return (
     <div style={{ padding: 16, maxWidth: 900 }}>
       <h2 style={{ marginTop: 0 }}>{t('page.settings.title')}</h2>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title={t('settings.advanced.title')}>
         <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
@@ -282,7 +301,7 @@ export default function SettingsPage() {
             {t('settings.danger.disabledHint')}
           </div>
         ) : (
-          <div style={{ marginTop: 12, border: '1px solid #f6d186', borderRadius: 10, padding: 12, background: '#fffbe8' }}>
+          <div style={{ marginTop: 12, border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--border))', borderRadius: 10, padding: 12, background: 'color-mix(in srgb, var(--warn) 12%, var(--panel))' }}>
             <div style={{ fontWeight: 700, marginBottom: 8 }}>{t('settings.danger.panelTitle')}</div>
             <div style={{ fontSize: 13, marginBottom: 8 }}>{t('settings.danger.scopeSummary')}</div>
             <ul style={{ margin: '0 0 8px 18px', padding: 0, fontSize: 13 }}>
@@ -314,9 +333,9 @@ export default function SettingsPage() {
                 disabled={panicBusy === 'prepare' || panicBusy === 'execute' || wipePhrase !== 'WIPE'}
                 style={{
                   padding: '8px 12px',
-                  border: '1px solid #bb1111',
-                  background: '#d91f11',
-                  color: '#fff',
+                  border: '1px solid color-mix(in srgb, var(--bad) 50%, var(--border))',
+                  background: 'color-mix(in srgb, var(--bad) 22%, var(--panel))',
+                  color: 'var(--text-inverse)',
                   borderRadius: 8,
                   fontWeight: 700,
                 }}
@@ -348,6 +367,42 @@ export default function SettingsPage() {
         </div>
       </Card>
 
+      <Card title="Factory Reset">
+        <div style={{ display: 'grid', gap: 10 }}>
+          <div style={{ fontSize: 13, opacity: 0.85 }}>
+            Deletes all local app data: database, stored settings, memory, and workspace state (<code>.pb/</code>).
+            The server restarts automatically. You will be asked to set a new password.
+          </div>
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 4 }}>Type <b>RESET</b> to confirm</div>
+            <input
+              value={resetConfirm}
+              onChange={(e) => setResetConfirm(e.target.value)}
+              placeholder="RESET"
+              disabled={!!resetBusy}
+              style={{ padding: 8, width: 200 }}
+            />
+          </label>
+          <div>
+            <button
+              onClick={factoryResetAll}
+              disabled={!!resetBusy || resetConfirm.trim() !== 'RESET'}
+              style={{
+                padding: '8px 14px',
+                border: '1px solid color-mix(in srgb, var(--bad) 50%, var(--border))',
+                background: 'color-mix(in srgb, var(--bad) 22%, var(--panel))',
+                color: 'var(--text)',
+                borderRadius: 8,
+                fontWeight: 700,
+                cursor: resetConfirm.trim() !== 'RESET' || !!resetBusy ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {resetBusy ? 'Resetting…' : 'Reset to factory settings'}
+            </button>
+          </div>
+        </div>
+      </Card>
+
       {showPanicConfirm ? (
         <div
           role="dialog"
@@ -355,14 +410,14 @@ export default function SettingsPage() {
           style={{
             position: 'fixed',
             inset: 0,
-            background: 'rgba(0,0,0,0.45)',
+            background: 'color-mix(in srgb, var(--bg) 68%, transparent)',
             display: 'grid',
             placeItems: 'center',
             zIndex: 2000,
             padding: 16,
           }}
         >
-          <div style={{ width: 'min(560px, 100%)', background: '#fff', color: '#111', borderRadius: 12, padding: 16 }}>
+          <div style={{ width: 'min(560px, 100%)', background: 'var(--panel)', color: 'var(--text)', borderRadius: 12, padding: 16 }}>
             <h3 style={{ marginTop: 0 }}>{t('settings.danger.confirm.title')}</h3>
             <p style={{ fontSize: 14 }}>{t('settings.danger.confirm.body')}</p>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -379,7 +434,7 @@ export default function SettingsPage() {
               <button
                 onClick={executePanicWipe}
                 disabled={panicBusy === 'execute'}
-                style={{ padding: '8px 12px', background: '#b51212', color: '#fff', border: '1px solid #8e0f0f', borderRadius: 8, fontWeight: 700 }}
+                style={{ padding: '8px 12px', background: 'color-mix(in srgb, var(--bad) 22%, var(--panel))', color: 'var(--text-inverse)', border: '1px solid color-mix(in srgb, var(--bad) 50%, var(--border))', borderRadius: 8, fontWeight: 700 }}
               >
                 {panicBusy === 'execute' ? t('settings.danger.executing') : t('settings.danger.confirm.confirm')}
               </button>

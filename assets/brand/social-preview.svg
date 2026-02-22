@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#0b1220"/>
+  <text x="80" y="220" fill="#e2e8f0" font-family="Arial" font-size="68" font-weight="700">ProWorkBench</text>
+  <text x="80" y="290" fill="#93c5fd" font-family="Arial" font-size="36">Local AI you can trust</text>
+  <text x="80" y="350" fill="#cbd5e1" font-family="Arial" font-size="28">Nothing executes without your approval.</text>
+  <circle cx="980" cy="315" r="130" fill="#2563eb"/>
+  <path d="M900 315h160M980 235v160" stroke="#fff" stroke-width="20" stroke-linecap="round"/>
+</svg>

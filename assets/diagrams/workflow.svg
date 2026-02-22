@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380">
+  <rect width="1200" height="380" fill="#0b1220"/>
+  <text x="40" y="60" fill="#e2e8f0" font-size="30" font-family="Arial" font-weight="700">Operator Workflow</text>
+  <g font-family="Arial" font-size="20" fill="white">
+    <rect x="40" y="120" width="210" height="90" rx="12" fill="#1d4ed8"/><text x="85" y="173">Install</text>
+    <rect x="290" y="120" width="210" height="90" rx="12" fill="#0f766e"/><text x="328" y="173">Run Doctor</text>
+    <rect x="540" y="120" width="210" height="90" rx="12" fill="#7c3aed"/><text x="560" y="173">Connect WebUI</text>
+    <rect x="790" y="120" width="210" height="90" rx="12" fill="#b45309"/><text x="812" y="173">Run Preset</text>
+    <rect x="1040" y="120" width="130" height="90" rx="12" fill="#334155"/><text x="1067" y="173">Review</text>
+  </g>
+  <g stroke="#93c5fd" stroke-width="4">
+    <line x1="250" y1="165" x2="290" y2="165"/>
+    <line x1="500" y1="165" x2="540" y2="165"/>
+    <line x1="750" y1="165" x2="790" y2="165"/>
+    <line x1="1000" y1="165" x2="1040" y2="165"/>
+  </g>
+</svg>

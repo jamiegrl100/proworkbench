@@ -29,7 +29,7 @@ const DEFAULT_BUILTIN_INSTALLED = [
 // Official PB signing key (Ed25519 public key).
 // Install fails closed if signature does not verify.
 const OFFICIAL_EXTENSION_SIGNING_KEY_PEM = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA3g6eD+P0wH9PzQq9gLr8zNw5LwI3r8V0kW2W3w9fS9M=
+MCowBQYDK2VwAyEA8x7miO8woEyyPgRLxQ9ZHkEd6LOcJBAhzaMPKiHEE9I=
 -----END PUBLIC KEY-----`;
 
 function workspacePath(...parts) {
@@ -227,16 +227,81 @@ function parseManifest(manifestText) {
   return { ...manifest, id, version, entry };
 }
 
-function verifyDetachedSignature(zipBuffer, signatureB64) {
-  const sig = Buffer.from(String(signatureB64 || ''), 'base64');
-  if (!sig.length) throw Object.assign(new Error('Missing package signature.'), { code: 'SIGNATURE_REQUIRED' });
-  let ok = false;
-  try {
-    ok = crypto.verify(null, zipBuffer, OFFICIAL_EXTENSION_SIGNING_KEY_PEM, sig);
-  } catch {
-    ok = false;
+function listExtraSigningKeyPaths() {
+  const envRaw = String(process.env.PB_EXTENSION_EXTRA_PUBLIC_KEYS || '').trim();
+  if (!envRaw) return [];
+  return envRaw
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+async function readExtraSigningKeys() {
+  const keys = [];
+  const keyPaths = listExtraSigningKeyPaths();
+  for (const p of keyPaths) {
+    try {
+      const pem = await fsp.readFile(p, 'utf8');
+      if (String(pem || '').includes('BEGIN PUBLIC KEY')) keys.push(pem);
+    } catch {
+      // Ignore unreadable optional key files.
+    }
   }
-  if (!ok) throw Object.assign(new Error('Signature verification failed.'), { code: 'SIGNATURE_INVALID' });
+
+  const workspaceSignerDir = workspacePath('.pb', 'extensions', 'trusted-signers');
+  try {
+    const entries = await fsp.readdir(workspaceSignerDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.toLowerCase().endsWith('.pem')) continue;
+      const abs = path.join(workspaceSignerDir, entry.name);
+      try {
+        const pem = await fsp.readFile(abs, 'utf8');
+        if (String(pem || '').includes('BEGIN PUBLIC KEY')) keys.push(pem);
+      } catch {
+        // Ignore unreadable key.
+      }
+    }
+  } catch {
+    // trusted-signers directory is optional.
+  }
+  return keys;
+}
+
+async function verifyDetachedSignature(zipBuffer, signatureB64) {
+  const allowUnsigned =
+    String(process.env.PB_EXTENSIONS_DEV_ALLOW_UNSIGNED || '').trim() === '1' &&
+    String(process.env.NODE_ENV || '').trim() !== 'production';
+  const sig = Buffer.from(String(signatureB64 || ''), 'base64');
+  if (!sig.length) {
+    if (allowUnsigned) return; // dev-only escape hatch
+    throw Object.assign(new Error('Missing package signature.'), { code: 'SIGNATURE_REQUIRED' });
+  }
+  const trustedKeys = [OFFICIAL_EXTENSION_SIGNING_KEY_PEM, ...(await readExtraSigningKeys())];
+  let ok = false;
+  for (const pem of trustedKeys) {
+    try {
+      if (crypto.verify(null, zipBuffer, pem, sig)) {
+        ok = true;
+        break;
+      }
+    } catch {
+      // keep trying
+    }
+  }
+  if (!ok) {
+    if (allowUnsigned) return; // dev-only escape hatch
+    throw Object.assign(new Error('Signature verification failed.'), { code: 'SIGNATURE_INVALID' });
+  }
+}
+
+function normalizeExpectedSha256(value) {
+  const trimmed = String(value || '').trim().toLowerCase();
+  if (!trimmed) return '';
+  if (!/^[a-f0-9]{64}$/.test(trimmed)) {
+    throw Object.assign(new Error('Invalid sha256 format (expected 64 hex chars).'), { code: 'HASH_FORMAT_INVALID' });
+  }
+  return trimmed;
 }
 
 async function writeReport(baseName, report) {
@@ -311,13 +376,27 @@ export async function installExtensionFromUpload(req) {
     const parsed = await parseMultipartUpload(req);
     uploadTmp = parsed.uploadTmp;
     const signature = parsed.fields.signature || '';
+    const expectedSha256 = normalizeExpectedSha256(parsed.fields.sha256 || '');
     report.steps[report.steps.length - 1] = { step: 'stage.upload', status: 'ok' };
 
     const zipBuffer = await fsp.readFile(uploadTmp);
     const zipSha256 = crypto.createHash('sha256').update(zipBuffer).digest('hex');
 
+    report.steps.push({ step: 'verify.hash', status: 'running' });
+    if (expectedSha256 && expectedSha256 !== zipSha256) {
+      throw Object.assign(new Error(`Hash mismatch for uploaded zip. expected=${expectedSha256} got=${zipSha256}`), {
+        code: 'HASH_MISMATCH',
+      });
+    }
+    report.steps[report.steps.length - 1] = {
+      step: 'verify.hash',
+      status: 'ok',
+      expectedSha256: expectedSha256 || null,
+      zipSha256,
+    };
+
     report.steps.push({ step: 'verify.signature', status: 'running' });
-    verifyDetachedSignature(zipBuffer, signature);
+    await verifyDetachedSignature(zipBuffer, signature);
     report.steps[report.steps.length - 1] = { step: 'verify.signature', status: 'ok' };
 
     report.steps.push({ step: 'verify.zip_entries', status: 'running' });

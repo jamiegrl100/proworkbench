@@ -50,7 +50,7 @@
 
     function Header({ meta, onLogout }: { meta: Meta; onLogout: () => void }) {
       return (
-        <div style={{ display: 'flex', justifyContent: 'space-between', padding: 16, borderBottom: '1px solid #ddd' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: 16, borderBottom: '1px solid var(--border)' }}>
           <div>
             <div style={{ fontWeight: 700 }}>Proworkbench</div>
             <div style={{ fontSize: 12, opacity: 0.75 }}>v{meta.version}</div>
@@ -67,7 +67,7 @@
 
     function Card({ title, children }: { title: string; children: React.ReactNode }) {
       return (
-        <div style={{ border: '1px solid #e5e5e5', borderRadius: 10, padding: 16, marginBottom: 12 }}>
+        <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 16, marginBottom: 12 }}>
           <div style={{ fontWeight: 700, marginBottom: 8 }}>{title}</div>
           {children}
         </div>
@@ -77,7 +77,7 @@
     function Layout({ nav, children }: { nav: React.ReactNode; children: React.ReactNode }) {
       return (
         <div style={{ display: 'grid', gridTemplateColumns: '240px 1fr', minHeight: 'calc(100vh - 64px)' }}>
-          <div style={{ borderRight: '1px solid #eee', padding: 12 }}>{nav}</div>
+          <div style={{ borderRight: '1px solid var(--border-soft)', padding: 12 }}>{nav}</div>
           <div>{children}</div>
         </div>
       );
@@ -92,8 +92,8 @@
             textAlign: 'left',
             padding: '10px 10px',
             borderRadius: 10,
-            border: '1px solid ' + (active ? '#ddd' : 'transparent'),
-            background: active ? '#fafafa' : 'transparent',
+            border: '1px solid ' + (active ? 'var(--border)' : 'transparent'),
+            background: active ? 'var(--panel-2)' : 'transparent',
             display: 'flex',
             justifyContent: 'space-between',
             alignItems: 'center',
@@ -103,7 +103,7 @@
         >
           <span>{label}</span>
           {badge != null ? (
-            <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 999, border: '1px solid #ddd', background: '#fff' }}>
+            <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 999, border: '1px solid var(--border)', background: 'var(--panel)' }}>
               {badge}
             </span>
           ) : null}
@@ -174,16 +174,16 @@
       <p style={{ opacity: 0.8 }}>Set up Telegram + your model server.</p>
 
       {err ? (
-        <div style={{ padding: 12, border: '1px solid #f3c2c2', background: '#fff4f4', borderRadius: 10, marginBottom: 12 }}>
+        <div style={{ padding: 12, border: '1px solid color-mix(in srgb, var(--bad) 45%, var(--border))', background: 'color-mix(in srgb, var(--bad) 12%, var(--panel))', borderRadius: 10, marginBottom: 12 }}>
           <div style={{ fontWeight: 700, marginBottom: 6 }}>Action required</div>
           <div style={{ fontFamily: 'monospace', fontSize: 12 }}>{err}</div>
         </div>
       ) : null}
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd', opacity: step === 1 ? 1 : 0.6 }}>1) Telegram</div>
-        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd', opacity: step === 2 ? 1 : 0.6 }}>2) Model</div>
-        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd', opacity: step === 3 ? 1 : 0.6 }}>3) Start</div>
+        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid var(--border)', opacity: step === 1 ? 1 : 0.6 }}>1) Telegram</div>
+        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid var(--border)', opacity: step === 2 ? 1 : 0.6 }}>2) Model</div>
+        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid var(--border)', opacity: step === 3 ? 1 : 0.6 }}>3) Start</div>
       </div>
 
       {step === 1 ? (
@@ -280,7 +280,7 @@
       return (
         <div style={{ padding: 16, maxWidth: 980 }}>
           <h2 style={{ marginTop: 0 }}>{this.props.title}</h2>
-          <div style={{ padding: 12, border: '1px solid #ffcdd2', background: '#ffebee', borderRadius: 10 }}>
+          <div style={{ padding: 12, border: '1px solid color-mix(in srgb, var(--bad) 45%, var(--border))', background: 'color-mix(in srgb, var(--bad) 12%, var(--panel))', borderRadius: 10 }}>
             <div style={{ fontWeight: 700, marginBottom: 6 }}>This page crashed</div>
             <div style={{ fontFamily: 'monospace', fontSize: 12, whiteSpace: 'pre-wrap' }}>
               {String(this.state.error?.message || this.state.error)}
@@ -324,7 +324,7 @@ function StatusPage({ setup }: { setup: SetupState | null }) {
             <thead>
               <tr>
                 {columns.map((c) => (
-                  <th key={c.key} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
+                  <th key={c.key} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>
                     {c.label}
                   </th>
                 ))}
@@ -334,7 +334,7 @@ function StatusPage({ setup }: { setup: SetupState | null }) {
               {rows.map((r, idx) => (
                 <tr key={r.chat_id + ':' + idx}>
                   {columns.map((c) => (
-                    <td key={c.key} style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>
+                    <td key={c.key} style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>
                       {c.render ? c.render(r) : ((r as any)[c.key] ?? '—')}
                     </td>
                   ))}
@@ -440,15 +440,15 @@ async function act(url: string, body?: any) {
       return (
         <div>
           {data.pendingOverflowActive ? (
-            <div style={{ padding: 12, border: '1px solid #f0d48a', background: '#fff9e6', borderRadius: 10, margin: 16 }}>
+            <div style={{ padding: 12, border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 14%, var(--panel))', borderRadius: 10, margin: 16 }}>
               <b>Pending inbox full ({data.pendingCap}).</b> Some requests were not recorded.
             </div>
           ) : null}
           <div style={{ padding: 16 }}>
             <h2 style={{ marginTop: 0 }}>Telegram</h2>
-            {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+            {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
       {toastMsg ? (
-        <div style={{ marginBottom: 12, padding: 10, border: '1px solid #c8e6c9', background: '#e8f5e9', borderRadius: 10 }}>
+        <div style={{ marginBottom: 12, padding: 10, border: '1px solid color-mix(in srgb, var(--ok) 45%, var(--border))', background: 'color-mix(in srgb, var(--ok) 14%, var(--panel))', borderRadius: 10 }}>
           {toastMsg}
         </div>
       ) : null}
@@ -474,7 +474,7 @@ async function act(url: string, body?: any) {
                 <button
                   key={t}
                   onClick={() => setTab(t)}
-                  style={{ padding: '8px 10px', borderRadius: 999, border: '1px solid #ddd', background: tab === t ? '#fafafa' : '#fff' }}
+                  style={{ padding: '8px 10px', borderRadius: 999, border: '1px solid var(--border)', background: tab === t ? 'var(--panel-2)' : 'var(--text-inverse)' }}
                 >
                   {t[0].toUpperCase() + t.slice(1)}
                 </button>
@@ -652,7 +652,7 @@ async function save() {
         <div style={{ marginTop: 12, fontSize: 12, opacity: 0.85 }}>
           Status: <b>{status.running ? 'Running' : 'Stopped'}</b> · Started: {status.startedAt || '—'} · Last error: {status.lastError || '—'}
         </div>
-        {err ? <div style={{ marginTop: 12, color: '#b00020', whiteSpace: 'pre-wrap' }}>{err}</div> : null}
+        {err ? <div style={{ marginTop: 12, color: 'var(--bad)', whiteSpace: 'pre-wrap' }}>{err}</div> : null}
       </Card>
 
       <Card title="Pending approvals">
@@ -839,15 +839,15 @@ async function saveKeys() {
   return (
     <div style={{ padding: 16, maxWidth: 980 }}>
       <h2 style={{ marginTop: 0 }}>Providers & Models</h2>
-      <div style={{ padding: 12, border: '1px solid #e5e5e5', borderRadius: 10, background: '#fafafa', marginBottom: 12 }}>
+      <div style={{ padding: 12, border: '1px solid var(--border-soft)', borderRadius: 10, background: 'var(--panel-2)', marginBottom: 12 }}>
         <div style={{ fontWeight: 700, marginBottom: 6 }}>Using</div>
         <div style={{ fontSize: 13, opacity: 0.85 }}>
           Provider: <b>{status?.providerName ?? '—'}</b> · Model: <b>{selectedModel ?? '—'}</b>
         </div>
       </div>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
       {toastMsg ? (
-        <div style={{ marginBottom: 12, padding: 10, border: '1px solid #c8e6c9', background: '#e8f5e9', borderRadius: 10 }}>
+        <div style={{ marginBottom: 12, padding: 10, border: '1px solid color-mix(in srgb, var(--ok) 45%, var(--border))', background: 'color-mix(in srgb, var(--ok) 14%, var(--panel))', borderRadius: 10 }}>
           {toastMsg}
         </div>
       ) : null}
@@ -855,7 +855,7 @@ async function saveKeys() {
       <Card title="Provider">
         <div style={{ display: 'grid', gap: 10 }}>
 {providerId === 'anthropic' ? (
-  <div style={{ padding: 12, border: '1px solid #e5e5e5', borderRadius: 10, background: '#fafafa' }}>
+  <div style={{ padding: 12, border: '1px solid var(--border-soft)', borderRadius: 10, background: 'var(--panel-2)' }}>
     <div style={{ fontWeight: 700, marginBottom: 6 }}>Anthropic setup</div>
     <div style={{ fontSize: 13, opacity: 0.85 }}>
       1) Save <code>ANTHROPIC_API_KEY</code> (Advanced) · 2) Add a model id (Model → Advanced) · 3) Click <b>Test</b>.
@@ -991,7 +991,7 @@ async function saveKeys() {
             <thead>
               <tr>
                 {['ts', 'method', 'path', 'status', 'duration_ms', 'profile', 'ok'].map((h) => (
-                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
+                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>
                     {h}
                   </th>
                 ))}
@@ -1000,13 +1000,13 @@ async function saveKeys() {
             <tbody>
               {trace.map((t, i) => (
                 <tr key={i}>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.ts}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.method}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.path}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.status ?? '—'}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.duration_ms ?? '—'}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.profile ?? '—'}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.ok ? '✅' : '—'}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{t.ts}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{t.method}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{t.path}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{t.status ?? '—'}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{t.duration_ms ?? '—'}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{t.profile ?? '—'}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{t.ok ? '✅' : '—'}</td>
                 </tr>
               ))}
             </tbody>
@@ -1073,7 +1073,7 @@ async function clearAll() {
   return (
     <div style={{ padding: 16, maxWidth: 1100 }}>
       <h2 style={{ marginTop: 0 }}>Events</h2>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title="Filters">
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1116,7 +1116,7 @@ async function clearAll() {
             <thead>
               <tr>
                 {['ts', 'type', 'summary'].map((h) => (
-                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
+                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>
                     {h}
                   </th>
                 ))}
@@ -1125,9 +1125,9 @@ async function clearAll() {
             <tbody>
               {filteredEvents.map((ev) => (
                 <tr key={ev.id}>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.ts}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.type}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.ts}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{ev.type}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>
                     <code style={{ fontSize: 12 }}>{JSON.stringify(ev.payload).slice(0, 400)}</code>
                   </td>
                 </tr>
@@ -1163,11 +1163,11 @@ function SecurityPage({ csrf }: { csrf: string }) {
       <h2 style={{ marginTop: 0 }}>Security</h2>
       <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 10 }}>Next scheduled daily report: {summary?.nextScheduledReportTs || '—'} (local 00:05)</div>
       {pendingOverflowActive ? (
-        <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, border: '1px solid #ffccbc', background: '#fff3e0' }}>
+        <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 16%, var(--panel))' }}>
           <b>Pending overflow active.</b> New unknown users are being dropped until you review pending users.
         </div>
       ) : null}
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title="Today (aggregated)">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
@@ -1185,15 +1185,15 @@ function SecurityPage({ csrf }: { csrf: string }) {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr>
-                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>chat_id</th>
-                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>count</th>
+                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>chat_id</th>
+                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>count</th>
                 </tr>
               </thead>
               <tbody>
                 {summary.topUnknownToday.map((r: any) => (
                   <tr key={String(r.chat_id)}>
-                    <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{String(r.chat_id)}</td>
-                    <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{Number(r.count || 0)}</td>
+                    <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{String(r.chat_id)}</td>
+                    <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{Number(r.count || 0)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1303,7 +1303,7 @@ function ReportsPage({ csrf }: { csrf: string }) {
   return (
     <div style={{ padding: 16, maxWidth: 1100 }}>
       <h2 style={{ marginTop: 0 }}>Reports</h2>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title="Reporting cadence">
         <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
@@ -1343,7 +1343,7 @@ function ReportsPage({ csrf }: { csrf: string }) {
             <thead>
               <tr>
                 {['ts', 'kind', 'payload'].map((h) => (
-                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
+                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>
                     {h}
                   </th>
                 ))}
@@ -1352,9 +1352,9 @@ function ReportsPage({ csrf }: { csrf: string }) {
             <tbody>
               {reports.map((r) => (
                 <tr key={r.id}>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{r.ts}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{r.kind}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{r.ts}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{r.kind}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>
                     <code style={{ fontSize: 12 }}>{JSON.stringify(r.payload).slice(0, 500)}</code>
                   </td>
                 </tr>
@@ -1410,7 +1410,7 @@ function SettingsPage({ csrf }: { csrf: string }) {
   return (
     <div style={{ padding: 16, maxWidth: 900 }}>
       <h2 style={{ marginTop: 0 }}>Settings</h2>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title="Advanced (safety)">
         <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>

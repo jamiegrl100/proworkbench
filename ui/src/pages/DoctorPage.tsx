@@ -27,10 +27,10 @@ type DoctorReport = {
 };
 
 function pillColor(status: DoctorStatus) {
-  if (status === "OK") return { bg: "#dcfce7", fg: "#166534" };
-  if (status === "FIXED") return { bg: "#dbeafe", fg: "#1d4ed8" };
-  if (status === "CANT_FIX") return { bg: "#fee2e2", fg: "#b00020" };
-  return { bg: "#fef9c3", fg: "#92400e" };
+  if (status === "OK") return { bg: "color-mix(in srgb, var(--ok) 16%, var(--panel))", fg: "var(--ok)" };
+  if (status === "FIXED") return { bg: "color-mix(in srgb, var(--accent-2) 10%, var(--panel))", fg: "var(--accent-2)" };
+  if (status === "CANT_FIX") return { bg: "color-mix(in srgb, var(--bad) 18%, var(--panel))", fg: "var(--bad)" };
+  return { bg: "color-mix(in srgb, var(--warn) 18%, var(--panel))", fg: "var(--warn)" };
 }
 
 function icon(status: DoctorStatus) {
@@ -115,7 +115,7 @@ export default function DoctorPage() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await getJson<DoctorReport | null>("/admin/doctor/last");
+        const r = await getJson<DoctorReport | null>("/admin/er/last");
         setLast(r || null);
       } catch {
         setLast(null);
@@ -140,7 +140,7 @@ export default function DoctorPage() {
     try {
       const localSteps: DoctorStep[] = [];
       let gotDone = false;
-      await streamNdjson(`/admin/doctor/${m === "check" ? "check" : "fix"}?stream=1`, {
+      await streamNdjson(`/admin/er/${m === "check" ? "check" : "fix"}?stream=1`, {
         method: m === "check" ? "GET" : "POST",
         onEvent: (ev) => {
           if (myRun !== runIdRef.current) return;
@@ -188,8 +188,8 @@ export default function DoctorPage() {
       await postJson("/admin/canvas/items", {
         kind: "doctor_report",
         status: "ok",
-        title: `Doctor report (${r.mode})`,
-        summary: `Doctor ${r.mode} at ${r.timestamp}`,
+        title: `ER+ report (${r.mode})`,
+        summary: `ER+ ${r.mode} at ${r.timestamp}`,
         content_type: "json",
         content: r,
         raw: r.support || null,
@@ -220,7 +220,7 @@ export default function DoctorPage() {
         </div>
       </div>
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
+      <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           <div style={{ fontWeight: 800 }}>{t("doctor.summary.title")}</div>
           <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -243,23 +243,23 @@ export default function DoctorPage() {
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10 }}>
-          <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10 }}>
+          <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10 }}>
             <div style={{ fontSize: 12, opacity: 0.75 }}>{t("doctor.summary.ok")}</div>
             <div style={{ fontSize: 28, fontWeight: 900 }}>{summary.ok}</div>
           </div>
-          <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10 }}>
+          <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10 }}>
             <div style={{ fontSize: 12, opacity: 0.75 }}>{t("doctor.summary.fixed")}</div>
             <div style={{ fontSize: 28, fontWeight: 900 }}>{summary.fixed}</div>
           </div>
-          <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10 }}>
+          <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10 }}>
             <div style={{ fontSize: 12, opacity: 0.75 }}>{t("doctor.summary.needsYou")}</div>
             <div style={{ fontSize: 28, fontWeight: 900 }}>{summary.needsYou}</div>
           </div>
-          <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10 }}>
+          <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10 }}>
             <div style={{ fontSize: 12, opacity: 0.75 }}>{t("doctor.summary.needsPrereq")}</div>
             <div style={{ fontSize: 28, fontWeight: 900 }}>{summary.needsPrerequisite}</div>
           </div>
-          <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10 }}>
+          <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10 }}>
             <div style={{ fontSize: 12, opacity: 0.75 }}>{t("doctor.summary.cantFix")}</div>
             <div style={{ fontSize: 28, fontWeight: 900 }}>{summary.cantFix}</div>
           </div>
@@ -273,26 +273,26 @@ export default function DoctorPage() {
       </section>
 
       {err ? (
-        <div style={{ padding: 10, border: "1px solid #f1c6c6", background: "#fff4f4", borderRadius: 8, color: "#b00020" }}>
+        <div style={{ padding: 10, border: "1px solid color-mix(in srgb, var(--bad) 45%, var(--border))", background: "color-mix(in srgb, var(--bad) 12%, var(--panel))", borderRadius: 8, color: "var(--bad)" }}>
           {err}
         </div>
       ) : null}
 
       {toastMsg ? (
-        <div style={{ padding: 10, border: "1px solid #c8e6c9", background: "#e8f5e9", borderRadius: 8, color: "#065f46" }}>
+        <div style={{ padding: 10, border: "1px solid color-mix(in srgb, var(--ok) 45%, var(--border))", background: "color-mix(in srgb, var(--ok) 14%, var(--panel))", borderRadius: 8, color: "var(--ok)" }}>
           {toastMsg}
         </div>
       ) : null}
 
       {running ? (
-        <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+        <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
           <div style={{ fontWeight: 800 }}>{t("doctor.progress.title")}</div>
           <div style={{ display: "grid", gap: 6 }}>
             {steps.map((s, idx) => {
               const active = idx === activeIdx;
               const pill = pillColor(s.status);
               return (
-                <div key={s.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: 8, border: "1px solid #eee", borderRadius: 10, background: active ? "#f8fbff" : "#fff" }}>
+                <div key={s.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: 8, border: "1px solid var(--border-soft)", borderRadius: 10, background: active ? "color-mix(in srgb, var(--accent-2) 10%, var(--panel))" : "var(--text-inverse)" }}>
                   <span style={{ width: 32, textAlign: "center", fontWeight: 900, color: pill.fg }}>{icon(s.status)}</span>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontWeight: 700 }}>{s.title}</div>
@@ -322,7 +322,7 @@ export default function DoctorPage() {
             {shown.steps.map((s) => {
               const pill = pillColor(s.status);
               return (
-                <div key={s.id} style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: "#fff", display: "grid", gap: 10 }}>
+                <div key={s.id} style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 12, background: "var(--panel)", display: "grid", gap: 10 }}>
                   <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                     <div style={{ fontWeight: 900 }}>{s.title}</div>
                     <span style={{ fontSize: 12, background: pill.bg, color: pill.fg, borderRadius: 999, padding: "2px 8px" }}>
@@ -352,21 +352,21 @@ export default function DoctorPage() {
                         href={a.href}
                         target={a.href.startsWith("http") ? "_blank" : undefined}
                         rel={a.href.startsWith("http") ? "noreferrer" : undefined}
-                        style={{ display: "inline-block", padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd", textDecoration: "none", color: "#111" }}
+                        style={{ display: "inline-block", padding: "6px 10px", borderRadius: 10, border: "1px solid var(--border)", textDecoration: "none", color: "var(--text)" }}
                       >
                         {a.label}
                       </a>
                     ))}
                     <button
                       onClick={() => setDetailsOpen((p) => ({ ...p, [s.id]: !p[s.id] }))}
-                      style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+                      style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--panel)" }}
                     >
                       {detailsOpen[s.id] ? t("doctor.viewDetailsHide") : t("doctor.viewDetails")}
                     </button>
                   </div>
 
                   {detailsOpen[s.id] ? (
-                    <pre style={{ margin: 0, background: "#fafafa", border: "1px solid #eee", padding: 10, borderRadius: 10, maxHeight: 220, overflow: "auto", fontSize: 12 }}>
+                    <pre style={{ margin: 0, background: "var(--panel-2)", border: "1px solid var(--border-soft)", padding: 10, borderRadius: 10, maxHeight: 220, overflow: "auto", fontSize: 12 }}>
                       {JSON.stringify(s.details || {}, null, 2)}
                     </pre>
                   ) : null}
@@ -376,11 +376,11 @@ export default function DoctorPage() {
           </div>
 
           {actionable.length ? (
-            <section style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: "#fff" }}>
+            <section style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 12, background: "var(--panel)" }}>
               <div style={{ fontWeight: 900, marginBottom: 8 }}>{t("doctor.doNext.title")}</div>
               <div style={{ display: "grid", gap: 8 }}>
                 {actionable.map((s) => (
-                  <div key={s.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 10 }}>
+                  <div key={s.id} style={{ border: "1px solid var(--border-soft)", borderRadius: 12, padding: 10 }}>
                     <div style={{ fontWeight: 800 }}>{s.title}</div>
                     <div style={{ fontSize: 13, opacity: 0.85, marginTop: 4 }}>{s.next?.[0] || s.found}</div>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
@@ -390,7 +390,7 @@ export default function DoctorPage() {
                           href={a.href}
                           target={a.href.startsWith("http") ? "_blank" : undefined}
                           rel={a.href.startsWith("http") ? "noreferrer" : undefined}
-                          style={{ display: "inline-block", padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd", textDecoration: "none", color: "#111" }}
+                          style={{ display: "inline-block", padding: "6px 10px", borderRadius: 10, border: "1px solid var(--border)", textDecoration: "none", color: "var(--text)" }}
                         >
                           {a.label}
                         </a>

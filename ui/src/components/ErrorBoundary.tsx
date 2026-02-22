@@ -43,7 +43,7 @@ export default class ErrorBoundary extends React.Component<{ title: string; chil
       return (
         <div style={{ padding: 16, maxWidth: 980 }}>
           <h2 style={{ marginTop: 0 }}>{this.props.title}</h2>
-          <div style={{ padding: 12, border: '1px solid #ffcdd2', background: '#ffebee', borderRadius: 10 }}>
+          <div style={{ padding: 12, border: '1px solid color-mix(in srgb, var(--bad) 45%, var(--border))', background: 'color-mix(in srgb, var(--bad) 12%, var(--panel))', borderRadius: 10 }}>
             <div style={{ fontWeight: 700, marginBottom: 6 }}>{tStatic('errors.pageCrashed')}</div>
             <div style={{ fontFamily: 'monospace', fontSize: 12, whiteSpace: 'pre-wrap' }}>
               {String(this.state.error?.message || this.state.error)}

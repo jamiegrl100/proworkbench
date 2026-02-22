@@ -16,7 +16,7 @@
     Proworkbench
   </text>
   <text x="96" y="188" fill="#cbd5e1" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-size="20">
-    Local-first AI with approvals, presets, Doctor self-heal, and WebChat-only execution.
+    Local-first AI with approvals, presets, ER+ self-heal, and WebChat-only execution.
   </text>
   <text x="96" y="224" fill="#94a3b8" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial" font-size="16">
     Preview v0.1 • Text Generation WebUI on 127.0.0.1:5000 • Social channels are chat-only

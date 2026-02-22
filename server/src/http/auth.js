@@ -14,7 +14,9 @@ export function createAuthRouter({ db }) {
     const token = extractToken(req);
     const loggedIn = verifyAdminToken(db, token);
     const tokenCount = countAdminTokens(db);
-    res.json({ loggedIn, tokenCount, setupComplete: tokenCount > 0 });
+    const authRow = db.prepare('SELECT password_hash FROM admin_auth WHERE id = 1').get();
+    const passwordSet = Boolean(authRow?.password_hash);
+    res.json({ loggedIn, tokenCount, setupComplete: tokenCount > 0, passwordSet });
   });
 
   r.post('/bootstrap', (req, res) => {

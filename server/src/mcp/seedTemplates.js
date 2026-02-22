@@ -28,6 +28,9 @@ function normalizeTemplate(raw, filePath) {
   const name = String(obj.name || '').trim();
   const description = String(obj.description || '').trim();
   const risk = String(obj.risk || '').trim();
+  const defaultCapabilities = Array.isArray(obj.defaultCapabilities)
+    ? obj.defaultCapabilities.map((x) => String(x || '').trim()).filter(Boolean)
+    : (Array.isArray(obj.capabilities) ? obj.capabilities.map((x) => String(x || '').trim()).filter(Boolean) : []);
   const allowedChannels = Array.isArray(obj.allowedChannels) ? obj.allowedChannels.map(String) : [];
   const requiresApprovalByDefault = Boolean(obj.requiresApprovalByDefault);
   const fields = Array.isArray(obj.fields) ? obj.fields : [];
@@ -45,6 +48,8 @@ function normalizeTemplate(raw, filePath) {
     schema_version: schemaVersion,
     name,
     description,
+    template_path: filePath,
+    default_capabilities: defaultCapabilities,
     risk,
     allowed_channels: allowedChannels,
     requires_approval_by_default: requiresApprovalByDefault,
@@ -61,13 +66,15 @@ export function seedMcpTemplates(db) {
 
   const ins = db.prepare(`
     INSERT INTO mcp_templates
-      (id, schema_version, name, description, risk, allowed_channels_json, requires_approval_by_default, fields_json, security_defaults_json, created_at, updated_at)
+      (id, schema_version, name, description, template_path, default_capabilities_json, risk, allowed_channels_json, requires_approval_by_default, fields_json, security_defaults_json, created_at, updated_at)
     VALUES
-      (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       schema_version = excluded.schema_version,
       name = excluded.name,
       description = excluded.description,
+      template_path = excluded.template_path,
+      default_capabilities_json = excluded.default_capabilities_json,
       risk = excluded.risk,
       allowed_channels_json = excluded.allowed_channels_json,
       requires_approval_by_default = excluded.requires_approval_by_default,
@@ -87,6 +94,8 @@ export function seedMcpTemplates(db) {
       t.schema_version,
       t.name,
       t.description,
+      t.template_path,
+      JSON.stringify(t.default_capabilities || []),
       t.risk,
       JSON.stringify(t.allowed_channels),
       t.requires_approval_by_default ? 1 : 0,

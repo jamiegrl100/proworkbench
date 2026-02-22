@@ -2,6 +2,8 @@ export type Meta = { appName: string; version: string; buildTime: string | null;
 export type AuthState = { hasPassword: boolean; authenticated: boolean };
 
 export type SetupState = {
+  tokenCount?: number;
+  setupComplete?: boolean;
   secretsOk: boolean;
   llm: {
     baseUrl: string;
@@ -10,6 +12,17 @@ export type SetupState = {
     lastRefreshedAt: string | null;
   };
   telegramRunning: boolean;
+  slackRunning?: boolean;
+  messagingProviders?: Array<{ id: string; label: string; available: boolean; status?: 'available' | 'coming_soon' }>;
+  messaging?: {
+    provider: 'telegram' | 'slack' | null;
+    configured: boolean;
+    last_test_ok: boolean;
+    last_test_at: string | null;
+    last_error?: string | null;
+    default_channel?: string | null;
+    admin_chat_id?: string | null;
+  };
 };
 
 export type TelegramUser = {

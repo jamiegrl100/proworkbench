@@ -18,9 +18,15 @@ function setKv(db, key, value) {
     .run(key, JSON.stringify(value));
 }
 
+
 export function createSecurityRouter({ db }) {
   const r = express.Router();
   r.use(requireAuth(db));
+
+
+
+
+
 
   r.post('/token', (req, res) => {
     const prev = String(req.adminToken || '').trim();

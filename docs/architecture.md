@@ -79,11 +79,11 @@ sequenceDiagram
   end
 ```
 
-## Doctor flow
+## ER+ flow
 
 ```mermaid
 flowchart TD
-  Idle["Doctor page (idle)\nNo auto-run"] --> Click["User clicks Run checks / Fix my setup"]
+  Idle["ER+ page (idle)\nNo auto-run"] --> Click["User clicks Run checks / Fix my setup"]
   Click --> Steps["Run steps sequentially\n(always run all)"]
   Steps --> Report["Report: OK / FIXED / NEEDS YOU / NEEDS PREREQUISITE / CAN'T FIX"]
   Report --> Store["Store last report (global)"]

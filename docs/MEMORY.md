@@ -1,37 +1,68 @@
-# PB Memory Model (v0)
+# Memory Model
 
-PB memory is workspace-file based and governed:
+PB memory is workspace-file based and draft-governed:
 
-- Daily scratch (append-only, bounded):  
+- Daily scratch (ephemeral, append-only):
   `.pb/memory/daily/YYYY-MM-DD.scratch.md`
-- Daily summary (bounded overwrite):  
+- Daily summary (derived):
   `.pb/memory/daily/YYYY-MM-DD.summary.md`
-- Durable memory:  
-  `MEMORY.md`
-- Durable monthly archives:  
-  `MEMORY_ARCHIVE/YYYY-MM.md`
+- Durable memory:
+  `MEMORY.md` + monthly archives under `MEMORY_ARCHIVE/`
 
-## Safety model
+## Draft-first behavior (Option B)
 
-- Memory reads are always allowed without approval, but only from allowlisted memory paths and with byte caps.
-- Scratch writes are append-only and rate/size limited.
-- Durable edits (`MEMORY.md`, `MEMORY_ARCHIVE/*`) are proposal + invoke only.
-- Sensitive scan + redaction run during finalize.
+All explicit memory writes now create **drafts** first.
 
-## APIs
+- Draft state: `state='draft'`
+- Committed state: `state='committed'`, `committed_at` set
+- Drafts are persisted immediately to SQLite and survive restart/crash.
+- Drafts are **not used** for memory search or model context until committed.
 
-- `GET /admin/memory/get` (allowlisted bounded read)
-- `GET /admin/memory/search` (lexical search across daily/durable/archive scopes)
-- `POST /admin/memory/write-scratch`
+## Commit or Wipe
+
+When drafts exist, operators can:
+
+- Commit selected/all drafts (moves to committed state)
+- Discard selected/all drafts (deletes drafts)
+- Review drafts from the Memory panel before choosing
+
+WebChat and app navigation show draft count and a guard so drafts are not silently dropped.
+
+## API
+
+### Draft lifecycle
+- `POST /api/memory/create_draft` (alias: `POST /api/memory/write`)
+- `GET /api/memory/drafts`
+- `POST /api/memory/commit`
+- `POST /api/memory/commit_all`
+- `POST /api/memory/discard`
+- `POST /api/memory/discard_all`
+
+### Search and health
+- `POST /api/memory/search` (committed only)
+- `GET /api/memory/health`
+
+### Admin aliases (auth-protected)
+- `GET /admin/memory/get`
 - `POST /admin/memory/update-summary`
-- `POST /admin/memory/finalize-day` (creates durable patch + approval proposal)
-- `POST /admin/memory/apply-durable-patch` (apply approved patch)
+- `POST /admin/memory/finalize-day`
+- `POST /admin/memory/apply-durable-patch`
 
-## Finalize Day flow
+## Observability
 
-1. Read full day scratch
-2. Scan for sensitive content
-3. Redact and preview
-4. Build diffs for durable files
-5. Require explicit invoke to apply
-6. Rotate older day logs from `MEMORY.md` into `MEMORY_ARCHIVE/YYYY-MM.md`
+Memory operations emit events (sanitized):
+
+- `memory.draft_created`
+- `memory.commit`, `memory.commit_all`
+- `memory.discard`, `memory.discard_all`
+- `memory.search`
+- `memory.api.request`
+- Security events for memory auth/search failures and requests
+
+No secrets are logged in memory event payloads.
+
+
+## Legacy approval conversion
+
+If older memory-write proposals are stuck in Approvals, use **Memory -> Convert pending approvals to drafts**.
+This moves pending `memory.write_scratch`/`memory.append` proposals into durable drafts and supersedes their approval items.

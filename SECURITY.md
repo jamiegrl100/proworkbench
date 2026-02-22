@@ -1,24 +1,29 @@
 # Security Policy
 
-Project status: **Preview (v0.1)**.
+## Supported Versions
 
-## Reporting a vulnerability
-Please do not open public GitHub issues for security problems.
+Security fixes are applied to the latest active branch (`main`) first.
 
-Instead, report privately:
-1. Create a GitHub Security Advisory (preferred), or
-2. Contact the maintainer through GitHub Discussions and request a private channel.
+## Reporting a Vulnerability
 
-Include:
-- a description of the issue
-- steps to reproduce
-- impact assessment
-- any proposed fix
+Please do **not** open public issues for vulnerabilities.
 
-## Supported versions
-Only the latest Preview release is supported for security fixes.
+Report via repository security advisory or private contact with:
+- affected version/commit
+- reproduction steps
+- impact scope
+- suggested mitigation (if available)
 
-## Scope notes
-- PB is designed for local-only use by default (binds to `127.0.0.1`).
-- Tools/MCP execution is WebChat-only; social channels are chat-only.
+We will acknowledge receipt and provide triage status.
 
+## Scope highlights
+
+- Local runtime and approval paths
+- Token/session handling
+- Tool and MCP boundaries
+- External connector handling (if configured)
+
+## Out of scope
+
+- Misconfiguration on publicly exposed hosts without recommended controls
+- Third-party runtime bugs outside this repository

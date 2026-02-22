@@ -138,7 +138,7 @@ async function runDoctor({ mode, db, dataDir, telegram, slack, adminToken, onSte
       status: 'CANT_FIX',
       found: 'PB health check failed.',
       did: 'No action taken.',
-      next: ['Restart PB server and retry Doctor.'],
+      next: ['Restart PB server and retry ER+.'],
       actions: [],
       details: { error: String(e?.message || e) },
     });
@@ -204,7 +204,7 @@ async function runDoctor({ mode, db, dataDir, telegram, slack, adminToken, onSte
       found: `Text WebUI probe failed at ${baseUrl}.`,
       did: 'PB does not start Text WebUI automatically.',
       next: [
-        'Start Text WebUI manually, then retry Doctor.',
+        'Start Text WebUI manually, then retry ER+.',
       ],
       actions: [action('Open Text WebUI', baseUrl)],
       details: { error: String(e?.message || e) },
@@ -219,7 +219,7 @@ async function runDoctor({ mode, db, dataDir, telegram, slack, adminToken, onSte
       status: 'NEEDS_PREREQUISITE',
       found: 'Cannot check models because Text WebUI is not reachable.',
       did: 'No action taken.',
-      next: ['Start Text WebUI, then rerun Doctor.'],
+      next: ['Start Text WebUI, then rerun ER+.'],
       actions: [action('Open Text WebUI', baseUrl)],
       details: { prerequisite: 'textwebui_reachable' },
     });
@@ -263,7 +263,7 @@ async function runDoctor({ mode, db, dataDir, telegram, slack, adminToken, onSte
       status: 'NEEDS_PREREQUISITE',
       found: 'Cannot run chat test until Text WebUI is running and a model is loaded.',
       did: 'No action taken.',
-      next: ['Start Text WebUI and load a model, then rerun Doctor.'],
+      next: ['Start Text WebUI and load a model, then rerun ER+.'],
       actions: [action('Open Text WebUI', baseUrl)],
       details: { prerequisite: 'models_list_loaded' },
     });
@@ -281,7 +281,7 @@ async function runDoctor({ mode, db, dataDir, telegram, slack, adminToken, onSte
         status: 'NEEDS_PREREQUISITE',
         found: 'No model available to test.',
         did: 'No action taken.',
-        next: ['Load a model in Text WebUI, then rerun Doctor.'],
+        next: ['Load a model in Text WebUI, then rerun ER+.'],
         actions: [action('Open Text WebUI', baseUrl)],
         details: {},
       });
@@ -375,7 +375,7 @@ async function runDoctor({ mode, db, dataDir, telegram, slack, adminToken, onSte
       status: 'CANT_FIX',
       found: 'MCP check failed.',
       did: 'No action taken.',
-      next: ['Restart PB and retry Doctor.'],
+      next: ['Restart PB and retry ER+.'],
       actions: [action('Open MCP Servers', '#/mcp')],
       details: { error: String(e?.message || e) },
     });
@@ -412,7 +412,7 @@ async function runDoctor({ mode, db, dataDir, telegram, slack, adminToken, onSte
       status: 'CANT_FIX',
       found: 'Approvals query failed.',
       did: 'No action taken.',
-      next: ['Restart PB and retry Doctor.'],
+      next: ['Restart PB and retry ER+.'],
       actions: [action('Open Approvals', '#/approvals')],
       details: { error: String(e?.message || e) },
     });

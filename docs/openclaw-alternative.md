@@ -41,7 +41,7 @@ These values map to concrete product behavior:
 - Telegram/Slack are chat/notify surfaces only (no tool/MCP execution).
 
 5. **Operational visibility**
-- Doctor provides setup checks and guided fixes.
+- ER+ provides setup checks and guided fixes.
 - Canvas and runtime views make state and outputs inspectable.
 
 ## Security posture comparison (high level)
@@ -52,7 +52,7 @@ These values map to concrete product behavior:
 | Risk controls | Depends on deployment profile | Block-by-default + per-risk controls |
 | Approvals | Implementation-dependent | Unified approvals for tools + MCP |
 | Social channels | Depends on integration choices | Chat-only, execution hard-blocked |
-| Recovery UX | Operator/toolchain dependent | Doctor guided checks and remediation |
+| Recovery UX | Operator/toolchain dependent | ER+ guided checks and remediation |
 
 ## What PB does not claim
 
@@ -77,7 +77,7 @@ These references should be used for informed evaluation, not alarmism.
 
 1. Run Text WebUI locally in API mode (`127.0.0.1:5000`).
 2. Load a model in WebUI first.
-3. Start PB and run Doctor.
+3. Start PB and run ER+.
 4. Keep tool policy conservative initially.
 5. Enable only tools needed for the first workflow.
 6. Use proposal → approval (if needed) → invoke flow.
@@ -110,4 +110,4 @@ PB is designed to make those failure modes easier to detect and recover from.
 - Website article: `https://proworkbench.com/openclaw-alternative/`
 - Security model: `docs/security.md`
 - Tools and approvals: `docs/tools-and-approvals.md`
-- Doctor: `docs/doctor.md`
+- ER+: `docs/doctor.md`

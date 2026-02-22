@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "search_browser",
+  "name": "Search Browser MCP",
+  "description": "Search web results then open/extract top pages.",
+  "risk": "medium",
+  "allowedChannels": [
+    "webchat"
+  ],
+  "requiresApprovalByDefault": false,
+  "fields": [],
+  "securityDefaults": {
+    "testPlan": [
+      "GET /health",
+      "browser.search query",
+      "open top result",
+      "extract text from top result"
+    ]
+  },
+  "defaultCapabilities": [
+    "browser.search",
+    "browser.open_url",
+    "browser.extract_text"
+  ]
+}

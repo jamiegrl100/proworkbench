@@ -6,21 +6,28 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "node --watch src/index.js",
-    "build": "node -e \"console.log('no build step yet')\"",
+    "build": "node scripts/build.mjs",
+    "test": "wait-on http://127.0.0.1:8787/admin/meta && PROWORKBENCH_ADMIN_TOKEN=admin-secret node src/http/admin.test.js",
     "start": "node src/index.js"
   },
   "dependencies": {
-    "argon2": "^0.31.2",
+    "@slack/bolt": "^3.17.0",
+    "argon2": "^0.44.0",
     "better-sqlite3": "^11.7.2",
+    "busboy": "^1.6.0",
     "cookie-parser": "^1.4.6",
-    "csurf": "^1.11.0",
+    "csurf": "^1.2.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2",
-    "@slack/bolt": "^3.17.0",
-    "busboy": "^1.6.0"
+    "vite": "7.3.1"
+  },
+  "devDependencies": {
+    "dotenv": "^16.4.5",
+    "esbuild": "^0.25.0",
+    "wait-on": "^7.2.0"
   }
 }

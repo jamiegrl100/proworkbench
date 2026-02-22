@@ -138,15 +138,15 @@ export default function TelegramPage({ onPendingBadge }: { onPendingBadge: (n: n
   return (
     <div>
       {data.pendingOverflowActive ? (
-        <div style={{ padding: 12, border: '1px solid #f0d48a', background: '#fff9e6', borderRadius: 10, margin: 16 }}>
+        <div style={{ padding: 12, border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 14%, var(--panel))', borderRadius: 10, margin: 16 }}>
           <b>{t('telegram.pendingOverflowTitle', { cap: data.pendingCap })}</b> {t('telegram.pendingOverflowBody')}
         </div>
       ) : null}
       <div style={{ padding: 16 }}>
         <h2 style={{ marginTop: 0 }}>{t('page.telegram.title')}</h2>
-        {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+        {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
         {toastMsg ? (
-          <div style={{ marginBottom: 12, padding: 10, border: '1px solid #c8e6c9', background: '#e8f5e9', borderRadius: 10 }}>
+          <div style={{ marginBottom: 12, padding: 10, border: '1px solid color-mix(in srgb, var(--ok) 45%, var(--border))', background: 'color-mix(in srgb, var(--ok) 14%, var(--panel))', borderRadius: 10 }}>
             {toastMsg}
           </div>
         ) : null}
@@ -172,7 +172,7 @@ export default function TelegramPage({ onPendingBadge }: { onPendingBadge: (n: n
             <button
               key={tabKey}
               onClick={() => setTab(tabKey)}
-              style={{ padding: '8px 10px', borderRadius: 999, border: '1px solid #ddd', background: tab === tabKey ? '#fafafa' : '#fff' }}
+              style={{ padding: '8px 10px', borderRadius: 999, border: '1px solid var(--border)', background: tab === tabKey ? 'var(--panel-2)' : 'var(--text-inverse)' }}
             >
               {tabKey === 'pending' ? t('telegram.tab.pending') : tabKey === 'allowed' ? t('telegram.tab.allowed') : t('telegram.tab.blocked')}
             </button>
@@ -183,7 +183,7 @@ export default function TelegramPage({ onPendingBadge }: { onPendingBadge: (n: n
         {tab === 'pending' ? (
           <>
             {data.pending.length === 0 ? (
-              <div style={{ marginBottom: 10, padding: 10, border: '1px solid #e5e7eb', borderRadius: 10, background: '#fafafa', fontSize: 13 }}>
+              <div style={{ marginBottom: 10, padding: 10, border: '1px solid var(--border-soft)', borderRadius: 10, background: 'var(--panel-2)', fontSize: 13 }}>
                 {t('telegram.empty.pending')}
               </div>
             ) : null}
@@ -212,7 +212,7 @@ export default function TelegramPage({ onPendingBadge }: { onPendingBadge: (n: n
 
         {tab === 'allowed' ? (
           <>
-            <div style={{ marginBottom: 12, padding: 12, border: '1px solid #e5e7eb', borderRadius: 10, background: '#fafafa', display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'end' }}>
+            <div style={{ marginBottom: 12, padding: 12, border: '1px solid var(--border-soft)', borderRadius: 10, background: 'var(--panel-2)', display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'end' }}>
               <label style={{ display: 'grid', gap: 6, minWidth: 260 }}>
                 <span style={{ fontSize: 12, opacity: 0.8 }}>{t('telegram.allowlist.inputLabel')}</span>
                 <input
@@ -227,7 +227,7 @@ export default function TelegramPage({ onPendingBadge }: { onPendingBadge: (n: n
               </button>
             </div>
             {data.allowed.length === 0 ? (
-              <div style={{ marginBottom: 10, padding: 10, border: '1px solid #e5e7eb', borderRadius: 10, background: '#fafafa', fontSize: 13 }}>
+              <div style={{ marginBottom: 10, padding: 10, border: '1px solid var(--border-soft)', borderRadius: 10, background: 'var(--panel-2)', fontSize: 13 }}>
                 {t('telegram.empty.allowed')}
               </div>
             ) : null}
@@ -257,7 +257,7 @@ export default function TelegramPage({ onPendingBadge }: { onPendingBadge: (n: n
           <>
             <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>{t('telegram.unblockHelp')}</div>
             {data.blocked.length === 0 ? (
-              <div style={{ marginBottom: 10, padding: 10, border: '1px solid #e5e7eb', borderRadius: 10, background: '#fafafa', fontSize: 13 }}>
+              <div style={{ marginBottom: 10, padding: 10, border: '1px solid var(--border-soft)', borderRadius: 10, background: 'var(--panel-2)', fontSize: 13 }}>
                 {t('telegram.empty.blocked')}
               </div>
             ) : null}

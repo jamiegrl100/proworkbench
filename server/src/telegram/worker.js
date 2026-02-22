@@ -19,6 +19,13 @@ import {
 function nowIso() { return new Date().toISOString(); }
 function nowMs() { return Date.now(); }
 
+function normalizeTelegramToken(raw) {
+  let token = String(raw || '').trim();
+  token = token.replace(/^['\"]+|['\"]+$/g, '');
+  if (token.toLowerCase().startsWith('bot')) token = token.slice(3);
+  return token.trim();
+}
+
 function parseAllowedIds(raw) {
   const parts = String(raw || '').split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
   const set = new Set();
@@ -55,10 +62,16 @@ function setDbAllowlist(db, idsSet) {
 
 function seedDbAllowlistFromEnv(db, dataDir) {
   const current = getDbAllowlist(db);
-  if (current.size > 0) return current;
   const { env } = readEnvFile(dataDir);
-  const seeded = parseAllowedIds(env.TELEGRAM_ALLOWED_USER_IDS || env.TELEGRAM_ALLOWED_CHAT_IDS || '');
-  return setDbAllowlist(db, seeded);
+  const envIds = parseAllowedIds(env.TELEGRAM_ALLOWED_USER_IDS || env.TELEGRAM_ALLOWED_CHAT_IDS || '');
+  let changed = false;
+  for (const id of envIds) {
+    if (!current.has(id)) {
+      current.add(id);
+      changed = true;
+    }
+  }
+  return changed ? setDbAllowlist(db, current) : current;
 }
 
 function recordPending(db, chatId, username) {
@@ -109,6 +122,27 @@ function isExpired(createdAtIso) {
   return (Date.now() - created) > 24 * 60 * 60_000;
 }
 
+async function buildTelegramApi(env) {
+  const candidates = [];
+  const t1 = normalizeTelegramToken(env.TELEGRAM_BOT_TOKEN || '');
+  const t2 = normalizeTelegramToken(env.BOT_API_TOKEN || '');
+  if (t1) candidates.push(t1);
+  if (t2 && t2 !== t1) candidates.push(t2);
+  if (!candidates.length) throw new Error('Telegram bot token missing.');
+
+  let lastErr = null;
+  for (const token of candidates) {
+    try {
+      const api = makeTelegramApi(token);
+      await api.getMe();
+      return { api, token };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(String(lastErr?.message || lastErr || 'Telegram token verification failed'));
+}
+
 export function createTelegramWorkerController({ db, dataDir }) {
   const rateWindow = new Map();
 const unknownViolationWindow = new Map();
@@ -150,6 +184,9 @@ const state = {
     running: false,
     startedAt: null,
     lastError: null,
+    lastPollAt: null,
+    lastUpdateId: null,
+    lastInboundAt: null,
   };
 
   let stop = false;
@@ -367,7 +404,18 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
       state.lastError = 'Telegram secrets not configured.';
       return;
     }
-    const api = makeTelegramApi(env.TELEGRAM_BOT_TOKEN);
+    const built = await buildTelegramApi(env);
+    const api = built.api;
+    try {
+      const normalized = normalizeTelegramToken(env.TELEGRAM_BOT_TOKEN || '');
+      if (built.token && built.token !== normalized) {
+        writeEnvFile(dataDir, { TELEGRAM_BOT_TOKEN: built.token, BOT_API_TOKEN: built.token });
+        process.env.TELEGRAM_BOT_TOKEN = built.token;
+        process.env.BOT_API_TOKEN = built.token;
+      }
+    } catch {
+      // best effort
+    }
     stop = false;
     state.lastError = null;
 
@@ -383,6 +431,7 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
       try {
         updates = await api.getUpdates({ offset, timeoutSeconds: 30 });
         state.lastError = null;
+        state.lastPollAt = nowIso();
       } catch (e) {
         state.lastError = String(e?.message || e);
         await new Promise(r => setTimeout(r, 2000));
@@ -391,6 +440,7 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
 
       for (const u of updates) {
         const uid = u.update_id;
+        state.lastUpdateId = uid;
         kvSet(db, 'telegram.updateOffset', uid + 1);
 
         const msg = u.message;
@@ -401,6 +451,7 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
         const text = msg?.text || '';
 
         const chatIdStr = String(chatId);
+        state.lastInboundAt = nowIso();
 
         if (isBlocked(chatIdStr)) continue;
 
@@ -442,6 +493,7 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
     state.running = true;
     recordEvent(db, 'telegram.worker.start', {});
     state.startedAt = nowIso();
+    state.lastPollAt = null;
     loopPromise = pollLoop().finally(() => {
       state.running = false;
     recordEvent(db, 'telegram.worker.stop', {});
@@ -529,8 +581,8 @@ if (shouldRateLimit(chatId, maxPerMinute)) {
     const { env } = readEnvFile(dataDir);
     if (!envConfigured(env)) return { ok: false, error: 'Telegram secrets not configured.' };
     try {
-      const api = makeTelegramApi(env.TELEGRAM_BOT_TOKEN);
-      await send(api, String(chatId), String(text || ''));
+      const built = await buildTelegramApi(env);
+      await send(built.api, String(chatId), String(text || ''));
       return { ok: true };
     } catch (e) {
       state.lastError = String(e?.message || e);

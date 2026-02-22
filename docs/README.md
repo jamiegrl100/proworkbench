@@ -1,33 +1,23 @@
-# Docs
+# ProWorkBench Docs
 
-Proworkbench documentation (Preview v0.1).
+This directory is the canonical operator/developer documentation set.
 
-> [!NOTE]
-> These docs prioritize non-technical, step-by-step guidance. Advanced sections exist, but are optional.
+## Start Here
 
-## Table of contents
-- Getting started: `docs/getting-started.md`
-- Persistent memory: `docs/MEMORY.md`
-- Watchtower: `docs/watchtower.md`
-- Doctor: `docs/doctor.md`
-- Security model deep dive: `docs/security-model-block-by-default.md`
-- Doctor deep dive: `docs/doctor-accident-prevention.md`
-- Tools and approvals: `docs/tools-and-approvals.md`
-- MCP servers: `docs/mcp-servers.md`
-- Canvas: `docs/canvas.md`
-- Smoke test checklist: `docs/smoke-test.md`
-- Security: `docs/security.md`
-- OpenClaw alternative (governed autonomy): `docs/openclaw-alternative.md`
-- Troubleshooting: `docs/troubleshooting.md`
-- Architecture (diagrams): `docs/architecture.md`
-- Roadmap: `docs/roadmap.md`
-- Release checklist (Preview): `docs/release-checklist.md`
-- Website copy notes: `docs/website-copy.md`
-- Writing style guide: `docs/STYLE-GUIDE.md`
+1. [INSTALL.md](./INSTALL.md)
+2. [QUICKSTART.md](./QUICKSTART.md)
+3. [DOCTOR.md](./DOCTOR.md)
 
-## How to update docs
-1. Edit markdown in `docs/`.
-2. Keep steps short and literal (copy/paste commands, exact URLs, and expected outputs).
-3. Prefer diagrams using Mermaid in fenced blocks (` ```mermaid `).
-4. If a feature is not shipped yet, label it **Planned** (do not imply it exists).
-5. Before shipping a preview build, run every step in `docs/smoke-test.md`.
+## Core Guides
+
+- [MCP_PRESETS.md](./MCP_PRESETS.md)
+- [SECURITY.md](./SECURITY.md)
+- [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
+- [DEVELOPMENT.md](./DEVELOPMENT.md)
+- [CHANGELOG.md](./CHANGELOG.md)
+
+## Source-of-Truth Rules
+
+- If docs and website differ, fix both in the same change.
+- Do not advertise features that are not merged and testable.
+- If information is missing, add a `TODO:` marker and open an issue.

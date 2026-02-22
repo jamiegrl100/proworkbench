@@ -15,7 +15,9 @@ export default function StatusPage({
   onRefreshSetup?: () => Promise<void> | void;
 }) {
   const { t } = useI18n();
-  const needsOnboarding = Boolean(setup && (!setup.secretsOk || !setup.llm.lastRefreshedAt || !setup.llm.activeProfile));
+  const needsMessaging = Boolean(setup && (!setup.messaging?.provider || !setup.messaging?.configured || !setup.messaging?.last_test_ok));
+  const needsModel = Boolean(setup && (!setup.llm.lastRefreshedAt || !setup.llm.activeProfile));
+  const needsOnboarding = Boolean(setup && (needsMessaging || needsModel));
 
   if (setup && needsOnboarding) {
     return (
@@ -40,7 +42,7 @@ export default function StatusPage({
       {!setup ? (
         <div>
           {error ? (
-            <div style={{ color: '#b00020', marginBottom: 8 }}>
+            <div style={{ color: 'var(--bad)', marginBottom: 8 }}>
               {t('status.unableLoadSetupState', { error })}
             </div>
           ) : null}
@@ -48,9 +50,12 @@ export default function StatusPage({
         </div>
       ) : (
         <div style={{ display: 'grid', gap: 10, maxWidth: 760 }}>
-          <Card title={t('status.telegram.title')}>
-            <div>{t('status.telegram.secrets')}: <b>{setup.secretsOk ? t('status.ok') : t('status.missing')}</b></div>
-            <div>{t('status.telegram.worker')}: <b>{setup.telegramRunning ? t('status.running') : t('status.stopped')}</b></div>
+          <Card title={'Messaging'}>
+            <div>Provider: <b>{setup.messaging?.provider || '—'}</b></div>
+            <div>Configured: <b>{setup.messaging?.configured ? t('status.ok') : t('status.missing')}</b></div>
+            <div>Last test: <b>{setup.messaging?.last_test_ok ? t('status.ok') : t('status.missing')}</b>{setup.messaging?.last_test_at ? ` (${setup.messaging.last_test_at})` : ''}</div>
+            <div>Telegram worker: <b>{setup.telegramRunning ? t('status.running') : t('status.stopped')}</b></div>
+            <div>Slack worker: <b>{setup.slackRunning ? t('status.running') : t('status.stopped')}</b></div>
           </Card>
           <Card title={t('status.llm.title')}>
             <div>{t('status.llm.baseUrl')}: <b>{setup.llm.baseUrl}</b></div>

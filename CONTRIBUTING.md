@@ -1,35 +1,32 @@
 # Contributing
 
-Project status: **Preview (v0.1)**.
+Thanks for contributing to ProWorkBench.
 
-## Development setup
-```bash
-cd /home/jamiegrl100/Apps/proworkbench
-npm install
-npm run dev
-```
+## Before opening a PR
 
-PB server: `http://127.0.0.1:8787`  
-PB UI dev: `http://127.0.0.1:5173`
+1. Open/confirm an issue for the change.
+2. Keep scope tight (feature, fix, or docs refresh).
+3. Update docs + website copy if behavior/user flow changed.
+4. Include validation steps and expected output.
 
-## PR checklist
-- UI builds: `npm -w ui run build`
-- Docs updated for user-visible behavior changes
-- Security boundaries respected:
-  - tools/MCP are WebChat-only
-  - social channels are chat-only
-  - no cookies/CSRF for admin
+## Branch and PR flow
 
-## Docs
-- Docs live in `docs/`.
-- Mermaid diagrams are preferred for flows.
-- If a feature is not shipped, label it **Planned**.
+- Branch from `main`
+- Commit logical units
+- Open PR with:
+  - problem statement
+  - solution summary
+  - test/verification commands
+  - screenshots for UI changes
 
-## Suggested labels (guidance)
-- `bug`: user-visible problem or regression
-- `security`: security boundary, auth, approvals, or execution constraints
-- `docs`: documentation only
-- `ui`: frontend changes
-- `server`: backend changes
-- `good first issue`: small, well-scoped starter work
+## Documentation policy
 
+- Do not claim unshipped features.
+- Use `TODO:` markers plus issue links where info is pending.
+- Keep `README.md`, `docs/`, and website wording aligned.
+
+## Security-sensitive contributions
+
+If your change affects auth, approvals, token handling, or network access:
+- call out threat model changes in PR description,
+- update `docs/SECURITY.md` and root `SECURITY.md`.

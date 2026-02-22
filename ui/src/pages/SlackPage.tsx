@@ -185,7 +185,7 @@ export default function SlackPage() {
         <div style={{ marginTop: 12, fontSize: 12, opacity: 0.85 }}>
           {t('slack.statusLine', { status: status.running ? t('common.running') : t('common.stopped'), startedAt: status.startedAt || '—', lastError: status.lastError || '—' })}
         </div>
-        {err ? <div style={{ marginTop: 12, color: '#b00020', whiteSpace: 'pre-wrap' }}>{err}</div> : null}
+        {err ? <div style={{ marginTop: 12, color: 'var(--bad)', whiteSpace: 'pre-wrap' }}>{err}</div> : null}
       </Card>
 
       <Card title={t('slack.pending.title')}>

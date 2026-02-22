@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "id": "code1",
+  "name": "Code1 Docs",
+  "description": "Resolve library IDs and fetch version-specific docs/snippets for coding help.",
+  "risk": "low",
+  "allowedChannels": [
+    "webchat"
+  ],
+  "requiresApprovalByDefault": false,
+  "fields": [
+    {
+      "key": "baseUrl",
+      "label": "Code1 MCP Base URL",
+      "type": "text",
+      "required": false,
+      "default": "http://127.0.0.1:6767"
+    },
+    {
+      "key": "transport",
+      "label": "Transport",
+      "type": "text",
+      "required": false,
+      "default": "http"
+    },
+    {
+      "key": "entryCmd",
+      "label": "Local command (optional)",
+      "type": "text",
+      "required": false,
+      "default": "npx -y @upstash/context7-mcp"
+    }
+  ],
+  "securityDefaults": {
+    "testPlan": [
+      "GET /health",
+      "resolve-library-id",
+      "query-docs"
+    ],
+    "notes": "Set baseUrl to your Code1 MCP runtime. If running local, start it with npx/bunx/deno and use the runtime URL."
+  },
+  "defaultCapabilities": [
+    "resolve-library-id",
+    "query-docs"
+  ]
+}

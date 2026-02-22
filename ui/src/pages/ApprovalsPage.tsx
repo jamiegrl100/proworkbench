@@ -10,6 +10,10 @@ type ApprovalRow = {
   source: string;
   tool_name?: string;
   risk_level?: string;
+  tier?: "A" | "B" | "C" | null;
+  requested_action_summary?: string | null;
+  approval_why?: string | null;
+  proposed_grant?: any;
   status?: string;
   summary?: string;
   reason?: string | null;
@@ -43,8 +47,8 @@ export default function ApprovalsPage() {
       const reqId = String(params.get("request") || "").trim();
       if (reqId) {
         setSelectedId(reqId);
-        setStatus("pending");
-        setTab("pending");
+        setStatus("all");
+        setTab("history");
       }
     } catch {
       // ignore
@@ -90,6 +94,15 @@ export default function ApprovalsPage() {
     }
   }
 
+
+  useEffect(() => {
+    if (status !== "pending") return;
+    const timer = window.setInterval(() => {
+      load();
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [status]);
+
   async function approve(id: string) {
     setBusy(true);
     setErr("");
@@ -128,38 +141,39 @@ export default function ApprovalsPage() {
       </div>
 
       {err ? (
-        <div style={{ padding: 10, border: "1px solid #f1c6c6", background: "#fff4f4", borderRadius: 8, color: "#b00020" }}>
+        <div style={{ padding: 10, border: "1px solid color-mix(in srgb, var(--bad) 45%, var(--border))", background: "color-mix(in srgb, var(--bad) 12%, var(--panel))", borderRadius: 8, color: "var(--bad)" }}>
           {err}
         </div>
       ) : null}
 
       <div style={{ display: "flex", gap: 8 }}>
-        <button onClick={() => { setTab("pending"); setStatus("pending"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid #ddd", background: status === "pending" ? "#f2f2f2" : "#fff" }}>{t("approvals.pending")}</button>
-        <button onClick={() => { setTab("active"); setStatus("approved"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid #ddd", background: status === "approved" ? "#f2f2f2" : "#fff" }}>{t("approvals.active")}</button>
-        <button onClick={() => { setTab("history"); setStatus("denied"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid #ddd", background: status === "denied" ? "#f2f2f2" : "#fff" }}>{t("approvals.history")}</button>
-        <button onClick={() => { setTab("history"); setStatus("all"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid #ddd", background: status === "all" ? "#f2f2f2" : "#fff" }}>{t("approvals.all")}</button>
+        <button onClick={() => { setTab("pending"); setStatus("pending"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid var(--border)", background: status === "pending" ? "var(--panel-2)" : "var(--text-inverse)" }}>{t("approvals.pending")}</button>
+        <button onClick={() => { setTab("active"); setStatus("approved"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid var(--border)", background: status === "approved" ? "var(--panel-2)" : "var(--text-inverse)" }}>{t("approvals.active")}</button>
+        <button onClick={() => { setTab("history"); setStatus("denied"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid var(--border)", background: status === "denied" ? "var(--panel-2)" : "var(--text-inverse)" }}>{t("approvals.history")}</button>
+        <button onClick={() => { setTab("history"); setStatus("all"); }} style={{ padding: "8px 10px", borderRadius: 999, border: "1px solid var(--border)", background: status === "all" ? "var(--panel-2)" : "var(--text-inverse)" }}>{t("approvals.all")}</button>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 12 }}>
-        <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, overflow: "hidden" }}>
+        <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, overflow: "hidden" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
             <thead>
-              <tr style={{ background: "#fafafa" }}>
-                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e5e7eb" }}>{t("approvals.table.approval")}</th>
-                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e5e7eb" }}>{t("approvals.table.source")}</th>
-                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e5e7eb" }}>{t("approvals.table.risk")}</th>
-                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e5e7eb" }}>{t("approvals.table.status")}</th>
-                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e5e7eb" }}>{t("approvals.table.actions")}</th>
+              <tr style={{ background: "var(--panel-2)" }}>
+                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid var(--border-soft)" }}>{t("approvals.table.approval")}</th>
+                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid var(--border-soft)" }}>{t("approvals.table.source")}</th>
+                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid var(--border-soft)" }}>{t("approvals.table.risk")}</th>
+                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid var(--border-soft)" }}>Tier</th>
+                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid var(--border-soft)" }}>{t("approvals.table.status")}</th>
+                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid var(--border-soft)" }}>{t("approvals.table.actions")}</th>
               </tr>
             </thead>
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={5} style={{ padding: 12 }}>{t("common.loading")}</td>
+                  <td colSpan={6} style={{ padding: 12 }}>{t("common.loading")}</td>
                 </tr>
               ) : rows.length === 0 ? (
                 <tr>
-                  <td colSpan={5} style={{ padding: 12 }}>
+                  <td colSpan={6} style={{ padding: 12 }}>
                     <div style={{ fontWeight: 600, marginBottom: 4 }}>{t("approvals.empty.title")}</div>
                     <div style={{ opacity: 0.8 }}>{t("approvals.empty.body")}</div>
                   </td>
@@ -168,20 +182,41 @@ export default function ApprovalsPage() {
                 rows.map((r) => (
                   <tr
                     key={r.id}
-                    style={{ background: selectedId === r.id ? "#f8fbff" : "transparent", cursor: "pointer" }}
+                    style={{ background: selectedId === r.id ? "color-mix(in srgb, var(--accent-2) 10%, var(--panel))" : "transparent", cursor: "pointer" }}
                     onClick={() => loadDetail(r.id)}
                   >
-                    <td style={{ padding: 10, borderTop: "1px solid #f3f4f6" }}>
+                    <td style={{ padding: 10, borderTop: "1px solid var(--panel-2)" }}>
                       <div style={{ fontWeight: 600 }}>{r.tool_name || r.summary || r.id}</div>
                       <div style={{ fontSize: 12, opacity: 0.75 }}>{r.id}</div>
                     </td>
-                    <td style={{ padding: 10, borderTop: "1px solid #f3f4f6" }}>{r.source || "—"}</td>
-                    <td style={{ padding: 10, borderTop: "1px solid #f3f4f6" }}>{r.risk_level || "—"}</td>
-                    <td style={{ padding: 10, borderTop: "1px solid #f3f4f6" }}>{r.status || "—"}</td>
-                    <td style={{ padding: 10, borderTop: "1px solid #f3f4f6" }}>
+                    <td style={{ padding: 10, borderTop: "1px solid var(--panel-2)" }}>{r.source || "—"}</td>
+                    <td style={{ padding: 10, borderTop: "1px solid var(--panel-2)" }}>{r.risk_level || "—"}</td>
+                    <td style={{ padding: 10, borderTop: "1px solid var(--panel-2)" }}>
+                      <span
+                        style={{
+                          display: "inline-block",
+                          borderRadius: 999,
+                          border: "1px solid var(--border)",
+                          padding: "2px 8px",
+                          background: r.tier === "A"
+                            ? "color-mix(in srgb, var(--ok) 18%, var(--panel))"
+                            : r.tier === "B"
+                              ? "color-mix(in srgb, var(--warn) 18%, var(--panel))"
+                              : r.tier === "C"
+                                ? "color-mix(in srgb, var(--bad) 18%, var(--panel))"
+                                : "var(--panel)",
+                        }}
+                      >
+                        {r.tier || "—"}
+                      </span>
+                    </td>
+                    <td style={{ padding: 10, borderTop: "1px solid var(--panel-2)" }}>{r.status || "—"}</td>
+                    <td style={{ padding: 10, borderTop: "1px solid var(--panel-2)" }}>
                       {status === "pending" ? (
                         <div style={{ display: "flex", gap: 8 }}>
-                          <button disabled={busy} onClick={(e) => { e.stopPropagation(); approve(r.id); }}>{t("approvals.approve")}</button>
+                          <button disabled={busy} onClick={(e) => { e.stopPropagation(); approve(r.id); }}>
+                            {r.tier === "B" ? "Approve for job" : t("approvals.approve")}
+                          </button>
                           <button disabled={busy} onClick={(e) => { e.stopPropagation(); deny(r.id); }}>{t("approvals.deny")}</button>
                         </div>
                       ) : (
@@ -195,14 +230,21 @@ export default function ApprovalsPage() {
           </table>
         </div>
 
-        <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 10 }}>
+        <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10 }}>
           <h3 style={{ marginTop: 0 }}>{t("approvals.detail")}</h3>
           {!detail ? (
             <div style={{ opacity: 0.7 }}>{t("approvals.selectRow")}</div>
           ) : (
-            <pre style={{ margin: 0, background: "#fafafa", border: "1px solid #eee", padding: 10, maxHeight: 420, overflow: "auto" }}>
-              {JSON.stringify(detail, null, 2)}
-            </pre>
+            <div style={{ display: "grid", gap: 10 }}>
+              <div style={{ fontSize: 12, border: "1px solid var(--border-soft)", borderRadius: 8, padding: 8, background: "var(--panel-2)" }}>
+                <div><strong>Tier:</strong> {detail?.tier || "—"}</div>
+                <div><strong>Why:</strong> {detail?.approval_why || detail?.reason || "—"}</div>
+                <div><strong>Requested action:</strong> {detail?.requested_action_summary || detail?.summary || "—"}</div>
+              </div>
+              <pre style={{ margin: 0, background: "var(--panel-2)", border: "1px solid var(--border-soft)", padding: 10, maxHeight: 360, overflow: "auto" }}>
+                {JSON.stringify(detail, null, 2)}
+              </pre>
+            </div>
           )}
         </div>
       </div>

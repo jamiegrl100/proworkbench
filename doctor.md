@@ -1,35 +1,38 @@
-# Doctor
+# ER+
 
-Doctor is PB’s “Fix my setup” page. It runs a deterministic checklist and produces a simple outcome:
+ER+ is PB’s “Fix my setup” page. It runs a deterministic checklist and produces a simple outcome:
 - **OK**
 - **FIXED**
 - **NEEDS YOU**
 - **NEEDS PREREQUISITE**
 - **CAN’T FIX**
 
+> [!NOTE]
+> Legacy `#/doctor` and `/doctor` links redirect to `#/er` and `/er`.
+
 ## What you’ll see
 - A summary strip: counts by status
-- A step list that updates as Doctor runs
+- A step list that updates as ER+ runs
 - Issue cards with:
   - what PB found
   - what PB did (if anything)
   - what you do next (1 to 3 steps)
   - action buttons (Open WebUI, Open Runtime, Open Approvals, etc.)
 
-Doctor also verifies core security invariants such as social execution hard-blocks.
+ER+ also verifies core security invariants such as social execution hard-blocks.
 
-## How to run Doctor
-Doctor does not run automatically.
-1. Open the **Doctor** page.
+## How to run ER+
+ER+ does not run automatically.
+1. Open the **ER+** page.
 2. Click **Run checks only** or **Fix my setup**.
 
-## What Doctor can fix (safe repairs)
-Doctor may attempt only safe operations, such as:
+## What ER+ can fix (safe repairs)
+ER+ may attempt only safe operations, such as:
 - seeding missing MCP templates in the database
 - applying safe default configuration values
 - restarting PB internal workers (when supported by existing PB endpoints)
 
-## What Doctor will never do
+## What ER+ will never do
 - Start Text Generation WebUI
 - Run tools
 - Run MCP servers
@@ -38,7 +41,7 @@ Doctor may attempt only safe operations, such as:
 ## Common outcomes
 
 ### Text WebUI not running (NEEDS YOU)
-Doctor will tell you to start Text WebUI manually:
+ER+ will tell you to start Text WebUI manually:
 
 ```bash
 cd ~/Apps/text-generation-webui
@@ -46,11 +49,11 @@ cd ~/Apps/text-generation-webui
 ```
 
 ### Text WebUI running but no models (NEEDS YOU)
-Doctor will instruct you to open Text WebUI and load a model.
+ER+ will instruct you to open Text WebUI and load a model.
 
 Known-good model:
 - `models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf`
 
 ## Privacy / safety notes
-- Doctor reports should not contain secret values.
+- ER+ reports should not contain secret values.
 - If you copy a support report, review it before posting publicly.

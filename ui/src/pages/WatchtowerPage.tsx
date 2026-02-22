@@ -113,10 +113,10 @@ export default function WatchtowerPage() {
         Proactive checks run only when PB is idle. Watchtower never auto-invokes tools.
       </div>
 
-      {info ? <div style={{ border: "1px solid #bfdbfe", background: "#eff6ff", padding: 10, borderRadius: 8 }}>{info}</div> : null}
-      {err ? <div style={{ border: "1px solid #fecaca", background: "#fef2f2", padding: 10, borderRadius: 8 }}>{err}</div> : null}
+      {info ? <div style={{ border: "1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))", background: "color-mix(in srgb, var(--accent-2) 10%, var(--panel))", padding: 10, borderRadius: 8 }}>{info}</div> : null}
+      {err ? <div style={{ border: "1px solid color-mix(in srgb, var(--bad) 45%, var(--border))", background: "color-mix(in srgb, var(--bad) 12%, var(--panel))", padding: 10, borderRadius: 8 }}>{err}</div> : null}
 
-      <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
+      <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
         <div style={{ fontWeight: 700 }}>Settings</div>
         <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <input
@@ -190,7 +190,7 @@ export default function WatchtowerPage() {
         </div>
       </div>
 
-      <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+      <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <div style={{ fontWeight: 700 }}>WATCHTOWER.md checklist</div>
         <textarea
           value={editor}
@@ -207,13 +207,13 @@ export default function WatchtowerPage() {
         </div>
       </div>
 
-      <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 6 }}>
+      <div style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 6 }}>
         <div style={{ fontWeight: 700 }}>Last run output</div>
         <div><strong>Status:</strong> {String(state?.state?.status || "unknown")}</div>
         <div><strong>Preview:</strong> {String(state?.state?.lastMessagePreview || "(none)")}</div>
         <div><strong>Proposals:</strong> {Array.isArray(state?.state?.proposals) ? state.state.proposals.length : 0}</div>
         {String(state?.state?.status || "") === "skipped-not-idle" ? (
-          <div style={{ border: "1px solid #fde68a", background: "#fffbeb", borderRadius: 8, padding: 8, display: "grid", gap: 4 }}>
+          <div style={{ border: "1px solid color-mix(in srgb, var(--warn) 45%, var(--border))", background: "color-mix(in srgb, var(--warn) 16%, var(--panel))", borderRadius: 8, padding: 8, display: "grid", gap: 4 }}>
             <strong>Skipped: not idle</strong>
             <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
               {Object.entries((state?.state?.lastSkipReason || blockers || {}) as Record<string, boolean>)

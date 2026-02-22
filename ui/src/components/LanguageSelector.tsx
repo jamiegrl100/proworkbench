@@ -12,7 +12,7 @@ export default function LanguageSelector() {
       <select
         value={lang}
         onChange={(e) => setLang(e.target.value)}
-        style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd" }}
+        style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid var(--border)" }}
       >
         {LANGUAGE_OPTIONS.map((l) => (
           <option key={l.code} value={l.code}>{l.label}</option>

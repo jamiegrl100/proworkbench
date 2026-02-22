@@ -7,7 +7,7 @@ This is a lightweight checklist for cutting a Preview release.
 - `npm run build`
 - `npm run i18n:audit`
 - Quick UI click-through:
-  - Status, Diagnostics, Doctor
+  - Status, Diagnostics, ER+
   - Runtime (Text WebUI status + models)
   - WebChat (basic chat)
   - Tools (policy visible, block-by-default)

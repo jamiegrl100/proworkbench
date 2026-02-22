@@ -4,6 +4,7 @@ import path from 'node:path';
 import { llmChatOnce } from '../llm/llmClient.js';
 import { probeTextWebUI } from '../runtime/textwebui.js';
 import { getWorkspaceRoot } from '../util/workspace.js';
+import { getActiveProject, getProjectLibraries, readProjectConfig } from '../writingProjects.js';
 
 const MAX_STYLE_CHARS = 7000;
 const MAX_CANON_CHARS = 12000;
@@ -122,7 +123,7 @@ export function getRequiredCanonFiles(db) {
     `${p.libraryRel}/series/CANON.json`,
     `${p.libraryRel}/bibles/STYLE.md`,
     `${p.libraryRel}/bibles/TIMELINE.md`,
-    `${p.libraryRel}/prompts/NOVEL_MODE_PROMPTS.md`,
+    `${p.libraryRel}/modes/MODES.json`,
   ].map((rel) => ({ rel, abs: path.join(p.workspaceRoot, rel) }));
 }
 
@@ -180,6 +181,91 @@ export function loadCanonPack(db) {
   };
 }
 
+
+function loadLibraryPackFromRoot(workspaceRoot, libraryRel, libraryAbs, meta = {}) {
+  const booksTxt = safeReadText(path.join(libraryAbs, 'series', 'BOOKS.md'));
+  const styleTxt = safeReadText(path.join(libraryAbs, 'bibles', 'STYLE.md'));
+  const timelineTxt = safeReadText(path.join(libraryAbs, 'bibles', 'TIMELINE.md'));
+  const canonTxt = safeReadText(path.join(libraryAbs, 'series', 'CANON.json'));
+  const voiceTxt = safeReadText(path.join(libraryAbs, 'bibles', 'VOICE_CHIPS.md'));
+  const modesTxt = safeReadText(path.join(libraryAbs, 'modes', 'MODES.json'));
+  const canon = parseJson(canonTxt, { characters: [], places: [], factions: [], artifacts: [], rules: [], themes: [] });
+  const modes = parseJson(modesTxt, { version: 1, modes: [] });
+  return {
+    id: String(meta?.id || 'primary'),
+    label: String(meta?.label || (meta?.id === 'primary' ? 'Primary Universe' : meta?.id || 'Library')),
+    editable: Boolean(meta?.editable),
+    libraryRel,
+    libraryAbs,
+    books: parseBooksIndex(booksTxt || ''),
+    canon,
+    style: styleTxt || '',
+    timeline: timelineTxt || '',
+    voiceChips: voiceTxt || '',
+    modes,
+  };
+}
+
+export async function loadProjectLibrariesPack(db, projectIdInput = '') {
+  const active = await getActiveProject();
+  const projectId = String(projectIdInput || active?.activeProject?.id || '').trim();
+  if (!projectId) {
+    return { projectId: '', project: null, libraries: [], modes: [], defaults: { primaryMode: 'balanced', primaryStrength: 50, secondaryMode: null, secondaryStrength: 0 } };
+  }
+  const workspaceRoot = path.resolve(getWorkspaceRoot());
+  const projectCfg = await readProjectConfig(projectId);
+  const libs = await getProjectLibraries(projectId);
+  const packs = [];
+  for (const l of libs) {
+    const rel = String(l.path || '').replace(/\\/g, '/');
+    const abs = path.resolve(workspaceRoot, rel);
+    if (!abs.startsWith(workspaceRoot)) continue;
+    packs.push(loadLibraryPackFromRoot(workspaceRoot, rel, abs, l));
+  }
+  const primary = packs.find((x) => x.id === 'primary') || null;
+  const modes = Array.isArray(primary?.modes?.modes) ? primary.modes.modes : [];
+  return {
+    projectId,
+    project: active?.activeProject || null,
+    libraries: packs,
+    modes,
+    defaults: {
+      primaryMode: String(projectCfg?.defaults?.primaryMode || 'balanced'),
+      primaryStrength: Number(projectCfg?.defaults?.primaryStrength ?? 50) || 50,
+      secondaryMode: projectCfg?.defaults?.secondaryMode || null,
+      secondaryStrength: Number(projectCfg?.defaults?.secondaryStrength ?? 0) || 0,
+    },
+  };
+}
+
+function mergeCanonFromLibraries(libraries, enabledLibraryIds = []) {
+  const enabled = new Set((Array.isArray(enabledLibraryIds) ? enabledLibraryIds : ['primary']).map((x) => String(x || '')));
+  if (!enabled.has('primary')) enabled.add('primary');
+  const groups = ['characters', 'places', 'factions', 'artifacts', 'rules', 'themes'];
+  const merged = { characters: [], places: [], factions: [], artifacts: [], rules: [], themes: [] };
+  for (const lib of libraries) {
+    if (!enabled.has(String(lib.id))) continue;
+    for (const g of groups) {
+      const arr = Array.isArray(lib?.canon?.[g]) ? lib.canon[g] : [];
+      for (const entry of arr) {
+        merged[g].push({
+          ...entry,
+          _sourceLibraryId: String(lib.id),
+          _sourceLibraryLabel: String(lib.label || lib.id),
+        });
+      }
+    }
+  }
+  return merged;
+}
+
+export async function searchCanonAcrossLibraries(db, { q, limit = 40, projectId = '', enabledLibraryIds = [] }) {
+  const libs = await loadProjectLibrariesPack(db, projectId);
+  const canon = mergeCanonFromLibraries(libs.libraries, enabledLibraryIds);
+  const hits = searchCanon(canon, q, limit);
+  return hits.map((h) => ({ ...h, sourceLibraryId: h.sourceLibraryId || h._sourceLibraryId, sourceLibraryLabel: h.sourceLibraryLabel || h._sourceLibraryLabel }));
+}
+
 export function searchCanon(canon, q, limit = 40) {
   const query = String(q || '').trim().toLowerCase();
   if (!query) return [];
@@ -198,6 +284,8 @@ export function searchCanon(canon, q, limit = 40) {
         relationships: Array.isArray(e?.relationships) ? e.relationships.slice(0, 6) : [],
         sources: Array.isArray(e?.sources) ? e.sources.slice(0, 8) : [],
         confidence: String(e?.confidence || 'unknown'),
+        sourceLibraryId: String(e?._sourceLibraryId || ''),
+        sourceLibraryLabel: String(e?._sourceLibraryLabel || ''),
       });
       if (out.length >= limit) return out;
     }
@@ -240,7 +328,7 @@ function buildCanonBlock({ canon, characters, pinnedNames, searchHits }) {
 
   const lines = [];
   for (const e of uniq.slice(0, 16)) {
-    lines.push(`- [${e._group}] ${e.name}: ${e.short_description || ''}`);
+    lines.push(`- [${e._group}] ${e.name}: ${e.short_description || ''}` + (e._sourceLibraryLabel ? ` (${e._sourceLibraryLabel})` : ''));
     if (Array.isArray(e.constraints) && e.constraints.length) lines.push(`  constraints: ${e.constraints.slice(0, 3).join(' | ')}`);
     if (Array.isArray(e.sources) && e.sources.length) lines.push(`  sources: ${e.sources.join(', ')}`);
   }
@@ -253,11 +341,13 @@ function buildCanonBlock({ canon, characters, pinnedNames, searchHits }) {
       name: String(e.name || ''),
       sources: Array.isArray(e.sources) ? e.sources : [],
       confidence: String(e.confidence || 'unknown'),
+      sourceLibraryId: String(e._sourceLibraryId || ''),
+      sourceLibraryLabel: String(e._sourceLibraryLabel || ''),
     })),
   };
 }
 
-export function buildWritingPrompt({ pack, payload }) {
+export function buildWritingPrompt({ pack, payload, styleApplied = null, librariesApplied = [] }) {
   const style = trimCap(pack.style || '', MAX_STYLE_CHARS);
   const timeline = trimCap(pack.timeline || '', MAX_TIMELINE_CHARS);
   const location = String(payload.location || '').trim();
@@ -281,6 +371,10 @@ export function buildWritingPrompt({ pack, payload }) {
     'Return plain markdown only.',
   ].join('\n');
 
+  const styleMixLine = styleApplied
+    ? `Style mix: primary=${styleApplied.primaryMode}@${styleApplied.primaryStrength}, secondary=${styleApplied.secondaryMode || 'none'}@${styleApplied.secondaryStrength}. Preserve intensity exact: ${styleApplied.preserveIntensity ? 'yes' : 'no'}`
+    : 'Style mix: default';
+
   const userBlocks = [
     `Book context: ${bookId}`,
     `Location: ${location}`,
@@ -292,6 +386,8 @@ export function buildWritingPrompt({ pack, payload }) {
     `Ending hook: ${endingHook}`,
     `Tone slider (0 lean, 100 lyrical/dread): ${Number.isFinite(tone) ? tone : 50}`,
     `Target length (words): ${Number.isFinite(targetLength) ? targetLength : 1200}`,
+    styleMixLine,
+    `Enabled libraries: ${librariesApplied.length ? librariesApplied.join(', ') : 'primary'}`,
     '',
     'Canon snippets (bounded):',
     canonBlock.text || '(none)',
@@ -308,7 +404,14 @@ export function buildWritingPrompt({ pack, payload }) {
   let promptText = userBlocks.join('\n');
   if (promptText.length > MAX_PROMPT_CONTEXT) promptText = promptText.slice(0, MAX_PROMPT_CONTEXT);
 
-  return { systemText, promptText, canonUsed: canonBlock.used, retrieval: { styleChars: style.length, canonChars: canonBlock.text.length, timelineChars: timeline.length, totalChars: promptText.length } };
+  return {
+    systemText,
+    promptText,
+    canonUsed: canonBlock.used,
+    retrieval: { styleChars: style.length, canonChars: canonBlock.text.length, timelineChars: timeline.length, totalChars: promptText.length },
+    styleApplied,
+    librariesApplied,
+  };
 }
 
 function firstJsonObject(text) {
@@ -342,20 +445,68 @@ export async function runDraft({ db, payload }) {
     err.code = 'WRITINGLAB_PROVIDER_NOT_READY';
     throw err;
   }
-  const pack = loadCanonPack(db);
-  if (pack.missing.length > 0) {
-    const err = new Error(`Canon pack not found: ${pack.missing.join(', ')}`);
-    err.code = 'WRITINGLAB_CANON_MISSING';
+
+  const projectPack = await loadProjectLibrariesPack(db, String(payload?.projectId || ''));
+  if (!projectPack?.projectId || !Array.isArray(projectPack.libraries) || projectPack.libraries.length === 0) {
+    const err = new Error('No active writing project selected.');
+    err.code = 'WRITINGLAB_PROJECT_REQUIRED';
     throw err;
   }
-  const built = buildWritingPrompt({ pack, payload });
+
+  const enabledInput = Array.isArray(payload?.enabledLibraryIds) ? payload.enabledLibraryIds : ['primary'];
+  const enabledSet = new Set(enabledInput.map((x) => String(x || '')).filter(Boolean));
+  enabledSet.add('primary');
+  const enabledLibraries = projectPack.libraries.filter((l) => enabledSet.has(String(l.id)));
+
+  const mergedCanon = mergeCanonFromLibraries(projectPack.libraries, Array.from(enabledSet));
+  const primary = projectPack.libraries.find((l) => String(l.id) === 'primary') || projectPack.libraries[0];
+  const attachedStyle = enabledLibraries.filter((l) => String(l.id) !== 'primary').map((l) => trimCap(l.style || '', 1500)).filter(Boolean).join('\n\n');
+
+  const modeMix = payload?.modeMix && typeof payload.modeMix === 'object' ? payload.modeMix : {};
+  const primaryMode = String(modeMix.primaryMode || projectPack.defaults.primaryMode || 'balanced');
+  const primaryStrength = Math.max(0, Math.min(100, Number(modeMix.primaryStrength ?? projectPack.defaults.primaryStrength ?? 50) || 50));
+  const secondaryMode = modeMix.secondaryMode ? String(modeMix.secondaryMode) : (projectPack.defaults.secondaryMode || null);
+  const secondaryStrength = Math.max(0, Math.min(30, Number(modeMix.secondaryStrength ?? projectPack.defaults.secondaryStrength ?? 0) || 0));
+  const preserveIntensity = Boolean(modeMix.preserveIntensity);
+
+  const styleMixHeader = [
+    `Primary mode: ${primaryMode} @${primaryStrength}`,
+    `Secondary mode: ${secondaryMode || 'none'} @${secondaryStrength}`,
+    `Preserve intensity exactly: ${preserveIntensity ? 'yes' : 'no'}`,
+  ].join('\n');
+
+  const mergedPack = {
+    ...primary,
+    canon: mergedCanon,
+    style: [styleMixHeader, '', trimCap(primary.style || '', MAX_STYLE_CHARS), attachedStyle ? `\n\nAttached library style notes:\n${attachedStyle}` : ''].join('\n').slice(0, MAX_STYLE_CHARS),
+    timeline: trimCap(primary.timeline || '', MAX_TIMELINE_CHARS),
+  };
+
+  const built = buildWritingPrompt({
+    pack: mergedPack,
+    payload,
+    styleApplied: { primaryMode, primaryStrength, secondaryMode, secondaryStrength, preserveIntensity },
+    librariesApplied: enabledLibraries.map((l) => `${l.id}:${l.label}`),
+  });
+
   const out = await llmChatOnce({ db, systemText: built.systemText, messageText: built.promptText, timeoutMs: 120_000, temperature: 0.6, maxTokens: 2200 });
   if (!out?.ok) {
     const err = new Error(String(out?.error || 'Draft failed'));
     err.code = 'WRITINGLAB_DRAFT_FAILED';
     throw err;
   }
-  return { assistant: 'Alex', createdAt: nowIso(), draft: String(out.text || '').trim(), canonUsed: built.canonUsed, prompt: built.promptText, retrieval: built.retrieval, model: out.model || status.selectedModelId || null };
+
+  return {
+    assistant: 'Alex',
+    createdAt: nowIso(),
+    draft: String(out.text || '').trim(),
+    canonUsed: built.canonUsed,
+    prompt: built.promptText,
+    retrieval: built.retrieval,
+    styleApplied: built.styleApplied,
+    librariesApplied: built.librariesApplied,
+    model: out.model || status.selectedModelId || null,
+  };
 }
 
 export async function runRewrite({ db, draft, style, preservePlot = true }) {

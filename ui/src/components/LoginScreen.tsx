@@ -1,13 +1,5 @@
-import React, { useState } from "react";
-
-import { clearToken, getLastToken, getToken, setToken, stashLastToken } from "../auth";
-import { useI18n } from "../i18n/LanguageProvider";
-import { getJson, postJson } from "./api";
-
-type SetupState = {
-  tokenCount?: number;
-  setupComplete?: boolean;
-};
+import React, { useEffect, useState } from "react";
+import { setToken } from "../auth";
 
 export default function LoginScreen({
   initialToken,
@@ -20,213 +12,123 @@ export default function LoginScreen({
   onCancel?: () => void;
   allowCancel?: boolean;
 }) {
-  const { t } = useI18n();
-  const [tokenInput, setTokenInput] = useState((initialToken || getLastToken() || "").trim());
-  const [busy, setBusy] = useState(false);
+  // null = still checking, false = first run (no password yet), true = password exists
+  const [passwordSet, setPasswordSet] = useState<boolean | null>(null);
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [err, setErr] = useState("");
-  const [info, setInfo] = useState("");
-  const [bootstrapMode, setBootstrapMode] = useState(false);
+  const [busy, setBusy] = useState(false);
 
-  async function recoverLocalToken() {
-    const out = await postJson<{ token: string }>("/admin/setup/bootstrap", { recover: true, confirm: "RECOVER" });
-    const token = String(out?.token || "").trim();
-    if (!token) throw new Error("Recovery token was not returned.");
-    setTokenInput(token);
-    setToken(token);
-    onAuthenticated(token);
-    return token;
-  }
+  useEffect(() => {
+    // Check if a password has been set on the server.
+    fetch("/admin/auth/state")
+      .then((r) => r.json())
+      .then((d) => setPasswordSet(Boolean(d?.passwordSet)))
+      .catch(() => setPasswordSet(false));
 
-  React.useEffect(() => {
-    (async () => {
-      try {
-        const state = await getJson<SetupState>("/admin/setup/state");
-        const count = Number(state?.tokenCount || 0);
-        setBootstrapMode(count === 0);
-      } catch {
-        setBootstrapMode(false);
-      }
-    })();
-
-    try {
-      const params = new URLSearchParams(window.location.search || "");
-      if (params.get("expired") === "1") {
-        setInfo(t("auth.sessionExpired"));
-      }
-    } catch {
-      // ignore
-    }
   }, []);
 
-  async function verifyAndSaveToken() {
-    const token = tokenInput.trim();
-    if (!token) {
-      setErr(t("auth.tokenRequired"));
-      return;
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!password) { setErr("Password is required."); return; }
+
+    if (passwordSet === false) {
+      if (password.length < 10) { setErr("Password must be at least 10 characters."); return; }
+      if (password !== confirm) { setErr("Passwords do not match."); return; }
     }
 
     setBusy(true);
     setErr("");
-    setInfo("");
 
     try {
-      // Verify token using auth state endpoint (returns 200 with loggedIn true/false).
-      const verifyRes = await fetch("/admin/auth/state", {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "X-PB-Admin-Token": token,
-        },
-      });
-      const verifyJson = await verifyRes.json().catch(() => ({}));
-      if (!verifyRes.ok) {
-        throw new Error(t("auth.tokenCheckFailed", { status: verifyRes.status }));
-      }
-      if (!verifyJson?.loggedIn) {
-        throw new Error("This token is not valid for this PB instance.");
-      }
-
-      setToken(token);
-      onAuthenticated(token);
-    } catch (e: any) {
-      stashLastToken(token);
-      const msg = String(e?.message || e);
-      setErr(msg);
-      setInfo(t("auth.invalidTokenHint"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function generateToken() {
-    setBusy(true);
-    setErr("");
-    setInfo("");
-    try {
-      if (bootstrapMode) {
-        const out = await postJson<{ token: string }>("/admin/setup/bootstrap", {});
-        const token = String(out?.token || "").trim();
-        if (!token) throw new Error(t("auth.bootstrapNoToken"));
-        setTokenInput(token);
-        setToken(token);
-        onAuthenticated(token);
-        return;
-      }
-
-      // If not logged in but setup already completed, allow local recovery bootstrap.
-      const current = getToken();
-      if (!current) {
-        const okRecover = window.confirm("Generate a new local recovery token for this PB instance? This is for when your old token is lost.");
-        if (!okRecover) {
-          throw new Error(t("auth.rotateRequiresLogin"));
-        }
-        await recoverLocalToken();
-        return;
-      }
-
-      const rotateRes = await fetch("/admin/security/token/rotate", {
+      // Use plain fetch so a wrong-password 401 doesn't trigger the global auth-logout handler.
+      const endpoint = passwordSet === false ? "/admin/auth/setup" : "/admin/auth/login";
+      const res = await fetch(endpoint, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${current}`,
-          "X-PB-Admin-Token": current,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({}),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
       });
-      const rotateTxt = await rotateRes.text();
-      const rotateJson = rotateTxt
-        ? (() => {
-            try {
-              return JSON.parse(rotateTxt);
-            } catch {
-              return null;
-            }
-          })()
-        : null;
-
-      if (!rotateRes.ok && (rotateRes.status === 401 || rotateRes.status === 403)) {
-        // Stale local token: recover locally in one click for day-one resilience.
-        await recoverLocalToken();
-        return;
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(String(data?.error || `Request failed (HTTP ${res.status})`));
       }
-
-      if (!rotateRes.ok) {
-        throw new Error(t("auth.tokenCheckFailed", { status: rotateRes.status }));
-      }
-      const token = String(rotateJson?.token || "").trim();
-      if (!token) throw new Error(t("auth.rotateNoToken"));
-
-      setTokenInput(token);
+      const token = String(data?.token || "").trim();
+      if (!token) throw new Error("Server did not return a session token.");
       setToken(token);
       onAuthenticated(token);
     } catch (e: any) {
-      stashLastToken(tokenInput.trim());
-      const msg = String(e?.message || e);
-      setErr(msg);
-      if (!bootstrapMode) setInfo(t("auth.generateTokenHelpBootstrap"));
+      setErr(String(e?.message || "Sign in failed."));
     } finally {
       setBusy(false);
     }
   }
 
-  async function copyToken() {
-    if (!tokenInput.trim()) return;
-    try {
-      await navigator.clipboard.writeText(tokenInput.trim());
-      setInfo(t("auth.tokenCopied"));
-    } catch {
-      setInfo(t("auth.copyUnavailable"));
-    }
+  if (passwordSet === null) {
+    return (
+      <div style={{ minHeight: "calc(100vh - 48px)", display: "grid", placeItems: "center" }}>
+        <div style={{ opacity: 0.6, fontSize: 14 }}>Connecting...</div>
+      </div>
+    );
   }
 
-  function clearInput() {
-    clearToken();
-    setTokenInput("");
-    setInfo("");
-    setErr("");
-  }
+  const isFirstRun = passwordSet === false;
 
   return (
     <div style={{ minHeight: "calc(100vh - 48px)", display: "grid", placeItems: "center", padding: 16, fontFamily: "system-ui, sans-serif" }}>
-      <div style={{ width: 480, maxWidth: "100%", border: "1px solid #e5e7eb", borderRadius: 12, padding: 16, display: "grid", gap: 10 }}>
-        <h2 style={{ margin: 0 }}>{t("auth.adminLoginTitle")}</h2>
-        <div style={{ fontSize: 13, opacity: 0.85 }}>{t("auth.subtitle")}</div>
+      <div style={{ width: 400, maxWidth: "100%", border: "1px solid var(--border-soft)", borderRadius: 12, padding: 24, display: "grid", gap: 14, background: "var(--panel)", boxShadow: "var(--shadow-soft)" }}>
+        <h2 style={{ margin: 0 }}>{isFirstRun ? "Set a Password" : "Sign In"}</h2>
 
-        <label>
-          <div style={{ fontSize: 12, opacity: 0.8 }}>{t("auth.adminTokenLabel")}</div>
+        {isFirstRun ? (
+          <div style={{ fontSize: 13, opacity: 0.8 }}>
+            Create a password to protect your ProWorkbench admin panel. Must be at least 10 characters.
+          </div>
+        ) : null}
+
+        <form onSubmit={handleSubmit} style={{ display: "grid", gap: 10 }}>
           <input
-            value={tokenInput}
-            onChange={(e) => setTokenInput(e.target.value)}
-            placeholder={t("auth.tokenPlaceholder")}
-            style={{ width: "100%", padding: 10 }}
+            type="password"
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+            disabled={busy}
+            style={{ padding: 10, fontSize: 15, borderRadius: 6, border: "1px solid var(--border)", background: "var(--panel-2)", color: "var(--text)" }}
           />
-        </label>
 
-        {err ? <div style={{ color: "#b00020", fontSize: 13 }}>{err}</div> : null}
-        {info ? <div style={{ color: "#075985", fontSize: 13 }}>{info}</div> : null}
-
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={verifyAndSaveToken} disabled={busy} style={{ padding: "8px 12px" }}>
-            {busy ? t("auth.saving") : t("auth.saveToken")}
-          </button>
-          <button onClick={generateToken} disabled={busy} style={{ padding: "8px 12px" }}>
-            {bootstrapMode ? t("auth.generateToken") : t("auth.rotateToken")}
-          </button>
-          <button onClick={copyToken} disabled={busy || !tokenInput.trim()} style={{ padding: "8px 12px" }}>
-            {t("auth.copy")}
-          </button>
-          <button onClick={() => setTokenInput(getLastToken() || "")} disabled={busy} style={{ padding: "8px 12px" }}>
-            {t("auth.useLastToken")}
-          </button>
-          <button onClick={clearInput} disabled={busy} style={{ padding: "8px 12px" }}>
-            {t("auth.clear")}
-          </button>
-          {allowCancel ? (
-            <button onClick={onCancel} disabled={busy} style={{ padding: "8px 12px", marginLeft: "auto" }}>
-              {t("auth.cancel")}
-            </button>
+          {isFirstRun ? (
+            <input
+              type="password"
+              placeholder="Confirm password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              disabled={busy}
+              style={{ padding: 10, fontSize: 15, borderRadius: 6, border: "1px solid var(--border)", background: "var(--panel-2)", color: "var(--text)" }}
+            />
           ) : null}
-        </div>
+
+          {err ? <div style={{ color: "var(--bad)", fontSize: 13 }}>{err}</div> : null}
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+            <button
+              type="submit"
+              disabled={busy}
+              style={{ padding: "9px 20px", borderRadius: 8, border: "1px solid var(--border)", cursor: busy ? "not-allowed" : "pointer", fontWeight: 600, background: "var(--panel-2)", color: "var(--text)" }}
+            >
+              {busy ? "..." : isFirstRun ? "Set Password" : "Sign In"}
+            </button>
+
+            {allowCancel && onCancel ? (
+              <button
+                type="button"
+                onClick={onCancel}
+                disabled={busy}
+                style={{ padding: "9px 16px", borderRadius: 8, border: "1px solid var(--border)", cursor: "pointer", background: "var(--panel)", color: "var(--text)" }}
+              >
+                Cancel
+              </button>
+            ) : null}
+          </div>
+        </form>
       </div>
     </div>
   );

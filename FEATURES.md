@@ -6,7 +6,7 @@
 - Tool policy with block-by-default posture and per-risk/per-tool controls.
 - Unified approvals for tool runs and MCP lifecycle actions.
 - MCP Servers manager with seeded templates.
-- Doctor self-check/fix workflow.
+- ER+ self-check/fix workflow.
 - Canvas persistent command-center cards (display/organize only; no execution).
 - Helper swarm (power user), bounded and server-gated.
 - Persistent Memory v0 (workspace-file memory flow in current runtime path).
@@ -25,6 +25,6 @@
 - Tools + approvals: `docs/tools-and-approvals.md`
 - MCP servers: `docs/mcp-servers.md`
 - Canvas: `docs/canvas.md`
-- Doctor: `docs/doctor.md`
+- ER+: `docs/doctor.md`
 - Memory: `docs/MEMORY.md`
 - Watchtower: `docs/watchtower.md`

@@ -1,76 +1,165 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 
 import Card from '../components/Card';
-import { getJson, postJson } from '../components/api';
-import { useI18n } from '../i18n/LanguageProvider';
+import { deleteJson, getJson, postJson } from '../components/api';
 
-const SUGGESTED_ANTHROPIC_MODELS = [
-  'claude-3-5-sonnet-20241022',
-  'claude-3-5-haiku-20241022',
-  'claude-3-opus-20240229',
-  'claude-3-sonnet-20240229',
-  'claude-3-haiku-20240307',
+type ProviderType = 'openai' | 'anthropic' | 'gemini' | 'openai_compatible';
+
+type Provider = {
+  id: string;
+  displayName: string;
+  providerType: ProviderType;
+  baseUrl: string;
+  models: string[];
+  hasApiKey?: boolean;
+  preset?: string;
+};
+
+type ProvidersRes = {
+  ok: boolean;
+  providers: Provider[];
+  activeProviderId: string;
+};
+
+type StatusRes = {
+  providerId: string;
+  defaultProviderId: string;
+  defaultModelId: string;
+  selectedModel: string;
+  lastRefreshedAt: string;
+};
+
+const PROVIDER_TYPES: Array<{ value: ProviderType; label: string }> = [
+  { value: 'openai_compatible', label: 'OpenAI-Compatible' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'anthropic', label: 'Anthropic' },
+  { value: 'gemini', label: 'Google Gemini' },
 ];
-const REQUIRED_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
+
+const PRESETS: Array<{ value: string; label: string; providerType: ProviderType; baseUrl?: string }> = [
+  { value: '', label: 'Custom', providerType: 'openai_compatible' },
+  { value: 'openai', label: 'OpenAI', providerType: 'openai', baseUrl: 'https://api.openai.com' },
+  { value: 'anthropic', label: 'Anthropic', providerType: 'anthropic', baseUrl: 'https://api.anthropic.com' },
+  { value: 'gemini', label: 'Google Gemini', providerType: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com' },
+  { value: 'ollama', label: 'Ollama (OpenAI-Compatible)', providerType: 'openai_compatible', baseUrl: 'http://127.0.0.1:11434' },
+  { value: 'azure-openai', label: 'Azure OpenAI (OpenAI-Compatible)', providerType: 'openai_compatible' },
+  { value: 'nvidia-nim', label: 'NVIDIA NIM (OpenAI-Compatible)', providerType: 'openai_compatible' },
+  { value: 'cloudflare-workers-ai', label: 'Cloudflare Workers AI (OpenAI-Compatible)', providerType: 'openai_compatible' },
+];
+
+function uniqueModels(items: string[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id0 of items || []) {
+    const id = String(id0 || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function defaultBaseForType(providerType: ProviderType) {
+  if (providerType === 'openai') return 'https://api.openai.com';
+  if (providerType === 'anthropic') return 'https://api.anthropic.com';
+  if (providerType === 'gemini') return 'https://generativelanguage.googleapis.com';
+  return 'http://127.0.0.1:5000';
+}
 
 export default function ModelsPage() {
-  const { t } = useI18n();
-  const [status, setStatus] = useState<{ baseUrl: string; mode: string; activeProfile: string | null; lastRefreshedAt: string | null } | null>(null);
-  const [models, setModels] = useState<{ id: string; source: string; discovered_at: string }[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  const [trace, setTrace] = useState<any[]>([]);
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [activeProviderId, setActiveProviderId] = useState('');
+  const [selectedModel, setSelectedModel] = useState('');
+  const [lastRefreshedAt, setLastRefreshedAt] = useState('');
 
-  const [providerId, setProviderId] = useState<'textwebui' | 'openai' | 'anthropic'>('textwebui');
-  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:5000');
-  const [mode, setMode] = useState<'auto' | 'force_openai' | 'force_gateway'>('auto');
-  const [customModel, setCustomModel] = useState('');
-  const [openaiApiKey, setOpenaiApiKey] = useState('');
-  const [anthropicApiKey, setAnthropicApiKey] = useState('');
-  const [showAllModels, setShowAllModels] = useState(false);
-  const [textWebuiStatus, setTextWebuiStatus] = useState<{ running: boolean; ready: boolean; baseUrl: string; models: string[]; error?: string } | null>(null);
-  const [textWebuiModels, setTextWebuiModels] = useState<string[]>([]);
-
+  const [edit, setEdit] = useState<Provider>({
+    id: '',
+    displayName: 'OpenAI-Compatible',
+    providerType: 'openai_compatible',
+    baseUrl: 'http://127.0.0.1:5000',
+    models: [],
+    preset: '',
+    hasApiKey: false,
+  });
+  const [apiKey, setApiKey] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [newModel, setNewModel] = useState('');
+  const [importFile, setImportFile] = useState<File | null>(null);
   const [busy, setBusy] = useState('');
-
   const [err, setErr] = useState('');
-  const [toastMsg, setToastMsg] = useState('');
+  const [msg, setMsg] = useState('');
 
-  function toast(msg: string) {
-    setToastMsg(msg);
-    window.setTimeout(() => setToastMsg(''), 3000);
+  function toast(text: string) {
+    setMsg(text);
+    setTimeout(() => setMsg(''), 3200);
   }
+
   async function loadAll() {
     setErr('');
-    const s = await getJson<any>('/admin/llm/status');
-    setStatus(s);
-    setProviderId(s.providerId || 'textwebui');
-    setBaseUrl(s.baseUrl);
-    setMode(s.mode);
-    setOpenaiApiKey('');
-    setAnthropicApiKey('');
-    const m = await getJson<any>('/admin/llm/models');
-    setModels(m.models || []);
-    setSelectedModel(m.selectedModel || null);
-    const t = await getJson<any>('/admin/llm/trace');
-    setTrace(t.trace || []);
-    const tw = await getJson<any>('/admin/runtime/textwebui/status');
-    setTextWebuiStatus(tw);
-    setTextWebuiModels(tw.models || []);
+    const p = await getJson<ProvidersRes>('/admin/llm/providers');
+    const list = Array.isArray(p.providers) ? p.providers : [];
+    setProviders(list);
+    setActiveProviderId(String(p.activeProviderId || list[0]?.id || ''));
+
+    const s = await getJson<StatusRes>('/admin/llm/status');
+    setSelectedModel(String(s.defaultModelId || s.selectedModel || ''));
+    setLastRefreshedAt(String(s.lastRefreshedAt || ''));
+
+    const active = list.find((x) => x.id === p.activeProviderId) || list[0];
+    if (active) {
+      setEdit({
+        ...active,
+        models: uniqueModels(active.models || []),
+      });
+    }
   }
 
   useEffect(() => {
     loadAll().catch((e: any) => setErr(String(e?.message || e)));
   }, []);
 
-  async function saveConfig() {
+  const current = useMemo(() => providers.find((p) => p.id === activeProviderId) || null, [providers, activeProviderId]);
+
+  function applyPreset(presetValue: string) {
+    const preset = PRESETS.find((p) => p.value === presetValue);
+    if (!preset) return;
+    setEdit((prev) => ({
+      ...prev,
+      preset: presetValue,
+      providerType: preset.providerType,
+      baseUrl: preset.baseUrl || prev.baseUrl || defaultBaseForType(preset.providerType),
+    }));
+  }
+
+  function addManualModel() {
+    const id = String(newModel || '').trim();
+    if (!id) return;
+    setEdit((prev) => ({ ...prev, models: uniqueModels([...(prev.models || []), id]) }));
+    setNewModel('');
+  }
+
+  async function saveProvider(setActive = false) {
     setBusy('save');
     setErr('');
     try {
-      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'Text WebUI');
-      const providerGroup = providerId === 'textwebui' ? 'Local' : 'API';
-      await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode });
+      const payload = {
+        provider: {
+          id: String(edit.id || '').trim(),
+          displayName: String(edit.displayName || '').trim() || String(edit.id || '').trim(),
+          providerType: edit.providerType,
+          baseUrl: String(edit.baseUrl || '').trim(),
+          models: uniqueModels(edit.models || []),
+          preset: String(edit.preset || ''),
+        },
+        apiKey: apiKey || undefined,
+        setActive,
+      };
+      if (!payload.provider.id) throw new Error('Provider ID is required.');
+      if (!payload.provider.baseUrl) throw new Error('Base URL is required.');
+      await postJson('/admin/llm/providers', payload);
+      setApiKey('');
       await loadAll();
-      toast(t('models.toast.savedProvider'));
+      toast('Provider saved.');
       try { window.dispatchEvent(new Event('pb-system-state-changed')); } catch {}
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -79,19 +168,61 @@ export default function ModelsPage() {
     }
   }
 
-  async function testAndRefresh() {
+  async function testProvider() {
+    if (!edit.id) return;
     setBusy('test');
     setErr('');
     try {
-      const providerName = providerId === 'openai' ? 'OpenAI' : (providerId === 'anthropic' ? 'Anthropic' : 'Text WebUI');
-      const providerGroup = providerId === 'textwebui' ? 'Local' : 'API';
-      await postJson('/admin/llm/config', { providerId, providerName, providerGroup, baseUrl, mode });
-      const testRes = await postJson<any>('/admin/llm/test', {});
-      if (!testRes.ok) throw new Error(testRes.error || t('models.errors.llmTestFailed'));
-      const r = await postJson<any>('/admin/llm/refresh-models', {});
-      if (!r.ok) throw new Error(r.error || t('models.errors.modelRefreshFailed'));
+      await saveProvider(false);
+      const out = await postJson<any>(`/admin/llm/providers/${encodeURIComponent(edit.id)}/test`, {});
+      toast(`Test passed. Models detected: ${Number(out.modelCount || 0)}`);
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function refreshModels() {
+    if (!edit.id) return;
+    setBusy('refresh');
+    setErr('');
+    try {
+      await saveProvider(false);
+      const out = await postJson<any>(`/admin/llm/providers/${encodeURIComponent(edit.id)}/refresh-models`, {});
+      setEdit((prev) => ({ ...prev, models: uniqueModels(out.models || prev.models || []) }));
       await loadAll();
+      toast(`Models refreshed: ${Number(out.modelCount || 0)}`);
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function activateProvider(id: string) {
+    setBusy('activate');
+    setErr('');
+    try {
+      await postJson(`/admin/llm/providers/${encodeURIComponent(id)}/activate`, {});
+      await loadAll();
+      toast('Default provider updated.');
       try { window.dispatchEvent(new Event('pb-system-state-changed')); } catch {}
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function removeProvider(id: string) {
+    if (!window.confirm(`Delete provider ${id}?`)) return;
+    setBusy('delete');
+    setErr('');
+    try {
+      await deleteJson(`/admin/llm/providers/${encodeURIComponent(id)}`);
+      await loadAll();
+      toast('Provider removed.');
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -100,16 +231,12 @@ export default function ModelsPage() {
   }
 
   async function chooseModel(modelId: string) {
-    setBusy('select');
-    setErr('');
+    if (!modelId) return;
+    setBusy('model');
     try {
-      if (providerId === 'textwebui') {
-        await postJson('/admin/runtime/textwebui/select-model', { modelId });
-      } else {
-        await postJson('/admin/llm/select-model', { modelId });
-      }
-      await loadAll();
-      toast(t('models.toast.selectedModelUpdated'));
+      await postJson('/admin/llm/select-model', { modelId });
+      setSelectedModel(modelId);
+      toast('Default model updated.');
       try { window.dispatchEvent(new Event('pb-system-state-changed')); } catch {}
     } catch (e: any) {
       setErr(String(e?.message || e));
@@ -118,46 +245,36 @@ export default function ModelsPage() {
     }
   }
 
-  async function saveKeys() {
-    setBusy('keys');
-    setErr('');
+  async function exportProvidersJson() {
     try {
-      await postJson('/admin/llm/set-api-keys', { openaiApiKey, anthropicApiKey });
-      setOpenaiApiKey('');
-      setAnthropicApiKey('');
-      await loadAll();
-      toast(t('models.toast.savedApiKeys'));
+      const out = await getJson<any>('/admin/llm/providers/export');
+      const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `pb-global-providers-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast('Exported global provider configs (no secrets).');
     } catch (e: any) {
       setErr(String(e?.message || e));
-    } finally {
-      setBusy('');
     }
   }
 
-  async function addCustom() {
-    setBusy('custom');
+  async function importProvidersJson() {
+    if (!importFile) return;
+    setBusy('import');
     setErr('');
     try {
-      await postJson('/admin/llm/add-custom-model', { modelId: customModel });
-      setCustomModel('');
+      const raw = await importFile.text();
+      const parsed = JSON.parse(raw);
+      await postJson('/admin/llm/providers/import', {
+        providers: Array.isArray(parsed?.providers) ? parsed.providers : [],
+        activeProviderId: String(parsed?.activeProviderId || ''),
+      });
+      setImportFile(null);
       await loadAll();
-      toast(t('models.toast.addedCustomModel'));
-    } catch (e: any) {
-      setErr(String(e?.message || e));
-    } finally {
-      setBusy('');
-    }
-  }
-
-  async function refreshTextWebuiModels() {
-    setBusy('tw_models');
-    setErr('');
-    try {
-      const r = await getJson<any>('/admin/runtime/textwebui/models');
-      setTextWebuiModels(r.models || []);
-      const s = await getJson<any>('/admin/runtime/textwebui/status');
-      setTextWebuiStatus(s);
-      toast(t('models.toast.refreshedTextWebuiModels'));
+      toast('Imported global provider configs (secrets unchanged).');
+      try { window.dispatchEvent(new Event('pb-system-state-changed')); } catch {}
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -166,221 +283,129 @@ export default function ModelsPage() {
   }
 
   return (
-    <div style={{ padding: 16, maxWidth: 980 }}>
-      <h2 style={{ marginTop: 0 }}>{t('page.models.title')}</h2>
-      <div style={{ padding: 12, border: '1px solid #e5e5e5', borderRadius: 10, background: '#fafafa', marginBottom: 12 }}>
-        <div style={{ fontWeight: 700, marginBottom: 6 }}>{t('models.using.title')}</div>
-        <div style={{ fontSize: 13, opacity: 0.85 }}>
-          {t('models.using.provider')}: <b>{status?.providerName ?? '—'}</b> · {t('models.using.model')}: <b>{selectedModel ?? '—'}</b>
-        </div>
+    <div style={{ padding: 16, maxWidth: 1180 }}>
+      <h2 style={{ marginTop: 0 }}>Models & Providers (Global)</h2>
+      <div style={{ fontSize: 12, opacity: 0.82, marginBottom: 10 }}>
+        Configure once here. Used everywhere: WebChat, agents, submitters.
       </div>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
-      {toastMsg ? (
-        <div style={{ marginBottom: 12, padding: 10, border: '1px solid #c8e6c9', background: '#e8f5e9', borderRadius: 10 }}>
-          {toastMsg}
-        </div>
-      ) : null}
+      {err ? <div style={{ color: 'var(--bad)', marginBottom: 10 }}>{err}</div> : null}
+      {msg ? <div style={{ marginBottom: 10 }}>{msg}</div> : null}
 
-      <Card title={t('models.textwebui.title')}>
-        <div style={{ display: 'grid', gap: 10 }}>
-          <div style={{ fontSize: 13, opacity: 0.85 }}>
-            {t('models.textwebui.manualStart')}: <code>./start_linux.sh --api --api-port 5000 --listen-host 127.0.0.1</code>
-          </div>
-          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-            <div>{t('models.textwebui.status')}: <b>{textWebuiStatus?.running ? (textWebuiStatus.ready ? t('models.textwebui.ready') : t('models.textwebui.running')) : t('models.textwebui.notRunning')}</b></div>
-            <div>{t('models.textwebui.baseUrl')}: <code>{textWebuiStatus?.baseUrl || 'http://127.0.0.1:5000'}</code></div>
-            {textWebuiStatus?.error ? <div style={{ color: '#b00020' }}>{textWebuiStatus.error}</div> : null}
-          </div>
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <button disabled={busy === 'tw_models'} onClick={refreshTextWebuiModels} style={{ padding: '8px 12px' }}>
-              {t('models.textwebui.refreshModels')}
-            </button>
-            <button disabled={busy === 'select'} onClick={() => chooseModel(REQUIRED_MODEL)} style={{ padding: '8px 12px' }}>
-              {t('models.textwebui.useRequiredModel')}
-            </button>
-            <div style={{ fontSize: 12, opacity: 0.8 }}>{t('models.textwebui.modelsCount', { n: textWebuiModels.length })}</div>
-          </div>
-          {textWebuiStatus?.running && textWebuiModels.length === 0 ? (
-            <div style={{ fontSize: 12, color: '#92400e' }}>
-              {t('models.textwebui.noModelLoadedHelp')}
-            </div>
-          ) : null}
-          <label>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>{t('models.textwebui.model')}</div>
-            <select value={selectedModel || ''} onChange={(e) => chooseModel(e.target.value)} style={{ width: 420, padding: 8 }}>
-              <option value="" disabled>{t('models.textwebui.selectModel')}</option>
-              {textWebuiModels.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-          </label>
+      <Card title="Global Defaults">
+        <div style={{ fontSize: 13 }}>
+          Default provider: <b>{current?.displayName || '—'}</b> ({current?.id || '—'}) · Default model: <b>{selectedModel || '—'}</b> · Last refresh: <b>{lastRefreshedAt || '—'}</b>
         </div>
       </Card>
 
-      <Card title={t('models.provider.title')}>
+      <Card title="Provider Registry (Global)">
         <div style={{ display: 'grid', gap: 10 }}>
-          {providerId === 'anthropic' ? (
-            <div style={{ padding: 12, border: '1px solid #e5e5e5', borderRadius: 10, background: '#fafafa' }}>
-              <div style={{ fontWeight: 700, marginBottom: 6 }}>{t('models.provider.anthropicSetupTitle')}</div>
-              <div style={{ fontSize: 13, opacity: 0.85 }}>
-                {t('models.provider.anthropicSetupHelp')}
+          {providers.map((p) => (
+            <div key={p.id} style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+              <div>
+                <div style={{ fontWeight: 700 }}>{p.displayName} <span style={{ opacity: 0.7 }}>({p.id})</span></div>
+                <div style={{ fontSize: 12, opacity: 0.82 }}>
+                  type: {p.providerType} · <code>{p.baseUrl}</code> · models: {p.models?.length || 0} · key: {p.hasApiKey ? 'saved' : 'not set'}
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={() => setEdit({ ...p, models: uniqueModels(p.models || []) })}>Edit</button>
+                <button onClick={() => activateProvider(p.id)} disabled={busy !== '' || activeProviderId === p.id}>Set Default</button>
+                <button onClick={() => removeProvider(p.id)} disabled={busy !== '' || providers.length <= 1}>Delete</button>
               </div>
             </div>
-          ) : null}
+          ))}
+        </div>
+      </Card>
 
-          <label>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>{t('models.provider.provider')}</div>
-            <select
-              value={providerId}
-              onChange={(e) => {
-                const v = e.target.value as any;
-                setProviderId(v);
-                if (v === 'openai') setBaseUrl('https://api.openai.com');
-                if (v === 'anthropic') setBaseUrl('https://api.anthropic.com');
-                if (v === 'textwebui') setBaseUrl('http://127.0.0.1:5000');
-              }}
-              style={{ width: 320, padding: 8 }}
-            >
-              <option value="textwebui">{t('models.provider.option.textwebui')}</option>
-              <option value="openai">{t('models.provider.option.openai')}</option>
-              <option value="anthropic">{t('models.provider.option.anthropic')}</option>
-            </select>
-          </label>
-          <label>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>{t('models.provider.baseUrl')}</div>
-            <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} style={{ width: '100%', padding: 8 }} />
-          </label>
-
-          {providerId === 'textwebui' ? (
+      <Card title="Provider Editor">
+        <div style={{ display: 'grid', gap: 10 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <label>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>{t('setup.endpointMode')}</div>
-              <select value={mode} onChange={(e) => setMode(e.target.value as any)} style={{ width: 320, padding: 8 }}>
-                <option value="auto">{t('setup.mode.auto')}</option>
-                <option value="force_openai">{t('setup.mode.forceOpenai')}</option>
-                <option value="force_gateway">{t('setup.mode.forceGateway')}</option>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Provider ID</div>
+              <input value={edit.id} onChange={(e) => setEdit((p) => ({ ...p, id: e.target.value }))} placeholder="my-provider" style={{ width: '100%', padding: 8 }} />
+            </label>
+            <label>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Display Name</div>
+              <input value={edit.displayName} onChange={(e) => setEdit((p) => ({ ...p, displayName: e.target.value }))} placeholder="OpenAI-Compatible" style={{ width: '100%', padding: 8 }} />
+            </label>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <label>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Provider Type</div>
+              <select value={edit.providerType} onChange={(e) => {
+                const pt = e.target.value as ProviderType;
+                setEdit((p) => ({ ...p, providerType: pt, baseUrl: p.baseUrl || defaultBaseForType(pt) }));
+              }} style={{ width: '100%', padding: 8 }}>
+                {PROVIDER_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
               </select>
             </label>
-          ) : null}
+            <label>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Preset (optional)</div>
+              <select value={edit.preset || ''} onChange={(e) => applyPreset(e.target.value)} style={{ width: '100%', padding: 8 }}>
+                {PRESETS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+            </label>
+            <label>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Base URL</div>
+              <input value={edit.baseUrl} onChange={(e) => setEdit((p) => ({ ...p, baseUrl: e.target.value }))} placeholder="http://127.0.0.1:11434" style={{ width: '100%', padding: 8 }} />
+            </label>
+          </div>
 
-          <div style={{ display: 'flex', gap: 10 }}>
-            <button disabled={!!busy} onClick={saveConfig} style={{ padding: '8px 12px' }}>
-              {t('common.save')}
-            </button>
-            <button disabled={!!busy} onClick={testAndRefresh} style={{ padding: '8px 12px', fontWeight: 700 }}>
-              {t('setup.testRefreshModels')}
-            </button>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>{t('models.provider.apiKeysAdvanced')}</div>
-            <div style={{ display: 'grid', gap: 10 }}>
-              <label>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>OPENAI_API_KEY</div>
-                <input type="password" value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)} placeholder={status?.hasOpenAiKey ? t('models.provider.keySaved') : t('models.provider.keyNotSet')} style={{ width: '100%', maxWidth: 520, padding: 8 }} />
-              </label>
-              <label>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>ANTHROPIC_API_KEY</div>
-                <input type="password" value={anthropicApiKey} onChange={(e) => setAnthropicApiKey(e.target.value)} placeholder={status?.hasAnthropicKey ? t('models.provider.keySaved') : t('models.provider.keyNotSet')} style={{ width: '100%', maxWidth: 520, padding: 8 }} />
-              </label>
-              <button disabled={!!busy} onClick={saveKeys} style={{ padding: '8px 12px', width: 180 }}>
-                {t('models.provider.saveKeys')}
-              </button>
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>API Key (masked)</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input type={showApiKey ? 'text' : 'password'} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={edit.hasApiKey ? 'Key saved (leave blank to keep)' : 'Set API key'} style={{ flex: 1, padding: 8 }} />
+              <button onClick={() => setShowApiKey((v) => !v)} type="button">{showApiKey ? 'Hide' : 'Reveal'}</button>
+            </div>
+          </label>
+
+          <div>
+            <div style={{ fontSize: 12, opacity: 0.82, marginBottom: 6 }}>Manual Models (always available)</div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <input value={newModel} onChange={(e) => setNewModel(e.target.value)} placeholder="gpt-4o-mini / claude-3-5-sonnet-20241022 / gemini-1.5-pro" style={{ flex: 1, padding: 8 }} />
+              <button onClick={addManualModel}>Add</button>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              {(edit.models || []).map((id) => (
+                <button key={id} onClick={() => setEdit((p) => ({ ...p, models: p.models.filter((m) => m !== id) }))} title="Remove model">
+                  {id} ×
+                </button>
+              ))}
+              {(edit.models || []).length === 0 ? <span style={{ fontSize: 12, opacity: 0.8 }}>No models configured.</span> : null}
             </div>
           </div>
 
-          <div style={{ fontSize: 12, opacity: 0.8 }}>
-            {t('models.provider.activeProfile')}: <b>{status?.activeProfile ?? '—'}</b> · {t('models.provider.lastRefreshed')}: <b>{status?.lastRefreshedAt ?? '—'}</b>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button onClick={() => saveProvider(true)} disabled={busy !== ''}>Save + Set Default</button>
+            <button onClick={testProvider} disabled={busy !== '' || !edit.id}>Test</button>
+            <button onClick={refreshModels} disabled={busy !== '' || !edit.id}>Refresh Models</button>
           </div>
         </div>
       </Card>
 
-      <Card title={t('models.model.title')}>
+      <Card title="Provider Config Export / Import (global, no secrets)">
         <div style={{ display: 'grid', gap: 10 }}>
-          <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <input type="checkbox" checked={showAllModels} onChange={(e) => setShowAllModels(e.target.checked)} />
-            <span style={{ fontSize: 12, opacity: 0.8 }}>{t('models.model.showAllAdvanced')}</span>
-          </label>
-
-          <label>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>{t('models.model.selectedModel')}</div>
-            <select
-              value={selectedModel ?? ''}
-              onChange={(e) => chooseModel(e.target.value)}
-              style={{ width: '100%', maxWidth: 520, padding: 8 }}
-            >
-              <option value="" disabled>
-                {t('models.model.selectModel')}
-              </option>
-              {(showAllModels
-                ? models
-                : models.filter((m) => !/(^|[-_/])(embed|embedding|embeddings)([-_/]|$)/i.test(m.id) && !/nomic-embed/i.test(m.id))
-              ).map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.id}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div style={{ fontSize: 12, opacity: 0.75 }}>{t('models.model.advanced')}</div>
-          {providerId === 'anthropic' ? (
-            <label style={{ display: 'grid', gap: 6 }}>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>{t('models.model.suggestedAnthropic')}</div>
-              <select
-                value=""
-                onChange={(e) => {
-                  const v = e.target.value;
-                  if (v) setCustomModel(v);
-                }}
-                style={{ padding: 8, width: 320 }}
-              >
-                <option value="">{t('models.model.pickModel')}</option>
-                {SUGGESTED_ANTHROPIC_MODELS.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
-
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <input
-              value={customModel}
-              onChange={(e) => setCustomModel(e.target.value)}
-              placeholder={t('models.model.addCustomPlaceholder')}
-              style={{ padding: 8, width: 320 }}
-            />
-            <button disabled={!!busy || !customModel.trim()} onClick={addCustom} style={{ padding: '8px 12px' }}>
-              {t('models.model.addCustom')}
-            </button>
+          <div style={{ fontSize: 12, opacity: 0.82 }}>Exports never contain API keys. Import updates global provider registry only.</div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button onClick={exportProvidersJson} disabled={busy !== ''}>Export Providers JSON</button>
+            <input type="file" accept="application/json,.json" onChange={(e) => setImportFile(e.target.files?.[0] || null)} />
+            <button onClick={importProvidersJson} disabled={busy !== '' || !importFile}>Import Providers JSON</button>
           </div>
         </div>
       </Card>
 
-      <Card title={t('models.trace.title')}>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr>
-                {['ts', 'method', 'path', 'status', 'duration_ms', 'profile', 'ok'].map((h) => (
-                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
-                    {t(`models.trace.col.${h}`)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {trace.map((t, i) => (
-                <tr key={i}>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.ts}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.method}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.path}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.status ?? '—'}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.duration_ms ?? '—'}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.profile ?? '—'}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{t.ok ? '✅' : '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <Card title="Global Model Picker">
+        <div style={{ display: 'grid', gap: 8 }}>
+          <select value={selectedModel || ''} onChange={(e) => chooseModel(e.target.value)} style={{ width: '100%', maxWidth: 650, padding: 8 }}>
+            <option value="" disabled>Select default model</option>
+            {uniqueModels([...(current?.models || []), selectedModel || '']).map((id) => (
+              <option key={id} value={id}>{id}</option>
+            ))}
+          </select>
+          <div style={{ fontSize: 12, opacity: 0.82 }}>
+            Manual model IDs remain usable even when refresh/test endpoints fail.
+          </div>
         </div>
       </Card>
     </div>

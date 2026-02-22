@@ -32,11 +32,11 @@ export default function SecurityPage() {
         {t('security.nextReport', { ts: summary?.nextScheduledReportTs || '—' })}
       </div>
       {pendingOverflowActive ? (
-        <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, border: '1px solid #ffccbc', background: '#fff3e0' }}>
+        <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 16%, var(--panel))' }}>
           <b>{t('security.pendingOverflowTitle')}</b> {t('security.pendingOverflowBody')}
         </div>
       ) : null}
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title={t('security.today.title')}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
@@ -54,15 +54,15 @@ export default function SecurityPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr>
-                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>{t('security.topUnknown.col.chat_id')}</th>
-                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>{t('security.topUnknown.col.count')}</th>
+                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>{t('security.topUnknown.col.chat_id')}</th>
+                  <th style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>{t('security.topUnknown.col.count')}</th>
                 </tr>
               </thead>
               <tbody>
                 {summary.topUnknownToday.map((r: any) => (
                   <tr key={String(r.chat_id)}>
-                    <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{String(r.chat_id)}</td>
-                    <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>{Number(r.count || 0)}</td>
+                    <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{String(r.chat_id)}</td>
+                    <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>{Number(r.count || 0)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -71,6 +71,11 @@ export default function SecurityPage() {
         ) : (
           <div style={{ fontSize: 13, opacity: 0.8 }}>{t('security.topUnknown.none')}</div>
         )}
+      </Card>
+
+
+      <Card title="Auth Mode">
+        <div style={{ fontSize: 13 }}>Current: <b>Auth required</b></div>
       </Card>
 
       <Card title={t('security.actions.title')}>

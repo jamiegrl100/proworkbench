@@ -18,11 +18,11 @@ export type RuntimeState = {
 };
 
 function badgeColors(kind: "idle" | "thinking" | "running_tool" | "waiting_approval" | "error") {
-  if (kind === "idle") return { bg: "#ecfeff", fg: "#155e75", dot: "#06b6d4" };
-  if (kind === "thinking") return { bg: "#eef2ff", fg: "#3730a3", dot: "#6366f1" };
-  if (kind === "running_tool") return { bg: "#dcfce7", fg: "#166534", dot: "#22c55e" };
-  if (kind === "waiting_approval") return { bg: "#fffbeb", fg: "#92400e", dot: "#f59e0b" };
-  return { bg: "#fff4f4", fg: "#b00020", dot: "#ef4444" };
+  if (kind === "idle") return { bg: "color-mix(in srgb, var(--accent-2) 12%, var(--panel))", fg: "var(--accent-2)", dot: "var(--accent-2)" };
+  if (kind === "thinking") return { bg: "color-mix(in srgb, var(--accent-3) 14%, var(--panel))", fg: "var(--accent-3)", dot: "var(--accent-3)" };
+  if (kind === "running_tool") return { bg: "color-mix(in srgb, var(--ok) 16%, var(--panel))", fg: "var(--ok)", dot: "var(--accent-1)" };
+  if (kind === "waiting_approval") return { bg: "color-mix(in srgb, var(--warn) 16%, var(--panel))", fg: "var(--warn)", dot: "var(--warn)" };
+  return { bg: "color-mix(in srgb, var(--bad) 12%, var(--panel))", fg: "var(--bad)", dot: "var(--bad)" };
 }
 
 function Spinner({ color }: { color: string }) {
@@ -146,7 +146,7 @@ export function CommandCenterIndicator({ state, assistantName }: { state: Runtim
           borderRadius: 999,
           background: c.bg,
           color: c.fg,
-          border: "1px solid #e5e7eb",
+          border: "1px solid var(--border-soft)",
           fontSize: 12,
           fontWeight: 800,
         }}
@@ -168,15 +168,15 @@ export function CommandCenterIndicator({ state, assistantName }: { state: Runtim
             width: 34,
             height: 34,
             borderRadius: 999,
-            background: "linear-gradient(135deg, #22c55e, #38bdf8)",
+            background: "linear-gradient(135deg, var(--accent-1), var(--accent-2))",
             position: "relative",
             display: "grid",
             placeItems: "center",
-            boxShadow: "0 6px 16px rgba(0,0,0,0.12)",
+            boxShadow: "0 6px 16px color-mix(in srgb, var(--bg) 22%, transparent)",
           }}
           title={t("commandCenter.assistant")}
         >
-          <div style={{ width: 30, height: 30, borderRadius: 999, background: "#0b1220", display: "grid", placeItems: "center", color: "#e5e7eb", fontSize: 12, fontWeight: 900 }}>
+          <div style={{ width: 30, height: 30, borderRadius: 999, background: "var(--bg)", display: "grid", placeItems: "center", color: "var(--border-soft)", fontSize: 12, fontWeight: 900 }}>
             {initials}
           </div>
           <div
@@ -188,7 +188,7 @@ export function CommandCenterIndicator({ state, assistantName }: { state: Runtim
               height: 12,
               borderRadius: 999,
               background: c.dot,
-              border: "2px solid #0b1220",
+              border: "2px solid var(--bg)",
             }}
           />
           {(computed.kind === "thinking" || computed.kind === "running_tool") ? (

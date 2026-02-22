@@ -1,89 +1,75 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { getJson, postJson } from "../components/api";
-import { useI18n } from "../i18n/LanguageProvider";
-
-type AccessMode = "blocked" | "allowed" | "allowed_with_approval";
-type Risk = "low" | "medium" | "high" | "critical";
-
-type PolicyV2 = {
-  version: 2;
-  global_default: AccessMode;
-  per_risk: Record<Risk, AccessMode>;
-  per_tool: Record<string, AccessMode>;
-  provider_overrides?: Record<string, any>;
-  updated_at?: string;
-};
+import React, { useEffect, useMemo, useState } from 'react';
+import { getJson, postJson } from '../components/api';
 
 type ToolRow = {
   id: string;
   label: string;
   description: string;
-  risk: Risk;
-  effective_access: AccessMode;
-  override_access: AccessMode | null;
+  risk: string;
 };
 
-function accessLabel(t: (k: string, p?: any) => string, mode: AccessMode) {
-  if (mode === "blocked") return t("tools.policy.blocked");
-  if (mode === "allowed") return t("tools.policy.allowed");
-  return t("tools.policy.allowedApproval");
-}
+type GrantRow = {
+  id: string;
+  path_prefix: string;
+  actions: string[];
+  created_at: string;
+  expires_at: string;
+  status: string;
+  limits?: { grant_scope?: 'once' | 'session' | 'project' };
+};
 
-function clone<T>(v: T): T {
-  return JSON.parse(JSON.stringify(v));
-}
+type OutsideError = {
+  message: string;
+  details?: {
+    paths?: Array<{ path: string; action: string }>;
+    suggested_scopes?: Array<'once' | 'session' | 'project'>;
+    suggested_path_prefix?: string;
+  };
+};
 
-function computeEffective(policy: PolicyV2, tool: ToolRow): AccessMode {
-  let mode: AccessMode = policy.global_default;
-  mode = policy.per_risk[tool.risk] || mode;
-  mode = policy.per_tool[tool.id] || mode;
-  return mode;
-}
-
-function argsSummary(args: any) {
-  if (!args || typeof args !== "object") return "";
-  const entries = Object.entries(args).slice(0, 5).map(([k, v]) => {
-    const s = typeof v === "string" ? v : JSON.stringify(v);
-    return `${k}=${s.length > 32 ? `${s.slice(0, 32)}…` : s}`;
-  });
-  return entries.join(", ");
+function pretty(v: unknown) {
+  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
 }
 
 export default function ToolsPage() {
-  const { t } = useI18n();
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  const [policy, setPolicy] = useState<PolicyV2 | null>(null);
+  const [err, setErr] = useState('');
   const [tools, setTools] = useState<ToolRow[]>([]);
-  const [search, setSearch] = useState("");
-  const [selected, setSelected] = useState<Record<string, boolean>>({});
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [providerOverridesText, setProviderOverridesText] = useState("{}");
-
-  const [proposals, setProposals] = useState<any[]>([]);
-  const [runs, setRuns] = useState<any[]>([]);
-  const [retentionDays, setRetentionDays] = useState(30);
-  const [purgeMsg, setPurgeMsg] = useState("");
+  const [grants, setGrants] = useState<GrantRow[]>([]);
+  const [allowedRoots, setAllowedRoots] = useState<{ home: string; workspace: string } | null>(null);
+  const [selectedTool, setSelectedTool] = useState('workspace.list');
+  const [argsText, setArgsText] = useState('{\n  "path": "."\n}');
+  const [running, setRunning] = useState(false);
+  const [runOut, setRunOut] = useState<any>(null);
+  const [outsideErr, setOutsideErr] = useState<OutsideError | null>(null);
+  const [grantScope, setGrantScope] = useState<'once' | 'session' | 'project'>('once');
+  const [grantPath, setGrantPath] = useState('');
+  const [search, setSearch] = useState('');
+  const [diagBusy, setDiagBusy] = useState(false);
+  const [diagOut, setDiagOut] = useState<any>(null);
+  const [diagQuickOut, setDiagQuickOut] = useState<any>(null);
 
   async function load() {
     setLoading(true);
-    setErr("");
+    setErr('');
     try {
-      const [{ policy: p, tools: t }, prop, runList, ret] = await Promise.all([
-        getJson<any>("/admin/tools"),
-        getJson<any[]>("/admin/tools/proposals?status=all"),
-        getJson<any[]>("/admin/tools/runs?limit=25"),
-        getJson<any>("/admin/retention").catch(() => ({ retention_days: 30 })),
+      const [toolsOut, grantsOut, legacyToolsOut] = await Promise.all([
+        getJson<any>('/api/tools'),
+        getJson<any>('/admin/grants/path-prefix').catch(() => ({ ok: true, grants: [] })),
+        getJson<any>('/admin/tools').catch(() => ({ tools: [], allowed_roots: null })),
       ]);
-      const normalizedPolicy = p as PolicyV2;
-      setPolicy(normalizedPolicy);
-      setTools(Array.isArray(t) ? t : []);
-      setProposals(Array.isArray(prop) ? prop : []);
-      setRuns(Array.isArray(runList) ? runList : []);
-      setRetentionDays(Math.max(1, Math.min(365, Number(ret?.retention_days || 30) || 30)));
-      setProviderOverridesText(JSON.stringify(normalizedPolicy?.provider_overrides || {}, null, 2));
+      const fromOpenAi = Array.isArray(toolsOut)
+        ? toolsOut.map((t: any) => ({
+            id: String(t?.function?.name || ''),
+            label: String(t?.function?.name || ''),
+            description: String(t?.function?.description || ''),
+            risk: 'medium',
+          })).filter((t: any) => t.id)
+        : [];
+      const fromLegacy = Array.isArray(legacyToolsOut?.tools) ? legacyToolsOut.tools : [];
+      setTools(fromOpenAi.length ? fromOpenAi : fromLegacy);
+      setAllowedRoots(legacyToolsOut?.allowed_roots || null);
+      setGrants(Array.isArray(grantsOut?.grants) ? grantsOut.grants : []);
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -91,381 +77,200 @@ export default function ToolsPage() {
     }
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
-  const filteredTools = useMemo(() => {
+  const visibleTools = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return tools;
-    return tools.filter((t) => (t.id + " " + t.label + " " + t.description).toLowerCase().includes(q));
-  }, [tools, search]);
+    return tools.filter((t) => `${t.id} ${t.label} ${t.description}`.toLowerCase().includes(q));
+  }, [search, tools]);
 
-  function updatePolicy(next: PolicyV2) {
-    setPolicy(next);
-  }
-
-  function setRiskDefault(risk: Risk, mode: AccessMode) {
-    if (!policy) return;
-    const next = clone(policy);
-    next.per_risk[risk] = mode;
-    updatePolicy(next);
-  }
-
-  function setGlobalDefault(mode: AccessMode) {
-    if (!policy) return;
-    const next = clone(policy);
-    next.global_default = mode;
-    updatePolicy(next);
-  }
-
-  function setToolOverride(toolId: string, modeOrNull: AccessMode | "") {
-    if (!policy) return;
-    const next = clone(policy);
-    if (!modeOrNull) delete next.per_tool[toolId];
-    else next.per_tool[toolId] = modeOrNull as AccessMode;
-    updatePolicy(next);
-  }
-
-  function resetSafest() {
-    if (!policy) return;
-    updatePolicy({
-      version: 2,
-      global_default: "blocked",
-      per_risk: { low: "blocked", medium: "blocked", high: "blocked", critical: "blocked" },
-      per_tool: {},
-      provider_overrides: {},
-    });
-    setSelected({});
-  }
-
-  function applyRecommendedPreset() {
-    if (!policy) return;
-    updatePolicy({
-      version: 2,
-      global_default: "blocked",
-      per_risk: { low: "allowed", medium: "allowed_with_approval", high: "blocked", critical: "blocked" },
-      per_tool: {},
-      provider_overrides: {},
-    });
-    setSelected({});
-  }
-
-  function bulkSet(mode: AccessMode) {
-    if (!policy) return;
-    const ids = Object.entries(selected).filter(([, v]) => v).map(([k]) => k);
-    if (ids.length === 0) return;
-    const next = clone(policy);
-    for (const id of ids) next.per_tool[id] = mode;
-    updatePolicy(next);
-  }
-
-  function selectByRisk(risk: Risk) {
-    const next: Record<string, boolean> = { ...selected };
-    for (const t of filteredTools) {
-      if (t.risk === risk) next[t.id] = true;
-    }
-    setSelected(next);
-  }
-
-  async function save() {
-    if (!policy) return;
-    setBusy(true);
-    setErr("");
+  async function runTool() {
+    setRunning(true);
+    setErr('');
+    setOutsideErr(null);
+    setRunOut(null);
     try {
-      let providerOverrides = {};
-      try {
-        providerOverrides = JSON.parse(providerOverridesText || "{}");
-      } catch {
-        throw new Error(t("tools.policy.providerOverridesInvalid"));
+      const args = argsText.trim() ? JSON.parse(argsText) : {};
+      const out = await postJson<any>('/api/tools/run', {
+        tool_name: selectedTool,
+        args,
+      });
+      setRunOut(out);
+      await load();
+    } catch (e: any) {
+      const code = String(e?.detail?.error || e?.detail?.code || '');
+      const message = String(e?.detail?.message || e?.detail?.error || e?.message || e);
+      if (code === 'OUTSIDE_ALLOWED_ROOTS') {
+        const details = e?.detail?.details || {};
+        const firstPath = String(details?.suggested_path_prefix || details?.paths?.[0]?.path || '');
+        setGrantPath(firstPath);
+        setOutsideErr({ message, details });
+      } else {
+        setErr(message);
       }
-      const next = clone(policy);
-      next.provider_overrides = providerOverrides;
-      await postJson("/admin/tools/policy", { policy: next });
-      await load();
-      try { window.dispatchEvent(new Event("pb-system-state-changed")); } catch {}
-    } catch (e: any) {
-      setErr(String(e?.message || e));
     } finally {
-      setBusy(false);
+      setRunning(false);
     }
   }
 
-  async function executeProposal(proposalId: string) {
-    setBusy(true);
-    setErr("");
+  async function grantAndRetry() {
+    if (!grantPath.trim()) {
+      setErr('Grant path is required.');
+      return;
+    }
+    setRunning(true);
+    setErr('');
     try {
-      await postJson("/admin/tools/execute", { proposal_id: proposalId });
-      await load();
+      const action = String(outsideErr?.details?.paths?.[0]?.action || 'read');
+      const mode = action === 'exec' ? 'exec' : action === 'read' ? 'read' : 'read_write';
+      await postJson('/admin/grants/path-prefix', {
+        path: grantPath.trim(),
+        mode,
+        grant_scope: grantScope,
+        session_id: `tools-ui-${Date.now()}`,
+      });
+      setOutsideErr(null);
+      await runTool();
     } catch (e: any) {
-      setErr(String(e?.detail?.error || e?.message || e));
-    } finally {
-      setBusy(false);
+      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+      setRunning(false);
     }
   }
 
-  async function saveRetentionDays() {
-    setBusy(true);
-    setErr("");
+  async function revokeGrant(id: string) {
     try {
-      const out = await postJson<any>("/admin/retention", { retention_days: retentionDays });
-      setRetentionDays(Math.max(1, Math.min(365, Number(out?.retention_days || retentionDays) || retentionDays)));
-    } catch (e: any) {
-      setErr(String(e?.message || e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function purgeOldProposals() {
-    if (!window.confirm(t("tools.purge.confirm", { days: retentionDays }))) return;
-    setBusy(true);
-    setErr("");
-    setPurgeMsg("");
-    try {
-      const out = await postJson<any>("/admin/tools/proposals/purge", { olderThanDays: retentionDays });
-      setPurgeMsg(
-        t("tools.purge.result", {
-          proposals: Number(out?.deleted_proposals || 0),
-          runs: Number(out?.deleted_runs || 0),
-          skipped: Number(out?.skipped_pending_approval || 0),
-        })
-      );
+      await postJson(`/admin/grants/${encodeURIComponent(id)}/revoke`, {});
       await load();
     } catch (e: any) {
       setErr(String(e?.detail?.error || e?.message || e));
-    } finally {
-      setBusy(false);
     }
   }
+
+
+  async function runQuickDiag(kind: 'list' | 'write' | 'read') {
+    setDiagBusy(true);
+    setErr('');
+    try {
+      if (kind === 'list') {
+        const toolsOut = await getJson<any>('/api/tools');
+        setDiagQuickOut({ kind, count: Array.isArray(toolsOut) ? toolsOut.length : 0, names: Array.isArray(toolsOut) ? toolsOut.map((t: any) => String(t?.function?.name || '')).filter(Boolean) : [], raw: toolsOut });
+      } else if (kind === 'write') {
+        const out = await postJson('/api/tools/run', { tool_name: 'tools.fs.writeFile', args: { path: 'hello.txt', content: 'hello world' } });
+        setDiagQuickOut({ kind, raw: out });
+      } else {
+        const out = await postJson('/api/tools/run', { tool_name: 'tools.fs.readFile', args: { path: 'hello.txt' } });
+        setDiagQuickOut({ kind, raw: out });
+      }
+    } catch (e: any) {
+      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+      setDiagQuickOut({ kind, error: e?.detail || String(e) });
+    } finally {
+      setDiagBusy(false);
+    }
+  }
+
+  async function runDiagnostics() {
+    setDiagBusy(true);
+    setErr('');
+    try {
+      const out = await postJson('/api/tools/diagnostics', {});
+      setDiagOut(out);
+    } catch (e: any) {
+      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+    } finally {
+      setDiagBusy(false);
+    }
+  }
+
+  if (loading) return <div>Loading tools…</div>;
 
   return (
-    <div style={{ display: "grid", gap: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h2 style={{ margin: 0 }}>{t("page.tools.title")}</h2>
-        <button onClick={load} disabled={busy || loading} style={{ padding: "8px 12px" }}>{t("common.refresh")}</button>
+    <div style={{ display: 'grid', gap: 12 }}>
+      <h2 style={{ margin: 0 }}>Tools</h2>
+      {err ? <div style={{ border: '1px solid var(--bad)', color: 'var(--bad)', padding: 8, borderRadius: 8 }}>{err}</div> : null}
+
+      <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Allowed roots</div>
+        <div style={{ fontSize: 13 }}>HOME: <code>{allowedRoots?.home || 'n/a'}</code></div>
+        <div style={{ fontSize: 13 }}>WORKSPACE: <code>{allowedRoots?.workspace || 'n/a'}</code></div>
       </div>
 
-      {err ? (
-        <div style={{ padding: 10, border: "1px solid #f1c6c6", background: "#fff4f4", borderRadius: 8, color: "#b00020" }}>
-          {err}
+      <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
+        <div style={{ fontWeight: 700 }}>Run tool</div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <select value={selectedTool} onChange={(e) => setSelectedTool(e.target.value)} style={{ minWidth: 300 }}>
+            {tools.map((t) => <option key={t.id} value={t.id}>{t.label} ({t.id})</option>)}
+          </select>
+          <button onClick={runTool} disabled={running}>{running ? 'Running…' : 'Run'}</button>
+        </div>
+        <textarea value={argsText} onChange={(e) => setArgsText(e.target.value)} rows={8} style={{ width: '100%', fontFamily: 'monospace' }} />
+        {runOut ? <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{pretty(runOut)}</pre> : null}
+      </div>
+
+      {outsideErr ? (
+        <div style={{ border: '1px solid var(--warn)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
+          <div style={{ fontWeight: 700 }}>Approval required</div>
+          <div>{outsideErr.message}</div>
+          <div>Path prefix</div>
+          <input value={grantPath} onChange={(e) => setGrantPath(e.target.value)} />
+          <div>Grant duration</div>
+          <select value={grantScope} onChange={(e) => setGrantScope(e.target.value as any)}>
+            <option value="once">Allow once</option>
+            <option value="session">Allow for session</option>
+            <option value="project">Allow for project</option>
+          </select>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={grantAndRetry} disabled={running}>Grant and retry</button>
+            <button onClick={() => setOutsideErr(null)} disabled={running}>Deny</button>
+          </div>
+          <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{pretty(outsideErr.details || {})}</pre>
         </div>
       ) : null}
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>{t("tools.policy.title")}</h3>
-        <div style={{ fontSize: 12, opacity: 0.8 }}>
-          {t("tools.policy.safeDefaultHelp")}
+      <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+          <div style={{ fontWeight: 700 }}>Tool list</div>
+          <input placeholder="Search tools" value={search} onChange={(e) => setSearch(e.target.value)} />
         </div>
-
-        {!policy ? <div>{t("common.loading")}</div> : (
-          <>
-            <label>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>{t("tools.policy.defaultAll")}</div>
-              <select value={policy.global_default} onChange={(e) => setGlobalDefault(e.target.value as AccessMode)} style={{ padding: 8, width: 260 }}>
-                <option value="blocked">{t("tools.policy.blocked")}</option>
-                <option value="allowed">{t("tools.policy.allowed")}</option>
-                <option value="allowed_with_approval">{t("tools.policy.allowedApproval")}</option>
-              </select>
-            </label>
-
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              {(["low", "medium", "high", "critical"] as Risk[]).map((r) => (
-                <label key={r} style={{ display: "grid", gap: 6 }}>
-                  <div style={{ fontSize: 12, opacity: 0.8 }}>
-                    {t("tools.policy.riskDefault", { risk: t(`risk.${r}`) })}
-                  </div>
-                  <select value={policy.per_risk[r]} onChange={(e) => setRiskDefault(r, e.target.value as AccessMode)} style={{ padding: 8, width: 220 }}>
-                    <option value="blocked">{t("tools.policy.blocked")}</option>
-                    <option value="allowed">{t("tools.policy.allowed")}</option>
-                    <option value="allowed_with_approval">{t("tools.policy.allowedApproval")}</option>
-                  </select>
-                </label>
-              ))}
+        <div style={{ display: 'grid', gap: 6 }}>
+          {visibleTools.map((t) => (
+            <div key={t.id} style={{ border: '1px solid var(--border-soft)', borderRadius: 8, padding: 8 }}>
+              <div style={{ fontWeight: 700 }}>{t.label}</div>
+              <div style={{ fontSize: 12, opacity: 0.85 }}><code>{t.id}</code> · risk {t.risk}</div>
+              <div style={{ fontSize: 13 }}>{t.description}</div>
             </div>
-
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <button onClick={resetSafest} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.policy.resetSafest")}</button>
-              <button onClick={applyRecommendedPreset} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.policy.recommendedPreset")}</button>
-              <button onClick={save} disabled={busy} style={{ padding: "8px 12px", fontWeight: 700 }}>{t("tools.policy.save")}</button>
-            </div>
-
-            <button onClick={() => setShowAdvanced((v) => !v)} style={{ padding: "6px 10px", width: 160 }}>
-              {showAdvanced ? t("tools.policy.hideAdvanced") : t("tools.policy.advanced")}
-            </button>
-
-            {showAdvanced ? (
-              <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10, display: "grid", gap: 8 }}>
-                <div style={{ fontWeight: 700 }}>{t("tools.policy.providerOverridesTitle")}</div>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>{t("tools.policy.providerOverridesHelp")}</div>
-                <textarea value={providerOverridesText} onChange={(e) => setProviderOverridesText(e.target.value)} rows={6} style={{ width: "100%", padding: 8, fontFamily: "monospace" }} />
-              </div>
-            ) : null}
-          </>
-        )}
-      </section>
-
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>{t("tools.registered.title")}</h3>
-        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t("tools.registered.searchPlaceholder")} style={{ padding: 8, width: 320 }} />
-          <button onClick={() => bulkSet("allowed")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>{t("tools.registered.allowSelected")}</button>
-          <button onClick={() => bulkSet("blocked")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>{t("tools.registered.blockSelected")}</button>
-          <button onClick={() => bulkSet("allowed_with_approval")} disabled={!policy || busy} style={{ padding: "8px 12px" }}>{t("tools.registered.requireApprovalSelected")}</button>
-          <button onClick={() => selectByRisk("low")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.low") })}</button>
-          <button onClick={() => selectByRisk("medium")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.medium") })}</button>
-          <button onClick={() => selectByRisk("high")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.high") })}</button>
-          <button onClick={() => selectByRisk("critical")} disabled={busy} style={{ padding: "8px 12px" }}>{t("tools.registered.selectAllRisk", { risk: t("risk.critical") })}</button>
+          ))}
         </div>
+      </div>
 
-        {loading ? (
-          <div>{t("common.loading")}</div>
-        ) : tools.length === 0 ? (
-          <div>{t("tools.registered.none")}</div>
-        ) : !policy ? (
-          <div>{t("tools.policy.loading")}</div>
-        ) : (
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-            <thead>
-              <tr style={{ background: "#fafafa" }}>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }} />
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.tool")}</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.risk")}</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.effective")}</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.registered.table.override")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredTools.map((toolRow) => {
-                const effective = computeEffective(policy, toolRow);
-                const overrideVal = policy.per_tool[toolRow.id] || "";
-                return (
-                  <tr key={toolRow.id}>
-                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>
-                      <input
-                        type="checkbox"
-                        checked={Boolean(selected[toolRow.id])}
-                        onChange={(e) => setSelected((prev) => ({ ...prev, [toolRow.id]: e.target.checked }))}
-                      />
-                    </td>
-                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>
-                      <div style={{ fontWeight: 700 }}>{toolRow.id}</div>
-                      <div style={{ fontSize: 12, opacity: 0.75 }}>{toolRow.description}</div>
-                    </td>
-                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{t(`risk.${toolRow.risk}`)}</td>
-                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{accessLabel(t, effective)}</td>
-                    <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>
-                      <select value={overrideVal} onChange={(e) => setToolOverride(toolRow.id, e.target.value as any)} style={{ padding: 8, width: 220 }}>
-                        <option value="">{t("tools.registered.noOverride")}</option>
-                        <option value="blocked">{t("tools.policy.blocked")}</option>
-                        <option value="allowed">{t("tools.policy.allowed")}</option>
-                        <option value="allowed_with_approval">{t("tools.policy.allowedApproval")}</option>
-                      </select>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>{t("tools.proposals.title")}</h3>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 12, opacity: 0.8 }}>{t("retention.daysLabel")}</span>
-            <input
-              type="number"
-              min={1}
-              max={365}
-              value={retentionDays}
-              onChange={(e) => setRetentionDays(Math.max(1, Math.min(365, Number(e.target.value || 30) || 30)))}
-              style={{ width: 120, padding: 8 }}
-            />
-          </label>
-          <button onClick={saveRetentionDays} disabled={busy} style={{ padding: "8px 12px", marginTop: 18 }}>
-            {t("retention.save")}
-          </button>
-          <button onClick={purgeOldProposals} disabled={busy} style={{ padding: "8px 12px", marginTop: 18 }}>
-            {t("tools.purge.button")}
-          </button>
-          {purgeMsg ? <span style={{ fontSize: 12, opacity: 0.8, marginTop: 18 }}>{purgeMsg}</span> : null}
-        </div>
-        {loading ? (
-          <div>{t("common.loading")}</div>
-        ) : proposals.length === 0 ? (
-          <div style={{ padding: 10, border: "1px solid #eee", borderRadius: 10, background: "#fafafa" }}>
-            <div style={{ fontWeight: 700, marginBottom: 4 }}>{t("tools.proposals.none")}</div>
-            <div style={{ fontSize: 13, opacity: 0.8 }}>{t("tools.proposals.noneHelp")}</div>
-          </div>
-        ) : (
-          <div style={{ display: "grid", gap: 10 }}>
-            {proposals.slice(0, 30).map((p) => (
-              <div key={p.id} style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-                  <div>
-                    <div style={{ fontWeight: 800 }}>{p.tool_name} <span style={{ fontWeight: 400, opacity: 0.7 }}>({p.risk_level})</span></div>
-                    <div style={{ fontSize: 12, opacity: 0.8 }}>{p.summary || "—"}</div>
-                    <div style={{ fontSize: 12, opacity: 0.8 }}>{t("tools.proposals.args")}: {argsSummary(p.args_json)}</div>
-                  </div>
-                  <div style={{ display: "grid", gap: 6, justifyItems: "end" }}>
-                    <div style={{ fontSize: 12 }}>{t("tools.proposals.status")}: <b>{p.status}</b></div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      {p.status === "awaiting_approval" ? (
-                        <button onClick={() => { window.location.hash = "#/approvals"; }} style={{ padding: "8px 12px" }}>
-                          {t("tools.proposals.openApprovals")}
-                        </button>
-                      ) : null}
-                      {p.status === "ready" ? (
-                        <button onClick={() => executeProposal(p.id)} disabled={busy} style={{ padding: "8px 12px" }}>
-                          {t("tools.proposals.execute")}
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-                <details style={{ marginTop: 8 }}>
-                  <summary style={{ cursor: "pointer" }}>{t("tools.proposals.viewRaw")}</summary>
-                  <pre style={{ margin: 0, marginTop: 8, padding: 8, background: "#fafafa", border: "1px solid #eee", maxHeight: 160, overflow: "auto" }}>
-                    {JSON.stringify(p, null, 2)}
-                  </pre>
-                </details>
+      <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
+        <div style={{ fontWeight: 700 }}>Active grants</div>
+        {grants.length === 0 ? <div style={{ opacity: 0.8 }}>No grants.</div> : (
+          <div style={{ display: 'grid', gap: 6 }}>
+            {grants.map((g) => (
+              <div key={g.id} style={{ border: '1px solid var(--border-soft)', borderRadius: 8, padding: 8, display: 'grid', gap: 4 }}>
+                <div><code>{g.path_prefix}</code></div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>scope={g.limits?.grant_scope || 'session'} · actions={g.actions.join(',')} · status={g.status}</div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>expires {new Date(g.expires_at).toLocaleString()}</div>
+                <div><button onClick={() => revokeGrant(g.id)}>Revoke</button></div>
               </div>
             ))}
           </div>
         )}
-      </section>
+      </div>
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>{t("tools.runs.title")}</h3>
-        {loading ? (
-          <div>{t("common.loading")}</div>
-        ) : runs.length === 0 ? (
-          <div>{t("tools.runs.none")}</div>
-        ) : (
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-            <thead>
-              <tr style={{ background: "#fafafa" }}>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.run")}</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.status")}</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.proposal")}</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #e5e7eb" }}>{t("tools.runs.table.started")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {runs.map((run) => (
-                <tr key={String(run.id)}>
-                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.id}</td>
-                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.status}</td>
-                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.proposal_id}</td>
-                  <td style={{ padding: 8, borderTop: "1px solid #f3f4f6" }}>{run.started_at}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
+      <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
+        <div style={{ fontWeight: 700 }}>Diagnostics</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button onClick={() => runQuickDiag('list')} disabled={diagBusy}>List tools</button>
+          <button onClick={() => runQuickDiag('write')} disabled={diagBusy}>Write workspace hello.txt</button>
+          <button onClick={() => runQuickDiag('read')} disabled={diagBusy}>Read workspace hello.txt</button>
+          <button onClick={runDiagnostics} disabled={diagBusy}>{diagBusy ? 'Running…' : 'Run diagnostics'}</button>
+        </div>
+        {diagQuickOut ? <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{pretty(diagQuickOut)}</pre> : null}
+        {diagOut ? <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{pretty(diagOut)}</pre> : null}
+      </div>
     </div>
   );
 }

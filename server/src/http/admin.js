@@ -2,21 +2,37 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
 import express from 'express';
 import { requireAuth } from './middleware.js';
 import { readEnvFile, writeEnvFile } from '../util/envStore.js';
 import { llmChatOnce } from '../llm/llmClient.js';
+import { getActiveProvider, getProviderSecret, PROVIDER_TYPES } from '../llm/providerConfig.js';
 import { recordEvent } from '../util/events.js';
 import { assertNotHelperOrigin, assertWebchatOnly } from './channel.js';
 import { getTextWebUIConfig, probeTextWebUI } from '../runtime/textwebui.js';
 import { canvasItemForToolRun, insertCanvasItem } from '../canvas/canvas.js';
 import { createItem as createCanvasItem } from '../canvas/service.js';
 import { getWorkspaceRoot } from '../util/workspace.js';
+import { ensureAlexWorkdir, inspectPathContainment } from '../util/alexSandbox.js';
 import { MEMORY_ALWAYS_ALLOWED_TOOLS } from '../memory/policy.js';
-import { appendTurnToScratch, buildMemoryContext, updateDailySummaryFromScratch } from '../memory/context.js';
+import { appendTurnToScratch, buildMemoryContextWithArchive, updateDailySummaryFromScratch } from '../memory/context.js';
 import { applyDurablePatch, prepareFinalizeDay } from '../memory/finalize.js';
 import { appendScratchSafe, readTextSafe, writeSummarySafe } from '../memory/fs.js';
-import { getLocalDayKey } from '../memory/date.js';
+import { createMemoryDraft, searchMemoryEntries } from '../memory/service.js';
+import { scratchWrite, scratchRead, scratchList, scratchClear } from '../memory/scratch.js';
+import {
+  DEFAULT_AGENT_ID as MEMORY_AGENT_ID,
+  clearChatSummary,
+  clearProfileMemory,
+  exportMemories,
+  loadMemory,
+  updateAfterTurn,
+} from '../memory/store.js';
+import { getLocalDayKey } from '../util/dayKey.js';
+import { executeMcpRpc } from './mcp.js';
+import { recordHot } from '../memory/hot.js';
 import { getWatchtowerMdPath } from '../watchtower/paths.js';
 import { ensureWatchtowerDir, readWatchtowerChecklist, writeWatchtowerChecklist } from '../watchtower/policy.js';
 import {
@@ -39,6 +55,451 @@ const WATCHTOWER_SETTINGS_KEY = 'watchtower.settings';
 const WATCHTOWER_STATE_KEY = 'watchtower.state';
 const WEBCHAT_SESSION_META_KEY_PREFIX = 'webchat.session_meta.';
 const DEFAULT_ASSISTANT_NAME = 'Alex';
+
+function envValue(name, fallback = '') {
+  const v = String(process.env[name] || '').trim();
+  return v || String(fallback || '');
+}
+
+function getSecurityMode() {
+  const raw = envValue('SECURITY_MODE', 'off').toLowerCase();
+  if (raw === 'off' || raw === 'prompt' || raw === 'enforce') return raw;
+  return 'off';
+}
+
+function getOutsideWritePolicy() {
+  const raw = envValue('OUTSIDE_WRITE_POLICY', 'ask').toLowerCase();
+  if (raw === 'ask' || raw === 'allow_session' || raw === 'allow_project' || raw === 'deny') return raw;
+  return 'ask';
+}
+
+function webchatTimeoutMs() {
+  const raw = Number(process.env.WEBCHAT_LLM_TIMEOUT_MS || 600000);
+  if (!Number.isFinite(raw) || raw <= 0) return 600000;
+  return Math.max(raw, 600000);
+}
+
+function isBareBonesMode() {
+  const bare = envValue('BARE_BONES_MODE', '').toLowerCase();
+  const sec = envValue('SECURITY_DISABLED', '').toLowerCase();
+  if (['1', 'true', 'on'].includes(sec)) return true;
+  if (!bare) return true;
+  if (bare === '0' || bare === 'false' || bare === 'off') return false;
+  return true;
+}
+
+function shouldUseMcpBrowse(messageText) {
+  const s = String(messageText || '').toLowerCase();
+  if (/https?:\/\//i.test(s)) return true;
+  if (/(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[\w\-./?%&=]*)?/i.test(s)) return true;
+  const kws = ['search', 'browse', 'look up', 'latest', 'news', 'price', 'release date', 'reddit', 'youtube', 'github', 'website', 'weather', 'forecast', 'temperature'];
+  if (kws.some((k) => s.includes(k))) return true;
+  // word-boundary check for 'find' to avoid matching 'finder', 'refind', etc.
+  if (/\bfind\b/.test(s)) return true;
+  return false;
+}
+
+function shouldUseContext7(messageText) {
+  const s = String(messageText || '').toLowerCase();
+  if (!s) return false;
+  if (s.includes('use code1') || s.includes('use context7')) return true;
+  const kws = [
+    'next.js', 'react', 'vue', 'svelte', 'express', 'fastapi', 'django', 'flask',
+    'typescript', 'javascript', 'python', 'node', 'api', 'sdk', 'middleware',
+    'how do i', 'docs', 'documentation', 'library', 'package', 'npm', 'pip install',
+  ];
+  const hits = kws.filter((k) => s.includes(k)).length;
+  return hits >= 2;
+}
+
+function compactContext7Result(capability, result, args = {}) {
+  const cap = String(capability || '').trim();
+  const src = result && typeof result === 'object' ? result : {};
+  const urls = [];
+  const snippets = [];
+  const stack = [src];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== 'object') continue;
+    for (const [k, v] of Object.entries(cur)) {
+      if (typeof v === 'string') {
+        const t = v.trim();
+        if (!t) continue;
+        if (/^https?:\/\//i.test(t)) {
+          if (!urls.includes(t)) urls.push(t);
+        } else if (/snippet|content|text|summary|description|example|code/i.test(String(k))) {
+          if (snippets.length < 8) snippets.push(t.replace(/\s+/g, ' ').slice(0, 700));
+        }
+      } else if (Array.isArray(v)) {
+        for (const item of v) stack.push(item);
+      } else if (v && typeof v === 'object') {
+        stack.push(v);
+      }
+    }
+  }
+
+  const out = {
+    ok: true,
+    capability: cap,
+    libraryId: String(src.libraryId || src.library_id || args.libraryId || '').trim() || null,
+    query: String(args.query || '').trim() || null,
+    snippets: snippets.slice(0, 6),
+    sources: urls.slice(0, 8),
+  };
+  if (cap === 'resolve-library-id') {
+    const matches = [];
+    const arr = Array.isArray(src.matches) ? src.matches : (Array.isArray(src.results) ? src.results : []);
+    for (const row of arr.slice(0, 6)) {
+      if (!row || typeof row !== 'object') continue;
+      const libId = String(row.libraryId || row.library_id || row.id || '').trim();
+      if (!libId) continue;
+      matches.push({
+        libraryId: libId,
+        name: String(row.name || row.title || libId),
+        description: String(row.description || row.snippet || '').slice(0, 220),
+      });
+      if (!out.libraryId) out.libraryId = libId;
+    }
+    out.matches = matches;
+  }
+  return out;
+}
+
+function extractFirstHttpUrl(messageText) {
+  const m = String(messageText || '').match(/https?:\/\/[^\s)]+/i);
+  return m ? String(m[0]) : '';
+}
+
+function summarizeMcpContextText(raw, maxChars = 700) {
+  const txt = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!txt) return '';
+  const parts = txt.split(/(?<=[.!?])\s+/).filter(Boolean);
+  const picked = [];
+  for (const p of parts) {
+    if (picked.join(' ').length >= maxChars) break;
+    picked.push(p.trim());
+    if (picked.length >= 4) break;
+  }
+  const out = picked.join(' ').trim();
+  return out.slice(0, maxChars);
+}
+
+
+function looksLikeRawBrowserDump(text) {
+  const s = String(text || '');
+  if (!s) return false;
+  if (/<html|<head|<body|<script|<style/i.test(s)) return true;
+  const tagCount = (s.match(/<[^>]+>/g) || []).length;
+  if (tagCount >= 12) return true;
+  if (/all regions|duckduckgo|safe search|result__a/i.test(s)) return true;
+  return false;
+}
+
+function formatMcpAnswerFromContext(contextText, sources = []) {
+  const summary = summarizeMcpContextText(contextText, 900);
+  if (!summary) return '';
+  const lines = summary.split(/(?<=[.!?])\s+/).filter(Boolean);
+  const answer = lines[0] || summary;
+  const bullets = lines.slice(1, 4);
+  const sourceLines = Array.isArray(sources) ? sources.filter(Boolean).slice(0, 5) : [];
+  return [
+    `Answer: ${answer}`,
+    '',
+    'Summary:',
+    ...(bullets.length ? bullets.map((b) => `- ${b}`) : [`- ${summary}`]),
+    '',
+    'Sources:',
+    ...(sourceLines.length ? sourceLines.map((u) => `- ${u}`) : ['- (no source URL captured)']),
+  ].join('\n');
+}
+
+
+function normalizeProviderBaseUrl(raw) {
+  return String(raw || '').trim().replace(/\/+$/g, '').replace(/\/v1$/g, '');
+}
+
+function selectedModelForProvider(db, provider) {
+  const selected = String(kvGet(db, 'llm.selectedModel', '') || '').trim();
+  if (selected) return selected;
+  const models = Array.isArray(provider?.models) ? provider.models.map((m) => String(m || '').trim()).filter(Boolean) : [];
+  return models[0] || null;
+}
+
+async function callOpenAiWithMessages({ db, systemText, messages, tools = null, signal = null, timeoutMs = 120000 }) {
+  const provider = getActiveProvider(db);
+  const pType = String(provider?.providerType || PROVIDER_TYPES.OPENAI_COMPATIBLE);
+  if (!(pType === PROVIDER_TYPES.OPENAI_COMPATIBLE || pType === PROVIDER_TYPES.OPENAI)) {
+    return { ok: false, error: `TOOL_LOOP_UNSUPPORTED_PROVIDER:${pType}` };
+  }
+  const model = selectedModelForProvider(db, provider);
+  if (!model) return { ok: false, error: 'NO_MODEL_SELECTED' };
+  const baseUrl = normalizeProviderBaseUrl(provider?.baseUrl || process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:5000');
+  const apiKey = getProviderSecret(db, String(provider?.id || ''));
+
+  const body = {
+    model,
+    messages: [
+      ...(systemText ? [{ role: 'system', content: String(systemText) }] : []),
+      ...messages,
+    ],
+    temperature: 0.2,
+  };
+  if (Array.isArray(tools) && tools.length) body.tools = tools;
+
+  const headers = { 'content-type': 'application/json' };
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+
+  const ctrl = new AbortController();
+  const tt = setTimeout(() => ctrl.abort(), Math.max(30000, Number(timeoutMs || 120000)));
+  const combinedSignal = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
+  try {
+    const rr = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: combinedSignal,
+    });
+    const txt = await rr.text();
+    const out = txt ? safeJsonParse(txt, null) : null;
+    if (!rr.ok || !out || typeof out !== 'object') {
+      return { ok: false, error: `LLM_HTTP_${rr.status}`, detail: { preview: String(txt || '').slice(0, 300) } };
+    }
+    return { ok: true, model, provider: String(provider?.id || ''), raw: out };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  } finally {
+    clearTimeout(tt);
+  }
+}
+
+async function runOpenAiToolLoop({ db, message, systemText, sessionId, reqSignal, workdir, mcpServerId = null, includeMcpTools = false, rid = null }) {
+  const serverCaps = mcpServerId
+    ? db.prepare('SELECT capability FROM mcp_capabilities WHERE server_id = ? ORDER BY capability ASC').all(String(mcpServerId)).map((r) => String(r.capability || ''))
+    : [];
+  const mcpToolDefs = includeMcpTools && mcpServerId ? getMcpToolSchema(serverCaps) : [];
+  const toolDefs = [...getOpenAiToolSchema(), ...mcpToolDefs];
+  console.log(`[llm.tool_schema] rid=${rid || '-'} include_mcp=${mcpToolDefs.length > 0} tool_count=${toolDefs.length} mcpServerId=${mcpServerId || '-'} caps=${serverCaps.join(',')}`);
+  const messages = [{ role: 'user', content: String(message || '') }];
+  const traces = [];
+  let context7Used = null;
+
+  for (let step = 0; step < 6; step += 1) {
+    const llm = await callOpenAiWithMessages({ db, systemText, messages, tools: toolDefs, signal: reqSignal, timeoutMs: webchatTimeoutMs() });
+    if (!llm.ok) return { ok: false, error: llm.error, detail: llm.detail || null, traces };
+    const choice = llm.raw?.choices?.[0] || {};
+    const msg = choice?.message || {};
+    const finish = String(choice?.finish_reason || 'stop');
+    const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+
+    if (toolCalls.length > 0) {
+      messages.push({ role: 'assistant', content: String(msg?.content || ''), tool_calls: toolCalls });
+      for (const tc of toolCalls) {
+        const toolCallId = String(tc?.id || `call_${Date.now()}`);
+        const toolNameRaw = String(tc?.function?.name || '').trim();
+        const toolName = normalizeToolName(toolNameRaw);
+        const args = safeJsonParse(String(tc?.function?.arguments || '{}'), {});
+        const started = Date.now();
+        try {
+          if ((toolNameRaw === 'mcp.browser.search' || toolNameRaw === 'mcp.browser.extract_text') && mcpServerId) {
+            const capability = toolNameRaw === 'mcp.browser.search' ? 'browser.search' : 'browser.extract_text';
+            console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
+            const mcpOut = await executeMcpRpc({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
+            const resultPayload = { ok: true, result: mcpOut || {} };
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: toolNameRaw, args, result: mcpOut || {}, duration_ms: Date.now() - started });
+            continue;
+          }
+
+          if ((toolNameRaw === 'resolve-library-id' || toolNameRaw === 'query-docs' || toolNameRaw === 'mcp.resolve-library-id' || toolNameRaw === 'mcp.query-docs') && mcpServerId) {
+            const capability = toolNameRaw.startsWith('mcp.') ? toolNameRaw.slice(4) : toolNameRaw;
+            console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
+            const mcpOut = await executeMcpRpc({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            const compact = compactContext7Result(capability, mcpOut || {}, args || {});
+            if (capability === 'query-docs') {
+              context7Used = {
+                libraryId: compact.libraryId || context7Used?.libraryId || null,
+                query: compact.query || String(args?.query || '').trim() || null,
+                sources: Array.isArray(compact.sources) ? compact.sources.slice(0, 8) : [],
+                snippets: Array.isArray(compact.snippets) ? compact.snippets.slice(0, 5) : [],
+              };
+            } else if (capability === 'resolve-library-id') {
+              context7Used = {
+                ...(context7Used || {}),
+                libraryId: compact.libraryId || context7Used?.libraryId || null,
+                query: compact.query || context7Used?.query || null,
+                sources: Array.isArray(compact.sources) ? compact.sources.slice(0, 8) : (context7Used?.sources || []),
+                snippets: Array.isArray(compact.snippets) ? compact.snippets.slice(0, 5) : (context7Used?.snippets || []),
+              };
+            }
+            console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
+            const resultPayload = { ok: true, result: compact };
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: toolNameRaw, args, result: compact, duration_ms: Date.now() - started });
+            continue;
+          }
+
+          const runOut = await executeRegisteredTool({ toolName, args, workdir, db, sessionId, signal: reqSignal });
+          const resultPayload = { ok: true, result: runOut?.result || {}, stdout: runOut?.stdout || '', stderr: runOut?.stderr || '' };
+          const content = JSON.stringify(resultPayload);
+          messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content });
+          traces.push({ stage: 'tool', ok: true, tool: toolNameRaw, args, result: runOut?.result || {}, stdout_preview: String(runOut?.stdout || '').slice(0, 300), stderr_preview: String(runOut?.stderr || '').slice(0, 300), duration_ms: Date.now() - started });
+        } catch (e) {
+          const errObj = { ok: false, error: String(e?.message || e), tool: toolNameRaw, args };
+          messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content: JSON.stringify(errObj) });
+          traces.push({ stage: 'tool', ok: false, tool: toolNameRaw, args, duration_ms: Date.now() - started, error: errObj.error });
+        }
+      }
+      continue;
+    }
+
+    if (finish === 'stop' || !toolCalls.length) {
+      return {
+        ok: true,
+        text: String(msg?.content || '').trim(),
+        model: llm.model,
+        profile: llm.provider,
+        traces,
+        context7: context7Used,
+      };
+    }
+  }
+  return { ok: false, error: 'TOOL_LOOP_MAX_STEPS', traces };
+}
+
+// Controller-style MCP browse: PB drives search+extract, returns plain-text context for LLM to summarize.
+// No tool schemas are ever sent to the LLM — prevents tool-hallucination on local/quantized models.
+async function runMcpBrowseController(db, { mcpServerId, message, rid, signal }) {
+  const traces = [];
+  const sources = [];
+  const extracts = [];
+
+  // Detect if the message contains an explicit URL to browse directly.
+  const explicitUrls = (message.match(/https?:\/\/[^\s,)'"]+/gi) || [])
+    .map((u) => u.replace(/[.,;!?]+$/, '').trim())
+    .filter((u) => /^https?:\/\//i.test(u));
+
+  let searchResults = [];
+
+  if (explicitUrls.length > 0) {
+    // ── Direct URL path: extract_text on each explicit URL ──
+    traces.push({ stage: 'URL_DETECTED', ok: true, urls: explicitUrls });
+    for (const url of explicitUrls.slice(0, 3)) {
+      try {
+        const extOut = await executeMcpRpc({
+          db,
+          serverId: mcpServerId,
+          capability: 'browser.extract_text',
+          args: { url, max_chars: 6000 },
+          signal,
+          rid,
+        });
+        const text = String(extOut?.text || extOut?.excerpt || '').trim().slice(0, 5000);
+        const title = String(extOut?.title || '').trim().slice(0, 120);
+        if (text) {
+          extracts.push({ url, title, text });
+          if (!sources.includes(url)) sources.push(url);
+          traces.push({ stage: 'EXTRACT', ok: true, url, chars: text.length });
+        } else {
+          traces.push({ stage: 'EXTRACT', ok: false, url, error: 'empty_body' });
+        }
+      } catch (e) {
+        traces.push({ stage: 'EXTRACT', ok: false, url, error: String(e?.message || e) });
+      }
+    }
+    if (!extracts.length) {
+      return { ok: false, error: 'URL_EXTRACT_EMPTY', traces, sources: [], context: '' };
+    }
+    const extractedBlocks = extracts.map((e) => {
+      const header = e.title ? `${e.title} — ${e.url}` : e.url;
+      return `--- ${header} ---\n${e.text}`;
+    }).join('\n\n');
+    const context =
+      `[LIVE PAGE CONTENT for: "${message}"]\n\n` +
+      `Extracted page content:\n${extractedBlocks}`;
+    return { ok: true, context, sources, traces };
+  }
+
+  // ── Search path: search then extract top results ──
+  try {
+    const searchOut = await executeMcpRpc({
+      db,
+      serverId: mcpServerId,
+      capability: 'browser.search',
+      args: { q: message, limit: 5 },
+      signal,
+      rid,
+    });
+    const rawResults = searchOut?.results;
+    // executeMcpRpc fallback returns { results: { results: [...], search_debug: [...] } }
+    // while upstream MCP servers may return { results: [...] }.
+    const list = Array.isArray(rawResults)
+      ? rawResults
+      : (Array.isArray(rawResults?.results) ? rawResults.results : []);
+    const searchDebug = Array.isArray(rawResults?.search_debug) ? rawResults.search_debug : [];
+    searchResults = list;
+    if (searchDebug.length) traces.push({ stage: 'SEARCH_DEBUG', ok: true, items: searchDebug.slice(0, 10) });
+    traces.push({ stage: 'SEARCH', ok: true, count: searchResults.length });
+  } catch (e) {
+    traces.push({ stage: 'SEARCH', ok: false, error: String(e?.message || e) });
+    return { ok: false, error: String(e?.message || e), traces, sources: [], context: '' };
+  }
+
+  if (!searchResults.length) {
+    return { ok: false, error: 'NO_SEARCH_RESULTS', traces, sources: [], context: '' };
+  }
+
+  // Extract text from top 3 URLs (skip DDG redirect-only entries).
+  const topUrls = searchResults
+    .map((r) => String(r?.url || '').trim())
+    .filter((u) => /^https?:\/\//i.test(u) && !/duckduckgo\.com\/l\//i.test(u))
+    .slice(0, 5);
+  for (const url of topUrls.slice(0, 3)) {
+    try {
+      const extOut = await executeMcpRpc({
+        db,
+        serverId: mcpServerId,
+        capability: 'browser.extract_text',
+        args: { url, max_chars: 3000 },
+        signal,
+        rid,
+      });
+      const text = String(extOut?.text || extOut?.excerpt || '').trim().slice(0, 2500);
+      const title = String(extOut?.title || '').trim().slice(0, 100);
+      if (text) {
+        extracts.push({ url, title, text });
+        if (!sources.includes(url)) sources.push(url);
+        traces.push({ stage: 'EXTRACT', ok: true, url, chars: text.length });
+      }
+    } catch (e) {
+      traces.push({ stage: 'EXTRACT', ok: false, url, error: String(e?.message || e) });
+    }
+  }
+
+  // Collect source URLs from search results even if extract failed.
+  for (const r of searchResults.slice(0, 5)) {
+    const u = String(r?.url || '').trim();
+    if (/^https?:\/\//i.test(u) && !sources.includes(u)) sources.push(u);
+  }
+
+  const topResultsList = searchResults.slice(0, 5).map((r, i) => {
+    const title = String(r?.title || r?.url || '').slice(0, 80);
+    const snippet = String(r?.snippet || '').slice(0, 180);
+    return `${i + 1}. ${title}\n   URL: ${r?.url}${snippet ? `\n   ${snippet}` : ''}`;
+  }).join('\n');
+
+  const extractedBlocks = extracts.map((e) => {
+    const header = e.title ? `${e.title} — ${e.url}` : e.url;
+    return `--- ${header} ---\n${e.text}`;
+  }).join('\n\n');
+
+  const context =
+    `[LIVE WEB SEARCH for: "${message}"]\n\n` +
+    `Top results:\n${topResultsList}` +
+    (extractedBlocks ? `\n\nExtracted page content:\n${extractedBlocks}` : '');
+
+  return { ok: true, context, sources, traces };
+}
 
 const DEFAULT_AGENT_PREAMBLE = `SCAN PROTOCOL (default preamble):
 
@@ -343,6 +804,20 @@ function normalizeAssistantName(name) {
   return raw.slice(0, 40);
 }
 
+function normalizeMcpServerId(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  return raw.slice(0, 120);
+}
+
+function normalizeMcpTemplateId(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  if (raw === 'context7') return 'code1';
+  if (raw === 'context7_docs_default') return 'code1_docs_default';
+  return raw.slice(0, 120);
+}
+
 function getWebchatSessionMeta(db, sessionId) {
   const sid = String(sessionId || '').trim() || 'webchat-default';
   const key = webchatSessionMetaKey(sid);
@@ -351,10 +826,12 @@ function getWebchatSessionMeta(db, sessionId) {
     return {
       session_id: sid,
       assistant_name: normalizeAssistantName(cur.assistant_name),
+      mcp_server_id: normalizeMcpServerId(cur.mcp_server_id),
+      mcp_template_id: normalizeMcpTemplateId(cur.mcp_template_id),
       updated_at: cur.updated_at || null,
     };
   }
-  const next = { session_id: sid, assistant_name: DEFAULT_ASSISTANT_NAME, updated_at: nowIso() };
+  const next = { session_id: sid, assistant_name: DEFAULT_ASSISTANT_NAME, mcp_server_id: null, mcp_template_id: null, updated_at: nowIso() };
   kvSet(db, key, next);
   return next;
 }
@@ -365,10 +842,111 @@ function setWebchatSessionMeta(db, sessionId, patch) {
   const next = {
     ...prev,
     assistant_name: normalizeAssistantName(patch?.assistant_name ?? prev.assistant_name),
+    mcp_server_id: normalizeMcpServerId(patch?.mcp_server_id ?? prev.mcp_server_id),
+    mcp_template_id: normalizeMcpTemplateId(patch?.mcp_template_id ?? prev.mcp_template_id),
     updated_at: nowIso(),
   };
   kvSet(db, webchatSessionMetaKey(sid), next);
   return next;
+}
+
+
+function getMcpWebchatEnabledState(db) {
+  const raw = kvGet(db, 'mcp.webchat.enabled', { templates: {}, servers: {} });
+  const templates = raw && typeof raw.templates === 'object' ? raw.templates : {};
+  const servers = raw && typeof raw.servers === 'object' ? raw.servers : {};
+  return { templates, servers };
+}
+
+function isTemplateEnabledInWebchat(db, templateId) {
+  const tid = String(templateId || '').trim();
+  if (!tid) return true;
+  const st = getMcpWebchatEnabledState(db);
+  if (Object.prototype.hasOwnProperty.call(st.templates, tid)) return Boolean(st.templates[tid]);
+  return true;
+}
+
+function isServerEnabledInWebchat(db, serverId) {
+  const sid = String(serverId || '').trim();
+  if (!sid) return true;
+  const st = getMcpWebchatEnabledState(db);
+  if (Object.prototype.hasOwnProperty.call(st.servers, sid)) return Boolean(st.servers[sid]);
+  // Default: permitted for WebChat unless the user has explicitly disabled it.
+  // approved_for_use is managed by the approval workflow and is not a WebChat gate.
+  return true;
+}
+
+function resolveMcpServerFromTemplate(db, templateId) {
+  const tid = String(templateId || '').trim();
+  if (!tid) return null;
+  if (!isTemplateEnabledInWebchat(db, tid)) return null;
+  const rows = db.prepare(`
+    SELECT id
+    FROM mcp_servers
+    WHERE template_id = ?
+      AND status = 'running'
+    ORDER BY updated_at DESC
+    LIMIT 50
+  `).all(tid);
+  for (const row of rows) {
+    const id = String(row?.id || '').trim();
+    if (id && isServerEnabledInWebchat(db, id)) return id;
+  }
+  return null;
+}
+
+function resolveAnyEnabledBrowserServer(db) {
+  const rows = db.prepare(`
+    SELECT s.id
+    FROM mcp_servers s
+    WHERE s.status = 'running'
+    ORDER BY datetime(s.updated_at) DESC
+    LIMIT 100
+  `).all();
+  for (const row of rows) {
+    const id = String(row?.id || '').trim();
+    if (!id || !isServerEnabledInWebchat(db, id)) continue;
+    const caps = db.prepare('SELECT capability FROM mcp_capabilities WHERE server_id = ?').all(id).map((r) => String(r.capability || ''));
+    const hasBrowser = caps.includes('browser.open_url') || caps.includes('browser.extract_text') || caps.includes('browser.search');
+    if (hasBrowser) return id;
+  }
+  return null;
+}
+
+// Broad fallback: any running, approved, webchat-enabled MCP server (no capability filter).
+function resolveAnyRunningMcpServer(db) {
+  const rows = db.prepare(`
+    SELECT id FROM mcp_servers
+    WHERE status = 'running'
+      AND (hidden IS NULL OR hidden = 0)
+    ORDER BY updated_at DESC, created_at DESC
+    LIMIT 50
+  `).all();
+  for (const row of rows) {
+    const id = String(row?.id || '').trim();
+    if (id && isServerEnabledInWebchat(db, id)) return id;
+  }
+  return null;
+}
+
+// Auto-select a default browser template when none is specified.
+// Priority: id containing 'search_browser' > id containing 'basic_browser' > first enabled.
+// Returns { id, name, reason } or null when no enabled templates exist at all.
+function resolveDefaultBrowserTemplate(db) {
+  let rows;
+  try {
+    rows = db.prepare('SELECT id, name FROM mcp_templates ORDER BY name ASC').all();
+  } catch {
+    return null;
+  }
+  const enabled = rows.filter((r) => isTemplateEnabledInWebchat(db, String(r?.id || '')));
+  if (!enabled.length) return null;
+  for (const pref of ['search_browser', 'basic_browser']) {
+    const match = enabled.find((r) => String(r.id || '').includes(pref));
+    if (match) return { id: String(match.id), name: String(match.name || match.id), reason: `preferred_${pref}` };
+  }
+  const first = enabled[0];
+  return { id: String(first.id), name: String(first.name || first.id), reason: 'first_enabled' };
 }
 
 const RETENTION_DAYS_KEY = 'retention.days';
@@ -560,6 +1138,19 @@ function approvalUiMeta(row) {
     const title = `MCP: ${row?.server_name || row?.server_id} (${kind})`;
     return { source: 'mcp', kind, title, summary: `${kind}`, payload };
   }
+  if (kind === 'directory_prefill') {
+    const projectId = String(payload?.projectId || '').trim();
+    const targetUrl = String(payload?.targetUrl || payload?.target_url || '').trim();
+    const profileId = String(payload?.profileId || payload?.profile_id || '').trim();
+    const summary = `prefill request${projectId ? ` project=${projectId}` : ''}${targetUrl ? ` target=${targetUrl}` : ''}${profileId ? ` profile=${profileId}` : ''}`;
+    return { source: 'directory-assistant', kind, title: 'Directory Assistant Prefill', summary, payload };
+  }
+  if (kind === 'directory_submit') {
+    const projectId = String(payload?.projectId || '').trim();
+    const targetUrl = String(payload?.targetUrl || payload?.target_url || '').trim();
+    const summary = `submit request${projectId ? ` project=${projectId}` : ''}${targetUrl ? ` target=${targetUrl}` : ''}`;
+    return { source: 'directory-assistant', kind, title: 'Directory Assistant Submit', summary, payload };
+  }
   const title = kind === 'tool_run' ? String(row?.tool_name || 'tool_run') : String(row?.tool_name || kind || 'tool');
   return { source: 'tool', kind, title, summary: kind || 'tool_run', payload };
 }
@@ -700,7 +1291,25 @@ function normalizeToolName(name) {
   const n = String(name || '').trim();
   if (n === 'workspace.read') return 'workspace.read_file';
   if (n === 'workspace.write') return 'workspace.write_file';
+  if (n === 'read_file') return 'workspace.read_file';
+  if (n === 'write_file') return 'workspace.write_file';
+  if (n === 'list_dir') return 'workspace.list';
+  if (n === 'mkdir') return 'workspace.mkdir';
+  if (n === 'tools.fs.writeFile') return 'workspace.write_file';
+  if (n === 'tools.fs.readFile') return 'workspace.read_file';
+  if (n === 'tools.fs.listDir') return 'workspace.list';
+  if (n === 'tools.fs.mkdir') return 'workspace.mkdir';
+  if (n === 'tools.fs.delete') return 'workspace.delete';
+  if (n === 'tools.proc.exec') return 'workspace.exec_shell';
   if (n === 'uploads.read') return 'uploads.read_file';
+  if (n === 'memory_write_scratch') return 'memory.write_scratch';
+  if (n === 'memory_search') return 'memory.search';
+  if (n === 'memory_get') return 'memory.get';
+  if (n === 'memory_finalize_day') return 'memory.finalize_day';
+  if (n === 'scratch_write') return 'scratch.write';
+  if (n === 'scratch_read') return 'scratch.read';
+  if (n === 'scratch_list') return 'scratch.list';
+  if (n === 'scratch_clear') return 'scratch.clear';
   return n;
 }
 
@@ -709,12 +1318,68 @@ function parseToolProposalFromReply(replyText) {
   if (!objText) return null;
   const obj = safeJsonParse(objText, null);
   if (!obj || typeof obj !== 'object') return null;
+
   const toolName = normalizeToolName(String(
-    obj.tool_name || obj.toolId || obj.tool || obj.suggested_tool_id || ''
+    obj.tool_name ||
+    obj.toolId ||
+    obj.tool ||
+    obj.suggested_tool_id ||
+    obj.name ||
+    obj.function_name ||
+    obj?.function_call?.name ||
+    ''
   ).trim());
   if (!toolName) return null;
-  const args = normalizeArgs(obj.args || obj.args_json || obj.input || {});
+
+  const rawArgs = obj.args || obj.args_json || obj.input || obj.arguments || obj?.function_call?.arguments || {};
+  const argsObj = typeof rawArgs === 'string' ? safeJsonParse(rawArgs, {}) : rawArgs;
+  const args = normalizeArgs(argsObj);
   return { toolName, args };
+}
+
+function detectDirectFileIntent(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+
+  const cleaned = raw.replace(/[.]+$/, '').trim();
+
+  // Create/write path with optional quoted content.
+  const create = cleaned.match(/^(?:please\s+)?(?:create|make|write|overwrite)\s+(?:a\s+)?file\s+([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?(?:\s+with\s+content\s+([\s\S]+))?$/i)
+    || cleaned.match(/^(?:please\s+)?(?:create|make|write|overwrite)\s+([^\s]+\.[a-z0-9_]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?(?:\s+with\s+content\s+([\s\S]+))?$/i);
+  if (create) {
+    const p = String(create[1] || '').trim();
+    const quoted = cleaned.match(/with\s+content\s+['"]([\s\S]*?)['"](?:\.|$)/i);
+    let content = quoted ? String(quoted[1] || '') : String(create[2] || 'Created by Alex');
+    content = content.trim();
+    if (!content) content = 'Created by Alex';
+    return { toolName: 'workspace.write_file', args: { path: p, content } };
+  }
+
+  const edit = cleaned.match(/^(?:please\s+)?(?:edit|update|replace)\s+(?:file\s+)?([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?\s+(?:with|to)\s+([\s\S]+)$/i);
+  if (edit) {
+    const p = String(edit[1] || '').trim();
+    let content = String(edit[2] || '').trim().replace(/^['"]|['"]$/g, '');
+    return { toolName: 'workspace.write_file', args: { path: p, content } };
+  }
+
+  const mkdir = cleaned.match(/^(?:please\s+)?(?:create|make)\s+(?:directory|folder)\s+([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
+  if (mkdir) return { toolName: 'workspace.mkdir', args: { path: String(mkdir[1] || '').trim() } };
+
+  const read = cleaned.match(/^(?:please\s+)?(?:read|show)\s+(?:file\s+)?([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
+  if (read) return { toolName: 'workspace.read_file', args: { path: String(read[1] || '').trim() } };
+
+  const del = cleaned.match(/^(?:please\s+)?(?:delete|remove)\s+(?:file\s+|folder\s+|directory\s+)?([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
+  if (del) return { toolName: 'workspace.delete', args: { path: String(del[1] || '').trim() } };
+
+  if (/^(?:please\s+)?list\s+files\s+in\s+(?:my\s+|his\s+|alex(?:'s)?\s+)?(?:workspace|working\s+directory)$/i.test(cleaned)
+      || /^(?:please\s+)?list\s+(?:my\s+|his\s+|alex(?:'s)?\s+)?workspace\s+files$/i.test(cleaned)) {
+    return { toolName: 'workspace.list', args: { path: '.' } };
+  }
+
+  const list = cleaned.match(/^(?:please\s+)?list\s+(?:dir|directory|folder)\s+([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
+  if (list) return { toolName: 'workspace.list', args: { path: String(list[1] || '').trim() } };
+
+  return null;
 }
 
 function isCanvasWriteToolName(name) {
@@ -758,6 +1423,7 @@ function internalCanvasWrite(db, { args, sessionId, messageId }) {
 function getWorkdir() {
   const root = getWorkspaceRoot();
   fs.mkdirSync(root, { recursive: true });
+  ensureAlexWorkdir(root);
   return root;
 }
 
@@ -774,6 +1440,31 @@ function sanitizeUploadFilename(name) {
   return safe || 'upload.bin';
 }
 
+function resolveFilesystemTarget(workspaceRoot, targetPath) {
+  const base = path.resolve(String(workspaceRoot || getWorkspaceRootReal()));
+  const raw = String(targetPath || '.').trim() || '.';
+  const lexical = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(base, raw);
+  if (fs.existsSync(lexical)) {
+    try {
+      return fs.realpathSync.native(lexical);
+    } catch {
+      return lexical;
+    }
+  }
+  let cur = path.dirname(lexical);
+  while (true) {
+    if (fs.existsSync(cur)) {
+      let parentReal = cur;
+      try { parentReal = fs.realpathSync.native(cur); } catch {}
+      return path.resolve(parentReal, path.basename(lexical));
+    }
+    const next = path.dirname(cur);
+    if (next === cur) break;
+    cur = next;
+  }
+  return lexical;
+}
+
 function resolveWorkspacePath(workdir, targetPath) {
   const raw = String(targetPath || '.').trim() || '.';
   const resolved = path.resolve(workdir, raw);
@@ -784,6 +1475,30 @@ function resolveWorkspacePath(workdir, targetPath) {
     throw err;
   }
   return resolved;
+}
+
+function normalizePathGrantInput(workdir, inputPath) {
+  const workspaceRoot = path.resolve(String(workdir || getWorkspaceRootReal()));
+  const abs = resolveFilesystemTarget(workspaceRoot, inputPath);
+  const inside = isInsideWorkspaceRoot(abs);
+  return {
+    abs,
+    inside_workspace: inside,
+    rel: inside ? (path.relative(workspaceRoot, abs).replace(/\\/g, '/') || '.') : null,
+  };
+}
+
+function pathGrantMatches(absPath, prefixPath) {
+  const rel = path.relative(prefixPath, absPath);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function pathActionForTool(toolName) {
+  if (toolName === 'workspace.list' || toolName === 'workspace.read_file') return 'read';
+  if (toolName === 'workspace.write_file' || toolName === 'workspace.mkdir') return 'write';
+  if (toolName === 'workspace.delete') return 'delete';
+  if (toolName === 'workspace.exec_shell' || toolName === 'workspace.exec') return 'exec';
+  return null;
 }
 
 function getMainDbFilePath(db) {
@@ -988,6 +1703,14 @@ const TOOL_REGISTRY = {
     requiresApproval: true,
     description: 'Writes a file under PB_WORKDIR.',
   },
+  'workspace.mkdir': {
+    id: 'workspace.mkdir',
+    source_type: 'builtin',
+    label: 'Create Workspace Directory',
+    risk: 'medium',
+    requiresApproval: false,
+    description: 'Creates a directory under PB_WORKDIR.',
+  },
   'workspace.delete': {
     id: 'workspace.delete',
     source_type: 'builtin',
@@ -995,6 +1718,14 @@ const TOOL_REGISTRY = {
     risk: 'high',
     requiresApproval: true,
     description: 'Deletes files or folders under PB_WORKDIR.',
+  },
+  'workspace.exec_shell': {
+    id: 'workspace.exec_shell',
+    source_type: 'builtin',
+    label: 'Execute Shell Command',
+    risk: 'high',
+    requiresApproval: true,
+    description: 'Runs a shell command with an optional cwd and timeout.',
   },
   'uploads.list': {
     id: 'uploads.list',
@@ -1100,19 +1831,661 @@ const TOOL_REGISTRY = {
     requiresApproval: true,
     description: 'Deletes scratch/summary/redacted files for a specific day. Requires typed confirmation.',
   },
+  'scratch.write': {
+    id: 'scratch.write',
+    source_type: 'builtin',
+    label: 'Scratch Write',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Writes scratch key/value for agent workspace planning.',
+  },
+  'scratch.read': {
+    id: 'scratch.read',
+    source_type: 'builtin',
+    label: 'Scratch Read',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Reads scratch key/value for agent workspace planning.',
+  },
+  'scratch.list': {
+    id: 'scratch.list',
+    source_type: 'builtin',
+    label: 'Scratch List',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Lists scratch keys and timestamps.',
+  },
+  'scratch.clear': {
+    id: 'scratch.clear',
+    source_type: 'builtin',
+    label: 'Scratch Clear',
+    risk: 'medium',
+    requiresApproval: true,
+    description: 'Clears scratch keys for current scope.',
+  },
 };
 
+
+function getMcpToolSchema(capabilities = []) {
+  const caps = Array.isArray(capabilities) ? capabilities.map((c) => String(c || '').trim()) : [];
+  const has = (c) => caps.includes(String(c));
+  const defs = [];
+  if (has('browser.search')) {
+    defs.push({
+      type: 'function',
+      function: {
+        name: 'mcp.browser.search',
+        description: 'Search the web using MCP browser server and return URLs/snippets.',
+        parameters: {
+          type: 'object',
+          properties: {
+            q: { type: 'string', description: 'Search query.' },
+            limit: { type: 'number', description: 'Max results (1-10).' },
+          },
+          required: ['q'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('browser.extract_text') || has('browser.open_url')) {
+    defs.push({
+      type: 'function',
+      function: {
+        name: 'mcp.browser.extract_text',
+        description: 'Fetch and extract readable text from a URL using MCP browser server.',
+        parameters: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'HTTP/HTTPS URL.' },
+            max_chars: { type: 'number', description: 'Extraction cap.' },
+          },
+          required: ['url'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('resolve-library-id')) {
+    defs.push({
+      type: 'function',
+      function: {
+        name: 'resolve-library-id',
+        description: 'Resolve a docs library name/query to canonical Context7 library IDs.',
+        parameters: {
+          type: 'object',
+          properties: {
+            libraryName: { type: 'string', description: 'Library name, e.g. next.js.' },
+            query: { type: 'string', description: 'Optional refinement query.' },
+          },
+          required: ['libraryName'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('query-docs')) {
+    defs.push({
+      type: 'function',
+      function: {
+        name: 'query-docs',
+        description: 'Fetch concise version-specific docs/snippets from Context7 for a library ID.',
+        parameters: {
+          type: 'object',
+          properties: {
+            libraryId: { type: 'string', description: 'Canonical library ID from resolve-library-id.' },
+            query: { type: 'string', description: 'Question to query docs for.' },
+          },
+          required: ['libraryId', 'query'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  return defs;
+}
+
+export function __test_getMcpToolSchema(capabilities = []) {
+  return getMcpToolSchema(capabilities);
+}
+
+
+function getOpenAiToolSchema() {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.writeFile',
+        description: 'Create or overwrite a text file in workspace/home.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative or absolute file path.' },
+            content: { type: 'string', description: 'UTF-8 text content to write.' },
+          },
+          required: ['path', 'content'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.readFile',
+        description: 'Read a text file from workspace/home.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+            maxBytes: { type: 'number' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.listDir',
+        description: 'List files and directories in a path.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Directory path. Defaults to workspace root.' },
+          },
+          required: [],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.mkdir',
+        description: 'Create a directory path.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.proc.exec',
+        description: 'Execute a shell command in a working directory.',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+            cwd: { type: 'string' },
+            timeoutMs: { type: 'number' },
+          },
+          required: ['command'],
+          additionalProperties: false,
+        },
+      },
+    },
+  ];
+}
+
 const ACCESS_MODES = ['blocked', 'allowed', 'allowed_with_approval'];
+const APPROVAL_MODEL_KEY = 'approvals.model_v1';
+const GRANT_MAX_DURATION_DEFAULT_SEC = 8 * 60 * 60;
+
+function defaultApprovalModelV1() {
+  return {
+    version: 1,
+    run_mode: 'ask_risky', // ask_everything | ask_once_per_job | ask_risky
+    preset: 'overnight_standard',
+    tier_b_enabled: true,
+    tier_b_max_duration_sec: GRANT_MAX_DURATION_DEFAULT_SEC,
+    localhost_auto_allow: true,
+    updated_at: nowIso(),
+  };
+}
+
+function normalizeRunMode(v) {
+  const s = String(v || '').trim();
+  if (s === 'ask_everything' || s === 'ask_once_per_job' || s === 'ask_risky') return s;
+  return null;
+}
+
+function normalizeApprovalModelV1(raw) {
+  const base = defaultApprovalModelV1();
+  if (!raw || typeof raw !== 'object') return base;
+  const mode = normalizeRunMode(raw.run_mode) || base.run_mode;
+  const preset = String(raw.preset || base.preset || '').trim() || base.preset;
+  const presetTierBEnabled = preset === 'overnight_safe' ? false : true;
+  const tierBEnabled = raw.tier_b_enabled === undefined
+    ? presetTierBEnabled
+    : Boolean(raw.tier_b_enabled);
+  const maxDur = Math.max(300, Math.min(24 * 60 * 60, Number(raw.tier_b_max_duration_sec || base.tier_b_max_duration_sec) || base.tier_b_max_duration_sec));
+  return {
+    version: 1,
+    run_mode: mode,
+    preset,
+    tier_b_enabled: tierBEnabled,
+    tier_b_max_duration_sec: maxDur,
+    localhost_auto_allow: raw.localhost_auto_allow !== false,
+    updated_at: String(raw.updated_at || '').trim() || nowIso(),
+  };
+}
+
+function getApprovalModelV1(db) {
+  const current = kvGet(db, APPROVAL_MODEL_KEY, null);
+  const normalized = normalizeApprovalModelV1(current);
+  try {
+    const same = current && JSON.stringify(current) === JSON.stringify(normalized);
+    if (!same) kvSet(db, APPROVAL_MODEL_KEY, normalized);
+  } catch {
+    if (!current) kvSet(db, APPROVAL_MODEL_KEY, normalized);
+  }
+  return normalized;
+}
+
+function setApprovalModelV1(db, model) {
+  const normalized = normalizeApprovalModelV1({ ...model, updated_at: nowIso() });
+  kvSet(db, APPROVAL_MODEL_KEY, normalized);
+  return normalized;
+}
+
+function isLocalhostUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return false;
+  try {
+    const u = new URL(s);
+    const host = String(u.hostname || '').toLowerCase();
+    return (u.protocol === 'http:' || u.protocol === 'https:') && (host === '127.0.0.1' || host === 'localhost');
+  } catch {
+    return false;
+  }
+}
+
+function classifyWorkspaceTier(toolName, args = {}) {
+  const workdir = getWorkdir();
+  const alexRoot = ensureAlexWorkdir(workdir);
+  const requestedPath = String(args?.path || '.').trim() || '.';
+  const targetAbs = path.resolve(workdir, requestedPath);
+  const workspaceCheck = inspectPathContainment(workdir, targetAbs);
+  if (!workspaceCheck.inside) return 'C';
+
+  const alexCheck = inspectPathContainment(alexRoot, targetAbs);
+  if (alexCheck.escapedBySymlink) return 'C';
+
+  const isReadOp = toolName === 'workspace.read_file' || toolName === 'workspace.list';
+  const isWriteOp = toolName === 'workspace.write_file' || toolName === 'workspace.mkdir' || toolName === 'workspace.delete';
+
+  if (alexCheck.inside) return 'A';
+  if (isReadOp) return 'B';
+  if (isWriteOp) return 'C';
+  return 'C';
+}
+
+function isPathInsideAlexSandbox(args = {}) {
+  try {
+    const workdir = getWorkdir();
+    const alexRoot = ensureAlexWorkdir(workdir);
+    const requestedPath = String(args?.path || '.').trim() || '.';
+    const abs = path.resolve(workdir, requestedPath);
+    const workspaceCheck = inspectPathContainment(workdir, abs);
+    if (!workspaceCheck.inside) return false;
+    const alexCheck = inspectPathContainment(alexRoot, abs);
+    if (alexCheck.escapedBySymlink) return false;
+    return Boolean(alexCheck.inside);
+  } catch {
+    return false;
+  }
+}
+
+function classifyToolTier(toolName, args = {}) {
+  const t = String(toolName || '').trim();
+  if (!t) return 'C';
+
+  if (t === 'workspace.list' || t === 'workspace.read_file' || t === 'workspace.write_file' || t === 'workspace.mkdir' || t === 'workspace.delete') {
+    return classifyWorkspaceTier(t, args);
+  }
+
+  if (
+    t === 'memory.delete_day' ||
+    t === 'workspace.exec_shell' ||
+    t === 'workspace.exec' ||
+    t.includes('credential') ||
+    t.includes('ssh')
+  ) {
+    return 'C';
+  }
+
+  if (t === 'memory.apply_durable_patch' || t === 'workspace.write_file' || t === 'workspace.mkdir' || t === 'scratch.clear') {
+    return 'B';
+  }
+  if (t.startsWith('scratch.')) return 'A';
+
+  if (t === 'workspace.read_file' || t === 'workspace.list' || t.startsWith('memory.') || t.startsWith('uploads.') || t === 'system.echo') {
+    return 'A';
+  }
+
+  if (typeof args?.url === 'string') {
+    if (isLocalhostUrl(args.url)) return 'A';
+    return 'C';
+  }
+
+  return 'B';
+}
+
+function proposalJobId(sessionId, messageId) {
+  const s = String(sessionId || '').trim();
+  const m = String(messageId || '').trim();
+  return m || s || null;
+}
+
+function grantIsActive(row, nowIsoValue = nowIso()) {
+  if (!row) return false;
+  if (String(row.status || '') !== 'active') return false;
+  const exp = String(row.expires_at || '').trim();
+  if (!exp) return false;
+  return new Date(exp).getTime() > new Date(nowIsoValue).getTime();
+}
+
+function getWorkspaceRootReal() {
+  const root = path.resolve(getWorkdir());
+  try {
+    return fs.realpathSync.native(root);
+  } catch {
+    return root;
+  }
+}
+
+function getHomeRootReal() {
+  const home = path.resolve(os.homedir());
+  try {
+    return fs.realpathSync.native(home);
+  } catch {
+    return home;
+  }
+}
+
+function getAllowedRootsReal() {
+  return {
+    workspace: getWorkspaceRootReal(),
+    home: getHomeRootReal(),
+  };
+}
+
+function resolveTargetPathForPolicy(rawPath, workspaceRoot = null) {
+  const root = workspaceRoot ? path.resolve(String(workspaceRoot)) : getWorkspaceRootReal();
+  return resolveFilesystemTarget(root, rawPath);
+}
+
+function isPathInsideRoot(absPath, rootAbs) {
+  const target = resolveTargetPathForPolicy(absPath, rootAbs);
+  const rel = path.relative(rootAbs, target);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function isInsideWorkspaceRoot(absPath) {
+  return isPathInsideRoot(absPath, getWorkspaceRootReal());
+}
+
+function isInsideAllowedRoots(absPath) {
+  const roots = getAllowedRootsReal();
+  return isPathInsideRoot(absPath, roots.workspace) || isPathInsideRoot(absPath, roots.home);
+}
+
+function authorizePath(op, targetPath, { create = false } = {}) {
+  const roots = getAllowedRootsReal();
+  const resolved = resolveTargetPathForPolicy(targetPath, roots.workspace);
+  const insideWorkspace = isPathInsideRoot(resolved, roots.workspace);
+  const insideHome = isPathInsideRoot(resolved, roots.home);
+  if (insideWorkspace || insideHome) {
+    return {
+      allowed: true,
+      requiresApproval: false,
+      targetPath: resolved,
+      insideWorkspace,
+      insideHome,
+      create,
+      reason: insideWorkspace ? 'Inside WORKSPACE_ROOT.' : 'Inside HOME_ROOT.',
+    };
+  }
+  return {
+    allowed: true,
+    requiresApproval: true,
+    targetPath: resolved,
+    insideWorkspace: false,
+    insideHome: false,
+    create,
+    reason: `Outside allowed roots requires approval: ${resolved}`,
+  };
+}
+
+function consumeOnceGrant(db, grantId) {
+  if (!grantId || !hasTable(db, 'capability_grants')) return;
+  const row = db.prepare('SELECT limits_json FROM capability_grants WHERE id = ?').get(String(grantId));
+  if (!row) return;
+  const limits = safeJsonParse(row.limits_json || '{}', {});
+  const scope = String(limits?.grant_scope || '').trim();
+  if (scope !== 'once') return;
+  const remaining = Number(limits?.uses_remaining || 0);
+  const next = Math.max(0, remaining - 1);
+  const nextLimits = { ...limits, uses_remaining: next };
+  if (next <= 0) {
+    db.prepare("UPDATE capability_grants SET status = 'expired', expires_at = ?, limits_json = ? WHERE id = ?").run(nowIso(), JSON.stringify(nextLimits), String(grantId));
+  } else {
+    db.prepare('UPDATE capability_grants SET limits_json = ? WHERE id = ?').run(JSON.stringify(nextLimits), String(grantId));
+  }
+}
+
+function findActiveGrant(db, { jobId, tier, toolName }) {
+  if (!hasTable(db, 'capability_grants')) return null;
+  const now = nowIso();
+  const rows = db.prepare(`
+    SELECT *
+    FROM capability_grants
+    WHERE status = 'active'
+      AND tier = ?
+      AND (
+        (scope_type = 'tool' AND scope_value = ?)
+        OR (scope_type = 'job' AND scope_value = '*')
+      )
+      AND datetime(expires_at) > datetime(?)
+      AND (job_id = ? OR (? IS NULL AND job_id IS NULL))
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).all(String(tier), String(toolName), now, jobId || null, jobId || null);
+  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+}
+
+function findActivePathGrant(db, { absPath, action, jobId = null, sessionId = null }) {
+  if (!hasTable(db, 'capability_grants')) return null;
+  if (!absPath || !action) return null;
+  const now = nowIso();
+  const rows = db.prepare(`
+    SELECT *
+    FROM capability_grants
+    WHERE status = 'active'
+      AND tier = 'B'
+      AND scope_type = 'path_prefix'
+      AND datetime(expires_at) > datetime(?)
+    ORDER BY created_at DESC
+    LIMIT 500
+  `).all(now);
+
+  for (const row of rows) {
+    if (!grantIsActive(row, now)) continue;
+    const prefix = String(row.scope_value || '').trim();
+    if (!prefix) continue;
+    if (!pathGrantMatches(absPath, prefix)) continue;
+
+    const actions = safeJsonParse(row.actions_json || '[]', []);
+    if (!Array.isArray(actions)) continue;
+    if (!actions.includes(action)) continue;
+
+    const limits = safeJsonParse(row.limits_json || '{}', {});
+    const scope = String(limits?.grant_scope || '').trim() || 'session';
+
+    if (scope === 'once') {
+      return row;
+    }
+    if (scope === 'session') {
+      if (sessionId && row.session_id && String(row.session_id) === String(sessionId)) return row;
+      continue;
+    }
+    if (scope === 'project') {
+      const projectId = String(limits?.project_id || '').trim();
+      if (!projectId) return row;
+      if (jobId && String(jobId) === projectId) return row;
+      continue;
+    }
+
+    if (
+      (row.job_id && jobId && String(row.job_id) === String(jobId)) ||
+      (row.session_id && sessionId && String(row.session_id) === String(sessionId))
+    ) {
+      return row;
+    }
+  }
+  return null;
+}
+
+function insertCapabilityGrant(db, grant) {
+  if (!hasTable(db, 'capability_grants')) return null;
+  const id = newId('grant');
+  db.prepare(`
+    INSERT INTO capability_grants
+      (id, approval_id, job_id, session_id, message_id, tier, scope_type, scope_value, actions_json, limits_json, created_at, expires_at, granted_by, reason, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+  `).run(
+    id,
+    grant.approval_id || null,
+    grant.job_id || null,
+    grant.session_id || null,
+    grant.message_id || null,
+    String(grant.tier || 'B'),
+    String(grant.scope_type || 'tool'),
+    String(grant.scope_value || ''),
+    JSON.stringify(Array.isArray(grant.actions) ? grant.actions : ['invoke']),
+    JSON.stringify(grant.limits || {}),
+    String(grant.created_at || nowIso()),
+    String(grant.expires_at || nowIso()),
+    grant.granted_by || null,
+    grant.reason || null,
+  );
+  return id;
+}
+
+function insertApprovalRequestRecord(db, rec) {
+  if (!hasTable(db, 'approval_requests')) return null;
+  const id = newId('areq');
+  db.prepare(`
+    INSERT INTO approval_requests
+      (id, approval_id, job_id, tier, requested_action_summary, proposed_grant_json, why, status, created_at, resolved_at, resolved_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+  `).run(
+    id,
+    rec.approval_id || null,
+    rec.job_id || null,
+    String(rec.tier || 'C'),
+    String(rec.requested_action_summary || ''),
+    JSON.stringify(rec.proposed_grant || {}),
+    rec.why || null,
+    String(rec.status || 'pending'),
+    String(rec.created_at || nowIso()),
+  );
+  return id;
+}
+
+function resolveApprovalRequestRecord(db, approvalId, status, resolvedBy = null) {
+  if (!hasTable(db, 'approval_requests')) return;
+  db.prepare(`
+    UPDATE approval_requests
+    SET status = ?, resolved_at = ?, resolved_by = ?
+    WHERE approval_id = ? AND status = 'pending'
+  `).run(String(status), nowIso(), resolvedBy || null, Number(approvalId));
+}
+
+function evaluateTieredAccess(db, { toolDef, toolName, args, sessionId, messageId }) {
+  const jobId = proposalJobId(sessionId, messageId);
+  const payload = args && typeof args === 'object' ? args : {};
+
+  if (isBareBonesMode()) {
+    return { allowed: true, requiresApproval: false, mode: 'allowed', tier: 'A', reason: 'BARE_BONES_MODE: approvals disabled.', jobId, grant: null };
+  }
+
+  const actionFor = (key) => {
+    if (key === 'cwd') return 'exec';
+    if (key === 'path') return pathActionForTool(toolName) || 'read';
+    if (['output', 'output_path', 'out', 'to', 'dst', 'dest', 'destination', 'target', 'target_path'].includes(key)) return 'write';
+    if (['delete_path', 'remove_path'].includes(key)) return 'delete';
+    return pathActionForTool(toolName) || 'read';
+  };
+
+  const pathCandidates = [];
+  const pathKeys = ['path', 'cwd', 'output', 'output_path', 'out', 'to', 'dst', 'dest', 'destination', 'target', 'target_path', 'file', 'file_path', 'dir', 'directory', 'input', 'input_path', 'src', 'from', 'delete_path', 'remove_path'];
+  for (const key of pathKeys) {
+    if (typeof payload?.[key] === 'string' && String(payload[key]).trim()) {
+      pathCandidates.push({ key, value: String(payload[key]), action: actionFor(key) });
+    }
+  }
+  if (pathCandidates.length === 0 && (toolName === 'workspace.list' || toolName === 'workspace.read_file' || toolName === 'workspace.write_file' || toolName === 'workspace.mkdir' || toolName === 'workspace.delete')) {
+    pathCandidates.push({ key: 'path', value: String(payload?.path || '.'), action: pathActionForTool(toolName) || 'read' });
+  }
+
+  for (const candidate of pathCandidates) {
+    try {
+      const auth = authorizePath(candidate.action, candidate.value, { create: candidate.action === 'write' || candidate.action === 'mkdir' });
+      if (!auth.requiresApproval) continue;
+
+      const pathGrant = findActivePathGrant(db, { absPath: auth.targetPath, action: candidate.action, jobId, sessionId: sessionId || null });
+      if (pathGrant) {
+        consumeOnceGrant(db, pathGrant.id);
+        continue;
+      }
+
+      return {
+        allowed: true,
+        requiresApproval: true,
+        mode: 'allowed_with_approval',
+        tier: 'B',
+        reason: auth.reason,
+        jobId,
+        grant: null,
+        targetPath: auth.targetPath,
+        action: candidate.action,
+        outside_paths: [{ key: candidate.key, path: auth.targetPath, action: candidate.action }],
+      };
+    } catch (e) {
+      return {
+        allowed: false,
+        requiresApproval: false,
+        mode: 'blocked',
+        tier: 'C',
+        reason: `Path validation failed: ${String(e?.message || e)}`,
+        jobId,
+        grant: null,
+      };
+    }
+  }
+
+  return { allowed: true, requiresApproval: false, mode: 'allowed', tier: 'A', reason: 'Allowed roots check passed.', jobId, grant: null };
+}
 
 function defaultPolicyV2() {
+
+
   return {
     version: 2,
-    global_default: 'blocked',
+    global_default: 'allowed',
     per_risk: {
-      low: 'blocked',
-      medium: 'blocked',
-      high: 'blocked',
-      critical: 'blocked',
+      low: 'allowed',
+      medium: 'allowed',
+      high: 'allowed',
+      critical: 'allowed',
     },
     per_tool: {},
     provider_overrides: {},
@@ -1183,6 +2556,16 @@ function setPolicyV2(db, policy) {
 }
 
 function effectiveAccessForTool(policy, toolDef) {
+  const securityMode = getSecurityMode();
+  if (securityMode === 'off') {
+    return {
+      allowed: true,
+      requiresApproval: false,
+      mode: 'allowed',
+      reason: 'SECURITY_MODE=off',
+    };
+  }
+
   if (MEMORY_ALWAYS_ALLOWED_TOOLS.has(String(toolDef?.id || ''))) {
     return {
       allowed: true,
@@ -1216,7 +2599,8 @@ function effectiveAccessForTool(policy, toolDef) {
   return { allowed, requiresApproval, mode, reason };
 }
 
-async function executeRegisteredTool({ toolName, args, workdir, db, sessionId }) {
+async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, signal = null }) {
+  const toDisplayPath = (absPath) => (isInsideWorkspaceRoot(absPath) ? (path.relative(workdir, absPath) || '.') : absPath);
   if (toolName === 'system.echo') {
     return {
       stdout: String(args?.text || args?.input || ''),
@@ -1233,7 +2617,7 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId })
     return {
       stdout: `Listed ${items.length} entries`,
       stderr: '',
-      result: { path: path.relative(workdir, dir) || '.', items },
+      result: { path: toDisplayPath(dir), abs_path: dir, items },
       artifacts: [],
     };
   }
@@ -1246,7 +2630,7 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId })
     return {
       stdout: `Read ${Math.min(text.length, maxBytes)} bytes`,
       stderr: '',
-      result: { path: path.relative(workdir, file), content: sliced, truncated: text.length > maxBytes },
+      result: { path: toDisplayPath(file), abs_path: file, content: sliced, truncated: text.length > maxBytes },
       artifacts: [],
     };
   }
@@ -1259,15 +2643,96 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId })
     return {
       stdout: `Wrote ${Buffer.byteLength(content, 'utf8')} bytes`,
       stderr: '',
-      result: { path: path.relative(workdir, file), bytes: Buffer.byteLength(content, 'utf8') },
-      artifacts: [{ type: 'file', path: path.relative(workdir, file) }],
+      result: { path: toDisplayPath(file), abs_path: file, bytes: Buffer.byteLength(content, 'utf8') },
+      artifacts: [{ type: 'file', path: toDisplayPath(file) }],
+    };
+  }
+
+  if (toolName === 'workspace.mkdir') {
+    const dir = resolveWorkspacePath(workdir, args?.path || '.');
+    await fsp.mkdir(dir, { recursive: true });
+    return {
+      stdout: `Created directory ${path.relative(workdir, dir) || '.'}`,
+      stderr: '',
+      result: { path: path.relative(workdir, dir) || '.', created: true },
+      artifacts: [{ type: 'dir', path: path.relative(workdir, dir) || '.' }],
+    };
+  }
+
+  if (toolName === 'workspace.exec_shell') {
+    const command = String(args?.command || args?.input || '').trim();
+    if (!command) {
+      const err = new Error('command is required');
+      err.code = 'EXEC_COMMAND_REQUIRED';
+      throw err;
+    }
+    const cwd = resolveWorkspacePath(workdir, args?.cwd || '.');
+    const timeoutMs = Math.max(1000, Math.min(Number(args?.timeoutMs || 120000) || 120000, 900000));
+    const shell = process.env.SHELL || '/bin/bash';
+    const started = Date.now();
+
+    const out = await new Promise((resolve, reject) => {
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      const child = spawn(shell, ['-lc', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+
+      const done = (fn, val) => {
+        if (settled) return;
+        settled = true;
+        fn(val);
+      };
+
+      const timer = setTimeout(() => {
+        try { child.kill('SIGTERM'); } catch {}
+        const err = new Error(`Command timed out after ${timeoutMs}ms`);
+        err.code = 'EXEC_TIMEOUT';
+        done(reject, err);
+      }, timeoutMs);
+
+      const onAbort = () => {
+        try { child.kill('SIGTERM'); } catch {}
+        const err = new Error('Command canceled by client');
+        err.code = 'CLIENT_ABORTED';
+        done(reject, err);
+      };
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      child.stdout.on('data', (d) => { stdout += String(d || ''); if (stdout.length > 500000) stdout = stdout.slice(-500000); });
+      child.stderr.on('data', (d) => { stderr += String(d || ''); if (stderr.length > 500000) stderr = stderr.slice(-500000); });
+      child.on('error', (e) => done(reject, e));
+      child.on('close', (code, sig) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        clearTimeout(timer);
+        if (code === 0) return done(resolve, { code, signal: sig, stdout, stderr });
+        const err = new Error(`Command failed with exit code ${code}${sig ? ` (signal ${sig})` : ''}`);
+        err.code = 'EXEC_FAILED';
+        err.detail = { code, signal: sig, stdout: stdout.slice(-2000), stderr: stderr.slice(-2000) };
+        done(reject, err);
+      });
+    });
+
+    return {
+      stdout: String(out.stdout || ''),
+      stderr: String(out.stderr || ''),
+      result: {
+        cwd: toDisplayPath(cwd),
+        abs_cwd: cwd,
+        command,
+        duration_ms: Date.now() - started,
+        exit_code: Number(out.code || 0),
+      },
+      artifacts: [],
     };
   }
 
   if (toolName === 'workspace.delete') {
     const target = resolveWorkspacePath(workdir, args?.path);
-    const rel = path.relative(workdir, target) || '.';
-    if (rel === '.' || rel === '') {
+    const rel = toDisplayPath(target);
+    if (target === getWorkspaceRootReal()) {
       const err = new Error('Deleting workspace root is not allowed.');
       err.code = 'WORKSPACE_DELETE_ROOT';
       throw err;
@@ -1282,9 +2747,50 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId })
     return {
       stdout: `Deleted ${stat.isDirectory() ? 'directory' : 'file'} ${rel}`,
       stderr: '',
-      result: { path: rel, kind: stat.isDirectory() ? 'dir' : 'file', deleted: true },
+      result: { path: rel, abs_path: target, kind: stat.isDirectory() ? 'dir' : 'file', deleted: true },
       artifacts: [],
     };
+  }
+
+  if (toolName === 'scratch.write') {
+    const out = await scratchWrite({
+      key: args?.key,
+      content: args?.content ?? '',
+      agentId: String(args?.agent_id || 'alex'),
+      projectId: String(args?.project_id || 'default'),
+      persist: Boolean(args?.persist),
+      sessionId: String(args?.session_id || sessionId || 'default'),
+    });
+    return { stdout: `scratch.write ${out.key}`, stderr: '', result: out, artifacts: [] };
+  }
+
+  if (toolName === 'scratch.read') {
+    const out = await scratchRead({
+      key: args?.key,
+      agentId: String(args?.agent_id || 'alex'),
+      projectId: String(args?.project_id || 'default'),
+      sessionId: String(args?.session_id || sessionId || 'default'),
+    });
+    return { stdout: `scratch.read ${out.key}`, stderr: '', result: out, artifacts: [] };
+  }
+
+  if (toolName === 'scratch.list') {
+    const out = await scratchList({
+      agentId: String(args?.agent_id || 'alex'),
+      projectId: String(args?.project_id || 'default'),
+      sessionId: String(args?.session_id || sessionId || 'default'),
+    });
+    return { stdout: `scratch.list ${Array.isArray(out.items) ? out.items.length : 0}`, stderr: '', result: out, artifacts: [] };
+  }
+
+  if (toolName === 'scratch.clear') {
+    const out = await scratchClear({
+      agentId: String(args?.agent_id || 'alex'),
+      projectId: String(args?.project_id || 'default'),
+      sessionId: String(args?.session_id || sessionId || 'default'),
+      includePersistent: Boolean(args?.include_persistent),
+    });
+    return { stdout: `scratch.clear ${Number(out.removed || 0)}`, stderr: '', result: out, artifacts: [] };
   }
 
   if (toolName === 'uploads.list') {
@@ -1362,13 +2868,28 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId })
   if (toolName === 'memory.write_scratch' || toolName === 'memory.append') {
     const day = String(args?.day || getLocalDayKey());
     const text = String(args?.text ?? args?.content ?? '');
-    const out = await appendScratchSafe(text, { day, root: workdir });
-    recordEvent(db, 'memory.write_scratch', { day, bytes: out.bytes_appended, via: 'tool' });
+    const sid = String(sessionId || args?.session_id || 'webchat-default').trim() || 'webchat-default';
+    const draft = createMemoryDraft(db, {
+      content: text,
+      kind: 'note',
+      title: String(args?.title || '').trim() || null,
+      tags: Array.isArray(args?.tags) ? args.tags : [],
+      sourceSessionId: sid,
+      workspaceId: workdir,
+      meta: { day, via: 'tool' },
+    });
+    recordEvent(db, 'memory.draft_created', { id: draft.id, day, via: 'tool', session_id: sid });
     return {
-      stdout: `Scratch memory appended for ${day}`,
+      stdout: `Saved as draft memory for ${day}. Commit required before archive/search/context use.`,
       stderr: '',
-      result: out,
-      artifacts: [{ type: 'file', path: path.relative(workdir, out.path) }],
+      result: {
+        verified: true,
+        state: 'draft',
+        draft_id: draft.id,
+        day,
+        message: 'Saved as draft. You can commit it from Memory panel or close guard.',
+      },
+      artifacts: [],
     };
   }
 
@@ -1411,47 +2932,42 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId })
       err.code = 'MEMORY_Q_REQUIRED';
       throw err;
     }
-    const root = workdir;
-    const scope = String(args?.scope || 'daily+durable');
+    const scope = String(args?.scope || 'committed');
     const limit = Math.max(1, Math.min(Number(args?.limit || 50) || 50, 200));
-    const files = [];
-    const day = getLocalDayKey();
-    if (scope.includes('daily') || scope === 'all' || scope === 'daily+durable') {
-      files.push(`.pb/memory/daily/${day}.summary.md`, `.pb/memory/daily/${day}.scratch.md`);
-    }
-    if (scope.includes('durable') || scope === 'all' || scope === 'daily+durable') {
-      files.push('MEMORY.md');
-    }
-    if (scope.includes('archive') || scope === 'all') {
-      const archiveDir = path.join(root, 'MEMORY_ARCHIVE');
-      const names = await fsp.readdir(archiveDir).catch(() => []);
-      for (const n of names.filter((n) => n.endsWith('.md')).slice(-24)) files.push(path.join('MEMORY_ARCHIVE', n).replace(/\\/g, '/'));
-    }
-    const needle = q.toLowerCase();
+    recordEvent(db, 'security.memory.search.request', {
+      via: 'tool',
+      session_id: sessionId || null,
+      scope,
+      limit,
+      query_present: true,
+    });
+
+    const out = searchMemoryEntries(db, { q, limit, state: 'committed' });
     const groups = {};
-    let count = 0;
-    for (const rel of files) {
-      const content = await readTextSafe(rel, { mode: 'tail', maxBytes: 256 * 1024, root, redact: true }).catch(() => '');
-      if (!content) continue;
-      const lines = content.split('\n');
-      for (let i = 0; i < lines.length; i += 1) {
-        const line = lines[i];
-        if (!line.toLowerCase().includes(needle)) continue;
-        const type = rel.startsWith('.pb/memory/daily/') ? 'daily' : (rel.startsWith('MEMORY_ARCHIVE/') ? 'archive' : 'durable');
-        if (!groups[type]) groups[type] = [];
-        groups[type].push({ path: rel, line: i + 1, snippet: line.slice(0, 240) });
-        count += 1;
-        if (count >= limit) break;
+    for (const g of out.groups || []) {
+      for (const entry of g.entries || []) {
+        if (!groups.committed) groups.committed = [];
+        groups.committed.push({
+          path: `memory_entries:${entry.id}`,
+          line: 1,
+          snippet: String(entry.snippet || entry.content || '').slice(0, 240),
+          id: entry.id,
+          day: entry.day,
+          ts: entry.ts,
+          kind: entry.kind,
+        });
       }
-      if (count >= limit) break;
     }
+    const count = Number(out.total || 0);
+    recordEvent(db, 'memory.search', { scope: 'committed', q: '[set]', returned: count, limit, via: 'tool' });
     return {
-      stdout: `Found ${count} memory matches`,
+      stdout: `Found ${count} committed memory matches`,
       stderr: '',
-      result: { q, scope, count, groups },
+      result: { q, scope: 'committed', count, groups },
       artifacts: [],
     };
   }
+
 
   if (toolName === 'memory.finalize_day' || toolName === 'memory_finalize_day') {
     const day = String(args?.day || getLocalDayKey()).trim();
@@ -1634,6 +3150,10 @@ function toProposalResponse(db, row) {
   const sourceType = String(toolDef.source_type || 'unknown');
   const policy = getPolicyV2(db);
   const eff = effectiveAccessForTool(policy, toolDef);
+  const tier = classifyToolTier(row.tool_name, safeJsonParse(row.args_json, {}));
+  const approvalReq = row.approval_id && hasTable(db, 'approval_requests')
+    ? db.prepare('SELECT * FROM approval_requests WHERE approval_id = ? ORDER BY created_at DESC LIMIT 1').get(row.approval_id)
+    : null;
   const approval = row.approval_id
     ? (db.prepare('SELECT id, status, reason, created_at, resolved_at FROM approvals WHERE id = ?').get(row.approval_id) ||
         db.prepare('SELECT id, status, reason, created_at, resolved_at FROM web_tool_approvals WHERE id = ?').get(row.approval_id))
@@ -1656,6 +3176,10 @@ function toProposalResponse(db, row) {
     created_at: row.created_at,
     effective_access: eff.mode,
     effective_reason: eff.reason,
+    tier,
+    requested_action_summary: approvalReq?.requested_action_summary || null,
+    approval_why: approvalReq?.why || null,
+    proposed_grant: approvalReq ? safeJsonParse(approvalReq.proposed_grant_json || '{}', {}) : null,
   };
 }
 
@@ -1721,6 +3245,56 @@ function createProposal(db, { sessionId, messageId, toolName, args, summary, mcp
     `).run(riskLevel, toolName, proposalId, JSON.stringify(args || {}), sessionId || null, messageId || null, createdAt);
     approvalId = Number(info.lastInsertRowid);
     db.prepare('UPDATE web_tool_proposals SET approval_id = ? WHERE id = ?').run(approvalId, proposalId);
+
+    const approvalModel = getApprovalModelV1(db);
+    const maxDurationSec = approvalModel.tier_b_max_duration_sec || GRANT_MAX_DURATION_DEFAULT_SEC;
+    let proposedGrant = null;
+    if (evalOut.tier === 'B') {
+      if (evalOut.targetPath && evalOut.action) {
+        proposedGrant = {
+          tier: 'B',
+          scope_type: 'path_prefix',
+          scope_value: String(evalOut.targetPath),
+          actions: [String(evalOut.action)],
+          limits: {
+            grant_scope: 'once',
+            uses_remaining: 1,
+            max_duration_sec: maxDurationSec,
+            max_calls: 1,
+            max_bytes: 10485760,
+            rate_limit_per_min: 120,
+          },
+          job_id: evalOut.jobId || null,
+          suggested_scopes: ['once', 'session', 'project'],
+        };
+      } else {
+        const jobScopedGrant = approvalModel.run_mode === 'ask_once_per_job';
+        proposedGrant = {
+          tier: 'B',
+          scope_type: jobScopedGrant ? 'job' : 'tool',
+          scope_value: jobScopedGrant ? '*' : toolName,
+          actions: ['invoke'],
+          limits: {
+            max_duration_sec: maxDurationSec,
+            max_calls: 250,
+            max_bytes: 10485760,
+            rate_limit_per_min: 120,
+          },
+          job_id: evalOut.jobId || null,
+        };
+      }
+    }
+
+    insertApprovalRequestRecord(db, {
+      approval_id: approvalId,
+      job_id: evalOut.jobId || null,
+      tier: evalOut.tier,
+      requested_action_summary: `${toolName} (${evalOut.tier})`,
+      proposed_grant: proposedGrant,
+      why: evalOut.reason || null,
+      status: 'pending',
+      created_at: createdAt,
+    });
   }
 
   pruneWebToolTables(db);
@@ -1796,7 +3370,7 @@ async function runWatchtowerOnce({ db, trigger = 'timer', force = false }) {
     ? db.prepare("SELECT ts, type, details_json FROM events WHERE type LIKE '%error%' ORDER BY id DESC LIMIT 5").all()
     : [];
   const lastDoctor = kvGet(db, 'doctor.last_report', null);
-  const mem = await buildMemoryContext({ root: workspace }).catch(() => ({ text: '' }));
+  const mem = await buildMemoryContextWithArchive({ db, root: workspace }).catch(() => ({ text: '' }));
   const safeStatus = {
     pendingApprovals,
     recentErrors: Array.isArray(recentErrors) ? recentErrors.map((r) => ({ ts: r.ts, type: r.type })) : [],
@@ -2074,10 +3648,20 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/telegram/worker/status', (_req, res) => {
+    const allowlist = telegram && typeof telegram.getAllowlist === 'function' ? telegram.getAllowlist() : [];
+    const pendingCount = Number(db.prepare('SELECT COUNT(1) AS c FROM telegram_pending').get()?.c || 0);
+    const blockedCount = Number(db.prepare('SELECT COUNT(1) AS c FROM telegram_blocked').get()?.c || 0);
     res.json({
       running: Boolean(telegram.state?.running),
       startedAt: telegram.state?.startedAt || null,
       lastError: telegram.state?.lastError || null,
+      lastPollAt: telegram.state?.lastPollAt || null,
+      lastUpdateId: telegram.state?.lastUpdateId ?? null,
+      lastInboundAt: telegram.state?.lastInboundAt || null,
+      allowlist,
+      allowlistCount: Array.isArray(allowlist) ? allowlist.length : 0,
+      pendingCount,
+      blockedCount,
     });
   });
 
@@ -2183,6 +3767,9 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
 
     const merged = rows.map((r) => {
       const meta = approvalUiMeta(r);
+      const reqRow = hasTable(db, 'approval_requests')
+        ? db.prepare('SELECT tier, requested_action_summary, why, proposed_grant_json FROM approval_requests WHERE approval_id = ? ORDER BY created_at DESC LIMIT 1').get(Number(r.id))
+        : null;
       return {
         id: `apr:${r.id}`,
         approval_id: r.id,
@@ -2200,6 +3787,10 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         resolved_at: r.resolved_at || null,
         session_id: r.session_id || null,
         message_id: r.message_id || null,
+        tier: reqRow?.tier || null,
+        requested_action_summary: reqRow?.requested_action_summary || null,
+        why: reqRow?.why || null,
+        proposed_grant: reqRow ? safeJsonParse(reqRow.proposed_grant_json || '{}', {}) : null,
       };
     });
 
@@ -2218,6 +3809,9 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     `).get(Number(parsed.id));
     if (!row) return res.status(404).json({ ok: false, error: 'Approval not found.' });
     const meta = approvalUiMeta(row);
+    const reqRow = hasTable(db, 'approval_requests')
+      ? db.prepare('SELECT tier, requested_action_summary, why, proposed_grant_json FROM approval_requests WHERE approval_id = ? ORDER BY created_at DESC LIMIT 1').get(Number(parsed.id))
+      : null;
     return res.json({
       id: `apr:${row.id}`,
       approval_id: row.id,
@@ -2236,6 +3830,10 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       resolved_at: row.resolved_at || null,
       session_id: row.session_id || null,
       message_id: row.message_id || null,
+      tier: reqRow?.tier || null,
+      requested_action_summary: reqRow?.requested_action_summary || null,
+      why: reqRow?.why || null,
+      proposed_grant: reqRow ? safeJsonParse(reqRow.proposed_grant_json || '{}', {}) : null,
     });
   });
 
@@ -2337,12 +3935,73 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     const kind = String(row.kind || '');
     if (kind === 'tool_run') {
       const prop = db.prepare('SELECT * FROM web_tool_proposals WHERE approval_id = ?').get(Number(parsed.id));
+      const reqRow = hasTable(db, 'approval_requests')
+        ? db.prepare('SELECT * FROM approval_requests WHERE approval_id = ? ORDER BY created_at DESC LIMIT 1').get(Number(parsed.id))
+        : null;
       if (prop) {
         const def = TOOL_REGISTRY[prop.tool_name] || { id: prop.tool_name, risk: prop.risk_level };
         const eff = effectiveAccessForTool(getPolicyV2(db), def);
         const nextStatus = eff.mode === 'blocked' ? 'blocked' : 'ready';
         db.prepare('UPDATE web_tool_proposals SET status = ? WHERE approval_id = ?').run(nextStatus, Number(parsed.id));
+
+        if (String(reqRow?.tier || '') === 'B' && hasTable(db, 'capability_grants')) {
+          const model = getApprovalModelV1(db);
+          const requestedDuration = Number(req.body?.max_duration_sec || model.tier_b_max_duration_sec || GRANT_MAX_DURATION_DEFAULT_SEC);
+          const maxDurationSec = Math.max(300, Math.min(8 * 60 * 60, requestedDuration));
+          const createdAt = nowIso();
+          const proposed = safeJsonParse(reqRow?.proposed_grant_json || '{}', {});
+          const requestedScope = String(req.body?.grant_scope || proposed?.limits?.grant_scope || 'once').trim();
+          const grantScope = ['once', 'session', 'project'].includes(requestedScope) ? requestedScope : 'once';
+          const pathPrefixRaw = String(req.body?.path_prefix || proposed?.scope_value || safeJsonParse(prop.args_json || '{}', {})?.path || '').trim();
+          const normalized = normalizePathGrantInput(getWorkdir(), pathPrefixRaw || '.');
+          const isPathScope = String(proposed?.scope_type || '') === 'path_prefix' || Boolean(pathPrefixRaw);
+
+          const limits = {
+            max_duration_sec: maxDurationSec,
+            max_calls: Number(proposed?.limits?.max_calls || 250),
+            max_bytes: Number(proposed?.limits?.max_bytes || 10485760),
+            rate_limit_per_min: Number(proposed?.limits?.rate_limit_per_min || 120),
+            grant_scope: grantScope,
+          };
+          if (grantScope === 'once') {
+            limits.uses_remaining = 1;
+          }
+          if (grantScope === 'project') {
+            const projectId = String(req.body?.project_id || req.body?.session_id || prop.session_id || proposed?.job_id || '').trim();
+            if (projectId) limits.project_id = projectId;
+          }
+
+          const expiresAt = new Date(Date.now() + maxDurationSec * 1000).toISOString();
+          const grantId = insertCapabilityGrant(db, {
+            approval_id: Number(parsed.id),
+            job_id: grantScope === 'project' ? null : (proposed?.job_id || proposalJobId(prop.session_id, prop.message_id)),
+            session_id: grantScope === 'session' ? (String(req.body?.session_id || prop.session_id || '') || null) : null,
+            message_id: prop.message_id || null,
+            tier: 'B',
+            scope_type: isPathScope ? 'path_prefix' : (proposed?.scope_type || 'tool'),
+            scope_value: isPathScope ? normalized.abs : (proposed?.scope_value || String(prop.tool_name)),
+            actions: Array.isArray(proposed?.actions) && proposed.actions.length > 0
+              ? proposed.actions
+              : (isPathScope ? [pathActionForTool(String(prop.tool_name)) || 'read'] : ['invoke']),
+            limits,
+            created_at: createdAt,
+            expires_at: expiresAt,
+            granted_by: tokenFingerprint(req.adminToken),
+            reason: reqRow?.why || 'approved_for_scope',
+          });
+          recordEvent(db, 'capability.grant.created', {
+            approval_id: Number(parsed.id),
+            grant_id: grantId,
+            tier: 'B',
+            tool_name: String(prop.tool_name),
+            scope_type: isPathScope ? 'path_prefix' : (proposed?.scope_type || 'tool'),
+            scope_value: isPathScope ? normalized.abs : (proposed?.scope_value || String(prop.tool_name)),
+            grant_scope: grantScope,
+            expires_at: expiresAt,
+          });
+        }
       }
+      resolveApprovalRequestRecord(db, Number(parsed.id), 'approved', tokenFingerprint(req.adminToken));
       insertWebToolAudit(db, 'APPROVAL_APPROVE', req.adminToken, { approval_id: Number(parsed.id) });
       recordEvent(db, 'tool.approval.approved', { approval_id: Number(parsed.id) });
       if (prop && String(prop.tool_name) === 'workspace.delete') {
@@ -2391,6 +4050,37 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         return res.status(500).json({ ok: false, error: err });
       }
     }
+    if (kind === 'directory_submit') {
+      try {
+        const payload = safeJsonParse(row.payload_json || '{}', {});
+        const projectId = String(payload?.projectId || '').trim();
+        const targetId = String(payload?.targetId || '').trim();
+        if (!projectId || !targetId) {
+          return res.status(400).json({ ok: false, error: 'directory_submit_payload_invalid' });
+        }
+        const target = db.prepare('SELECT id, domain FROM directory_targets WHERE id = ?').get(targetId);
+        if (!target) return res.status(404).json({ ok: false, error: 'target_not_found' });
+        const state = db.prepare('SELECT * FROM directory_project_targets WHERE project_id = ? AND target_id = ?').get(projectId, targetId);
+        if (!state) return res.status(404).json({ ok: false, error: 'project_target_state_not_found' });
+        const ts = nowIso();
+        const prevHistory = safeJsonParse(state.submission_history_json || '[]', []);
+        const entry = { submittedAt: ts, result: 'success' };
+        if (payload?.profileId) entry.profileId = String(payload.profileId);
+        if (payload?.notes) entry.notes = String(payload.notes);
+        if (payload?.proofUrl) entry.proofUrl = String(payload.proofUrl);
+        const nextHistory = Array.isArray(prevHistory) ? [...prevHistory, entry] : [entry];
+        db.prepare('UPDATE directory_project_targets SET status = ?, last_submitted_at = ?, submission_history_json = ?, updated_at = ? WHERE id = ?')
+          .run('submitted', ts, JSON.stringify(nextHistory), ts, state.id);
+        db.prepare(`
+          INSERT INTO directory_attempts (id, target_id, domain, attempted_at, mode, result, evidence_path, fields_detected_json, prefill_map_json, error, approval_id)
+          VALUES (?, ?, ?, ?, 'manual', 'submitted', NULL, '[]', '{}', NULL, ?)
+        `).run(`att_${Math.random().toString(16).slice(2, 10)}`, targetId, target.domain || '', ts, Number(parsed.id));
+        recordEvent(db, 'directory_assistant.submit.approved', { approval_id: Number(parsed.id), projectId, targetId });
+        return res.json({ ok: true, submitted: true, projectId, targetId });
+      } catch (e) {
+        return res.status(500).json({ ok: false, error: String(e?.message || e) });
+      }
+    }
     return res.json({ ok: true });
   });
 
@@ -2422,6 +4112,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         SET status = 'rejected'
         WHERE approval_id = ?
       `).run(Number(parsed.id));
+      resolveApprovalRequestRecord(db, Number(parsed.id), 'denied', tokenFingerprint(req.adminToken));
       insertWebToolAudit(db, 'APPROVAL_DENY', req.adminToken, { approval_id: Number(parsed.id), notes: { reason } });
       recordEvent(db, 'tool.approval.denied', { approval_id: Number(parsed.id) });
       const prop = db.prepare('SELECT id, tool_name, args_json FROM web_tool_proposals WHERE approval_id = ?').get(Number(parsed.id));
@@ -2488,6 +4179,10 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     res.json({ ok: true, retention_days: days });
   });
 
+  r.get('/tools/openai', (_req, res) => {
+    return res.json(getOpenAiToolSchema());
+  });
+
   r.get('/tools', (_req, res) => {
     const policy = getPolicyV2(db);
     const tools = Object.values(TOOL_REGISTRY).map((t) => {
@@ -2504,7 +4199,8 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         override_access: override,
       };
     });
-    res.json({ ok: true, policy, tools });
+    const roots = getAllowedRootsReal();
+    res.json({ ok: true, policy, tools, allowed_roots: { home: roots.home, workspace: roots.workspace } });
   });
 
   r.get('/tools/policy', (_req, res) => {
@@ -2515,6 +4211,329 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   r.post('/tools/policy', (req, res) => {
     const policy = setPolicyV2(db, req.body?.policy || req.body);
     res.json({ ok: true, policy });
+  });
+
+
+  r.get('/approval-model', (_req, res) => {
+    const model = getApprovalModelV1(db);
+    const activeGrants = hasTable(db, 'capability_grants')
+      ? Number(db.prepare("SELECT COUNT(1) AS c FROM capability_grants WHERE status = 'active' AND datetime(expires_at) > datetime(?)").get(nowIso())?.c || 0)
+      : 0;
+    const lastGrantAt = hasTable(db, 'capability_grants')
+      ? (db.prepare("SELECT created_at FROM capability_grants ORDER BY created_at DESC LIMIT 1").get()?.created_at || null)
+      : null;
+    const resolvedApprovals = Number(db.prepare("SELECT COUNT(1) AS c FROM approvals WHERE status IN ('approved','denied') AND datetime(created_at) >= datetime(?, '-24 hours')").get(nowIso())?.c || 0);
+    res.json({
+      ok: true,
+      model,
+      stats: {
+        active_grants: activeGrants,
+        last_grant_at: lastGrantAt,
+        resolved_approvals_24h: resolvedApprovals,
+      },
+      presets: {
+        overnight_safe: {
+          run_mode: 'ask_risky',
+          notes: 'Tier A only. Tier B disabled. Tier C prompts.',
+        },
+        overnight_standard: {
+          run_mode: 'ask_risky',
+          notes: 'Tier A auto, Tier B once-per-job, Tier C prompts.',
+        },
+        dev_supervised: {
+          run_mode: 'ask_once_per_job',
+          notes: 'Tier A auto, Tier B/C prompt (supervised).',
+        },
+      },
+    });
+  });
+
+  r.post('/approval-model', (req, res) => {
+    const next = setApprovalModelV1(db, req.body || {});
+    recordEvent(db, 'approval_model.updated', {
+      run_mode: next.run_mode,
+      preset: next.preset,
+      tier_b_enabled: Boolean(next.tier_b_enabled),
+      tier_b_max_duration_sec: next.tier_b_max_duration_sec,
+    });
+    return res.json({ ok: true, model: next });
+  });
+
+  r.get('/grants/path-prefix', (_req, res) => {
+    try {
+      if (!hasTable(db, 'capability_grants')) return res.json({ ok: true, grants: [] });
+      const now = nowIso();
+      const rows = db.prepare(`
+        SELECT id, job_id, session_id, scope_value, actions_json, limits_json, created_at, expires_at, granted_by, reason, status
+        FROM capability_grants
+        WHERE scope_type = 'path_prefix' AND tier = 'B'
+        ORDER BY created_at DESC
+        LIMIT 300
+      `).all();
+      const out = rows.map((r0) => {
+        const actions = safeJsonParse(r0.actions_json || '[]', []);
+        const limits = safeJsonParse(r0.limits_json || '{}', {});
+        return {
+          id: String(r0.id),
+          job_id: r0.job_id || null,
+          session_id: r0.session_id || null,
+          path_prefix: String(r0.scope_value || ''),
+          actions: Array.isArray(actions) ? actions : [],
+          limits,
+          created_at: r0.created_at,
+          expires_at: r0.expires_at,
+          granted_by: r0.granted_by || null,
+          reason: r0.reason || null,
+          status: grantIsActive(r0, now) ? 'active' : String(r0.status || 'expired'),
+        };
+      });
+      return res.json({ ok: true, grants: out });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+  r.post('/grants/path-prefix', (req, res) => {
+    try {
+      const workspaceRoot = getWorkdir();
+      const model = getApprovalModelV1(db);
+      const rawPath = String(req.body?.path || '').trim();
+      if (!rawPath) return res.status(400).json({ ok: false, error: 'path is required' });
+      const mode = String(req.body?.mode || 'read_write').trim();
+      if (!['read', 'read_write', 'exec'].includes(mode)) return res.status(400).json({ ok: false, error: 'mode must be read, read_write, or exec' });
+      const grantScope = String(req.body?.grant_scope || 'session').trim();
+      if (!['once', 'session', 'project'].includes(grantScope)) return res.status(400).json({ ok: false, error: 'grant_scope must be once, session, or project' });
+      const normalized = normalizePathGrantInput(workspaceRoot, rawPath);
+      const requestedDuration = Number(req.body?.max_duration_sec || model.tier_b_max_duration_sec || GRANT_MAX_DURATION_DEFAULT_SEC);
+      const maxDurationSec = Math.max(300, Math.min(8 * 60 * 60, requestedDuration));
+      const createdAt = nowIso();
+      const expiresAt = new Date(Date.now() + maxDurationSec * 1000).toISOString();
+      const actions = mode === 'read'
+        ? ['read', 'list']
+        : mode === 'exec'
+          ? ['exec']
+          : ['read', 'write', 'list', 'create', 'mkdir', 'rename', 'delete'];
+      const limits = {
+        grant_scope: grantScope,
+        max_duration_sec: maxDurationSec,
+        max_calls: Number(req.body?.max_calls || 2000),
+        max_bytes: Number(req.body?.max_bytes || 104857600),
+        rate_limit_per_min: Number(req.body?.rate_limit_per_min || 300),
+      };
+      if (grantScope === 'once') limits.uses_remaining = 1;
+      if (grantScope === 'project') {
+        const projectId = String(req.body?.project_id || '').trim();
+        if (projectId) limits.project_id = projectId;
+      }
+
+      const sessionId = grantScope === 'session'
+        ? String(req.body?.session_id || 'manual-folder-access').slice(0, 120)
+        : null;
+      const grantId = insertCapabilityGrant(db, {
+        approval_id: null,
+        job_id: grantScope === 'project' ? null : String(req.body?.job_id || `job:${Date.now()}`).slice(0, 120),
+        session_id: sessionId,
+        message_id: null,
+        tier: 'B',
+        scope_type: 'path_prefix',
+        scope_value: normalized.abs,
+        actions,
+        limits,
+        created_at: createdAt,
+        expires_at: expiresAt,
+        granted_by: tokenFingerprint(req.adminToken),
+        reason: String(req.body?.reason || 'manual_path_prefix_grant'),
+      });
+      recordEvent(db, 'capability.grant.path_prefix.created', {
+        grant_id: grantId,
+        session_id: sessionId,
+        mode,
+        grant_scope: grantScope,
+        path_prefix: normalized.inside_workspace ? normalized.rel : normalized.abs,
+        expires_at: expiresAt,
+      });
+      return res.json({
+        ok: true,
+        grant: {
+          id: grantId,
+          session_id: sessionId,
+          path_prefix: normalized.abs,
+          path_relative: normalized.rel,
+          inside_workspace: normalized.inside_workspace,
+          grant_scope: grantScope,
+          actions,
+          expires_at: expiresAt,
+        },
+      });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: String(e?.message || e), code: String(e?.code || '') });
+    }
+  });
+
+  r.post('/grants/:id/revoke', (req, res) => {
+    try {
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+      if (!hasTable(db, 'capability_grants')) return res.status(404).json({ ok: false, error: 'grants table missing' });
+      const row = db.prepare(`SELECT id FROM capability_grants WHERE id = ?`).get(id);
+      if (!row) return res.status(404).json({ ok: false, error: 'grant not found' });
+      db.prepare(`UPDATE capability_grants SET status = 'revoked', expires_at = ? WHERE id = ?`).run(nowIso(), id);
+      recordEvent(db, 'capability.grant.revoked', { grant_id: id, by: tokenFingerprint(req.adminToken) });
+      return res.json({ ok: true, id });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+  r.post('/workspace/self-test', async (_req, res) => {
+    const workdir = getWorkdir();
+    const alexRoot = ensureAlexWorkdir(workdir);
+    const probe = path.join(alexRoot, '_probe.txt');
+    const steps = [];
+    const mark = (name, ok, detail = null) => {
+      const row = { step: name, ok: Boolean(ok), detail };
+      steps.push(row);
+      console.log('[workspace-self-test]', row);
+    };
+    try {
+      const content = `probe ${new Date().toISOString()}`;
+      await fsp.writeFile(probe, content, 'utf8');
+      mark('write_probe', true, { probe });
+      const readBack = await fsp.readFile(probe, 'utf8');
+      mark('read_probe', readBack === content, { bytes: Buffer.byteLength(readBack, 'utf8') });
+      const entries = await fsp.readdir(alexRoot);
+      mark('list_dir', entries.includes('_probe.txt'), { count: entries.length });
+      await fsp.unlink(probe).catch(() => {});
+      mark('cleanup_probe', true, null);
+      recordEvent(db, 'workspace.self_test', { ok: true, steps: steps.length });
+      return res.json({ ok: true, pass: steps.every((s) => s.ok), alex_workdir: alexRoot, steps });
+    } catch (e) {
+      const msg = String(e?.message || e);
+      mark('error', false, { error: msg });
+      try { await fsp.unlink(probe).catch(() => {}); } catch {}
+      recordEvent(db, 'workspace.self_test', { ok: false, error: msg.slice(0, 240) });
+      return res.status(500).json({ ok: false, pass: false, alex_workdir: alexRoot, error: msg, steps });
+    }
+  });
+
+  r.post('/panic-stop', (req, res) => {
+    const reason = String(req.body?.reason || 'manual_stop').slice(0, 200);
+    let cancelled = 0;
+    try {
+      if (hasTable(db, 'agent_runs')) {
+        const rows = db.prepare("SELECT conversation_id, user_message_id FROM agent_runs WHERE status IN ('idle','working') GROUP BY conversation_id, user_message_id").all();
+        for (const r0 of rows) AGENTS.cancelledBatches.add(batchKey(r0.conversation_id, r0.user_message_id));
+        db.prepare(
+          `UPDATE agent_runs
+           SET status = 'cancelled', ended_at = COALESCE(ended_at, ?)
+           WHERE status IN ('idle','working')`
+        ).run(nowIso());
+        cancelled = rows.length;
+      }
+      RUNTIME_STATE.activeThinking = 0;
+      RUNTIME_STATE.activeToolRuns = new Set();
+      RUNTIME_STATE.llmStatus = 'idle';
+      RUNTIME_STATE.lastUpdated = nowIso();
+      if (hasTable(db, 'capability_grants')) {
+        db.prepare("UPDATE capability_grants SET status = 'revoked' WHERE status = 'active'").run();
+      }
+      recordEvent(db, 'panic_stop.executed', {
+        reason,
+        cancelled_batches: cancelled,
+        at: nowIso(),
+        by: tokenFingerprint(req.adminToken),
+      });
+      return res.json({ ok: true, cancelled_batches: cancelled, reason });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+
+  r.post('/tools/run-now', async (req, res) => {
+    try {
+      const rawName = String(req.body?.tool_name || req.body?.name || '').trim();
+      const toolName = normalizeToolName(rawName);
+      if (!toolName || !TOOL_REGISTRY[toolName]) {
+        return res.status(400).json({ ok: false, error: 'UNKNOWN_TOOL', message: 'Unknown tool name.', detail: { tool_name: rawName } });
+      }
+      const argsIn = req.body?.args ?? req.body?.arguments ?? {};
+      const args = argsIn && typeof argsIn === 'object' ? argsIn : safeJsonParse(String(argsIn || '{}'), {});
+      const sessionId = String(req.body?.session_id || `tools-${Date.now()}`);
+      const evalOut = evaluateTieredAccess(db, { toolDef: TOOL_REGISTRY[toolName], toolName, args, sessionId, messageId: null });
+      if (!evalOut.allowed) {
+        return res.status(403).json({ ok: false, error: 'OUTSIDE_WORKSPACE_DENIED', message: String(evalOut.reason || 'Denied by path policy.'), details: { paths: evalOut.outside_paths || [] } });
+      }
+      if (evalOut.requiresApproval) {
+        const createdAt = nowIso();
+        const info = db.prepare(`
+          INSERT INTO approvals
+            (kind, status, risk_level, tool_name, proposal_id, server_id, payload_json, session_id, message_id, reason, created_at, resolved_at, resolved_by_token_fingerprint)
+          VALUES ('tool_run', 'pending', ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, NULL, NULL)
+        `).run(String(TOOL_REGISTRY[toolName].risk || 'medium'), toolName, JSON.stringify(args), sessionId, String(evalOut.reason || 'Outside allowed roots requires approval.'), createdAt);
+        const approvalId = Number(info.lastInsertRowid || 0);
+        insertApprovalRequestRecord(db, {
+          approval_id: approvalId,
+          job_id: evalOut.jobId || null,
+          tier: 'B',
+          requested_action_summary: `${toolName} outside allowed roots`,
+          proposed_grant: {
+            tier: 'B',
+            scope_type: 'path_prefix',
+            scope_value: String(evalOut.targetPath || args?.path || ''),
+            actions: [String(evalOut.action || pathActionForTool(toolName) || 'read')],
+            limits: {
+              grant_scope: 'once',
+              uses_remaining: 1,
+              max_duration_sec: GRANT_MAX_DURATION_DEFAULT_SEC,
+            },
+            suggested_scopes: ['once', 'session', 'project'],
+          },
+          why: String(evalOut.reason || 'Outside allowed roots requires approval.'),
+          status: 'pending',
+          created_at: createdAt,
+        });
+        return res.status(403).json({
+          ok: false,
+          error: 'OUTSIDE_ALLOWED_ROOTS',
+          message: String(evalOut.reason || 'Outside allowed roots requires approval.'),
+          details: {
+            paths: evalOut.outside_paths || [{ path: String(evalOut.targetPath || ''), action: String(evalOut.action || pathActionForTool(toolName) || 'read') }],
+            approval_id: approvalId,
+            suggested_scopes: ['once', 'session', 'project'],
+            suggested_path_prefix: String(path.dirname(String(evalOut.targetPath || args?.path || '')) || ''),
+          },
+        });
+      }
+
+      const runOut = await executeRegisteredTool({ toolName, args, workdir: getWorkdir(), db, sessionId });
+      return res.json({ ok: true, tool_name: toolName, result: runOut?.result || {}, stdout: runOut?.stdout || '', stderr: runOut?.stderr || '', artifacts: runOut?.artifacts || [] });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'TOOL_RUN_FAILED', message: String(e?.message || e) });
+    }
+  });
+
+  r.post('/tools/diagnostics', (_req, res) => {
+    try {
+      const homeProbe = path.join(getHomeRootReal(), 'pb_tools_test.txt');
+      const checks = [
+        { id: 'home_write', title: 'Create/write ~/pb_tools_test.txt', tool: 'workspace.write_file', args: { path: homeProbe, content: 'probe' } },
+        { id: 'tmp_write', title: 'Write /tmp/pb_tools_test.txt', tool: 'workspace.write_file', args: { path: '/tmp/pb_tools_test.txt', content: 'probe' } },
+        { id: 'etc_read', title: 'Read /etc/hosts', tool: 'workspace.read_file', args: { path: '/etc/hosts' } },
+      ].map((c) => {
+        const evalOut = evaluateTieredAccess(db, { toolDef: TOOL_REGISTRY[c.tool], toolName: c.tool, args: c.args, sessionId: 'tools-diagnostics', messageId: null });
+        return {
+          id: c.id,
+          title: c.title,
+          allowed_without_prompt: !evalOut.requiresApproval && evalOut.allowed,
+          requires_approval: Boolean(evalOut.requiresApproval),
+          reason: String(evalOut.reason || ''),
+        };
+      });
+      return res.json({ ok: true, checks });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'TOOLS_DIAGNOSTICS_FAILED', message: String(e?.message || e) });
+    }
   });
 
   r.get('/tools/proposals', (req, res) => {
@@ -2669,7 +4688,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           ok: false,
           code: 'LLM_NOT_READY',
           error: 'Text WebUI is not reachable. Start it manually and load a model first.',
-          doctor_url: '#/doctor',
+          doctor_url: '#/er',
           webui_url: sys?.textWebui?.baseUrl || 'http://127.0.0.1:5000',
           correlation_id: correlationId,
         });
@@ -2679,7 +4698,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           ok: false,
           code: 'LLM_NOT_READY',
           error: 'Text WebUI is running but no model is loaded. Load a model in Text WebUI, then try again.',
-          doctor_url: '#/doctor',
+          doctor_url: '#/er',
           webui_url: sys?.textWebui?.baseUrl || 'http://127.0.0.1:5000',
           correlation_id: correlationId,
         });
@@ -2691,7 +4710,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         ok: false,
         code: 'LLM_NOT_READY',
         error: 'Text WebUI readiness check failed. Start Text WebUI and load a model, then try again.',
-        doctor_url: '#/doctor',
+        doctor_url: '#/er',
         webui_url: 'http://127.0.0.1:5000',
         correlation_id: correlationId,
       });
@@ -2725,7 +4744,11 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
 
     // Enforce scan-first governance before write/delete operations.
     // Session must have at least one successful workspace.list and workspace.read_file.
-    if (proposal.tool_name === 'workspace.write_file' || proposal.tool_name === 'workspace.delete') {
+    if (proposal.tool_name === 'workspace.write_file' || proposal.tool_name === 'workspace.mkdir' || proposal.tool_name === 'workspace.delete') {
+      const inAlexSandbox = isPathInsideAlexSandbox(safeJsonParse(proposal.args_json || '{}', {}));
+      if (inAlexSandbox) {
+        // Alex sandbox operations are Tier A and do not require scan-first gate.
+      } else
       if (!isScanSatisfied(db, proposal.session_id)) {
         return res.status(403).json({
           ok: false,
@@ -2775,11 +4798,20 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         ? (db.prepare('SELECT id, status FROM approvals WHERE id = ?').get(Number(proposal.approval_id)) ||
             db.prepare('SELECT id, status FROM web_tool_approvals WHERE id = ?').get(Number(proposal.approval_id)))
         : null;
+      const reqRow = proposal.approval_id && hasTable(db, 'approval_requests')
+        ? db.prepare('SELECT proposed_grant_json, why FROM approval_requests WHERE approval_id = ? ORDER BY created_at DESC LIMIT 1').get(Number(proposal.approval_id))
+        : null;
+      const proposed = safeJsonParse(reqRow?.proposed_grant_json || '{}', {});
+      const outsideDetails = {
+        paths: proposed?.scope_value ? [{ path: String(proposed.scope_value), action: String((Array.isArray(proposed?.actions) && proposed.actions[0]) || pathActionForTool(String(proposal.tool_name)) || 'read') }] : [],
+      };
+      const isOutsideRoots = String(reqRow?.why || '').toLowerCase().includes('outside');
       if (!appr) {
         return res.status(403).json({
           ok: false,
-          code: 'APPROVAL_REQUIRED',
+          code: isOutsideRoots ? 'OUTSIDE_ALLOWED_ROOTS' : 'APPROVAL_REQUIRED',
           error: 'This tool run requires approval in Web Admin.',
+          details: isOutsideRoots ? outsideDetails : undefined,
           approval_id: proposal.approval_id || null,
           correlation_id: correlationId,
         });
@@ -2796,8 +4828,9 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       if (appr.status !== 'approved') {
         return res.status(403).json({
           ok: false,
-          code: 'APPROVAL_REQUIRED',
+          code: isOutsideRoots ? 'OUTSIDE_ALLOWED_ROOTS' : 'APPROVAL_REQUIRED',
           error: 'This tool run requires approval in Web Admin.',
+          details: isOutsideRoots ? outsideDetails : undefined,
           approval_id: proposal.approval_id || null,
           correlation_id: correlationId,
         });
@@ -3044,18 +5077,134 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
 
   const handleWebchatSend = async (req, res) => {
     const message = String(req.body?.message || '').trim();
-    const sessionId = String(req.body?.session_id || 'webchat-default');
+    const sessionId = String(req.body?.session_id || req.get('X-PB-Session') || 'webchat-default').trim() || 'webchat-default';
     const messageId = String(req.body?.message_id || newId('msg'));
-    const mcpServerId = String(req.body?.mcp_server_id || '').trim() || null;
     const sessionMeta = getWebchatSessionMeta(db, sessionId);
+    const requestMcpServerId = String(req.body?.mcp_server_id || sessionMeta?.mcp_server_id || '').trim() || null;
+    let mcpTemplateId = String(req.body?.mcp_template_id || sessionMeta?.mcp_template_id || '').trim() || null;
+    const wantsBrowse = shouldUseMcpBrowse(message);
+    if (mcpTemplateId && !isTemplateEnabledInWebchat(db, mcpTemplateId)) {
+      if (wantsBrowse) {
+        return res.status(400).json({ ok: false, error: 'MCP_TEMPLATE_DISABLED', message: 'Selected MCP template is disabled. Enable it in MCP Servers.' });
+      }
+    }
+    let chosenTemplateId = null, chosenTemplateName = null, chosenTemplateReason = null;
+    if (wantsBrowse && !mcpTemplateId && !requestMcpServerId) {
+      const autoTpl = resolveDefaultBrowserTemplate(db);
+      if (autoTpl) {
+        mcpTemplateId = autoTpl.id;
+        chosenTemplateId = autoTpl.id;
+        chosenTemplateName = autoTpl.name;
+        chosenTemplateReason = autoTpl.reason;
+        console.log(`[webchat.send] auto-selected template session=${sessionId} tpl=${autoTpl.id} reason=${autoTpl.reason}`);
+      }
+      // else: no templates found — fall through to server-level auto-selection below
+    }
+    let mcpServerId = requestMcpServerId || resolveMcpServerFromTemplate(db, mcpTemplateId);
+    if (requestMcpServerId && !isServerEnabledInWebchat(db, requestMcpServerId)) {
+      if (wantsBrowse) {
+        const fallbackByTemplate = mcpTemplateId ? resolveMcpServerFromTemplate(db, mcpTemplateId) : null;
+        const fallbackAny = fallbackByTemplate || resolveAnyEnabledBrowserServer(db);
+        if (fallbackAny) {
+          mcpServerId = fallbackAny;
+        } else {
+          return res.status(400).json({ ok: false, error: 'MCP_SERVER_DISABLED', message: 'Selected MCP server is disabled in WebChat. Enable it in MCP Servers.' });
+        }
+      } else {
+        mcpServerId = null;
+      }
+    }
+    // Server-level auto-selection: pick any running browser-capable server if still unresolved.
+    let chosenMcpServerId = null;
+    let chosenMcpServerReason = 'none_available';
+    if (mcpServerId) {
+      chosenMcpServerId = mcpServerId;
+      chosenMcpServerReason = req.body?.mcp_server_id
+        ? 'client_selected'
+        : (sessionMeta?.mcp_server_id ? 'session_meta' : 'template_resolved');
+    } else if (wantsBrowse) {
+      const autoSrv = resolveAnyEnabledBrowserServer(db) || resolveAnyRunningMcpServer(db);
+      if (autoSrv) {
+        mcpServerId = autoSrv;
+        chosenMcpServerId = autoSrv;
+        chosenMcpServerReason = 'auto_default';
+        console.log(`[webchat.send] auto-selected server session=${sessionId} srv=${autoSrv}`);
+      }
+      // else: none_available — friendly 200 reply handled in the !mcpServerId guard below
+    }
     if (!message) return res.status(400).json({ ok: false, error: 'message required' });
+
+    const agentId = String(req.body?.agent_id || req.get('X-PB-Agent') || MEMORY_AGENT_ID).trim() || MEMORY_AGENT_ID;
+    const chatId = sessionId;
+    const injectedMemory = loadMemory({ db, agentId, chatId });
+    console.log(`MEMORY_LOAD agent=${agentId} chat=${chatId} profile_chars=${injectedMemory.chars.profile} summary_chars=${injectedMemory.chars.summary}`);
+
+    const requestId = newId('rid');
+    const reqAbort = new AbortController();
+    req.on('aborted', () => reqAbort.abort());
+    console.log(`[webchat.send] rid=${requestId} session=${sessionId} agent=${agentId} mcpTemplateId=${mcpTemplateId || '-'} mcpServerId=${mcpServerId || '-'} messageId=${messageId}`);
 
     let reply = '';
     let model = null;
     let provider = null;
+    let routeSourceType = 'builtin';
+    let routeMcpServerId = null;
+    let routeSources = [];
+    let routeContext7 = null;
+    const routeStartMs = Date.now();
+    let browseTrace = {
+      route: 'direct',
+      mcp_server_id: null,
+      urls_visited: [],
+      chars_extracted: 0,
+      durations: {},
+      total_duration_ms: 0,
+      stages: [],
+    };
     let candidate = parseToolCommand(message);
+    if (!candidate) candidate = detectDirectFileIntent(message);
 
     if (!candidate) {
+      if (shouldUseMcpBrowse(message) && !mcpServerId) {
+        const friendly = mcpTemplateId
+          ? `No running MCP server found for template ${mcpTemplateId}. Open MCP Servers, start one, then retry.`
+          : 'Browsing requires an MCP browser server. Create/enable one in MCP Servers.';
+        browseTrace = {
+          route: 'mcp',
+          mcp_server_id: null,
+          urls_visited: [],
+          chars_extracted: 0,
+          durations: {},
+          total_duration_ms: Date.now() - routeStartMs,
+          stages: [{ stage: 'CALL_MCP', ok: false, error: mcpTemplateId ? 'MCP_TEMPLATE_NOT_RESOLVED' : 'MCP_SERVER_NOT_SELECTED', remediation: friendly }],
+        };
+        return res.json({
+          ok: true,
+          session_id: sessionId,
+          message_id: messageId,
+          session_meta: sessionMeta,
+          reply: friendly,
+          model: null,
+          provider: null,
+          source_type: 'mcp',
+          mcp_server_id: null,
+          sources: [],
+          browse_trace: browseTrace,
+          proposal: null,
+          canvas_item: null,
+          chosenTemplateId,
+          chosenTemplateName,
+          chosenTemplateReason,
+          chosen_mcp_server_id: chosenMcpServerId,
+          chosen_mcp_server_reason: chosenMcpServerReason,
+          browse_intent: true,
+          route_selected: 'mcp',
+          mcp_server_selected: null,
+          mcp_reason: 'none_available',
+          mcp_allowed: false,
+          mcp_denied_reason: 'no_running_server',
+        });
+      }
       runtimeClearError();
       runtimeThinkingStart();
       try {
@@ -3075,6 +5224,8 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         const systemText =
           `${preamble}\n\n` +
           `Preferred name: ${sessionMeta.assistant_name}\n\n` +
+          'You are Alex. Use memory context when relevant.\n\n' +
+          `${injectedMemory.injectedPreface}\n\n` +
           'PB System State (source of truth; do not guess values):\n' +
           JSON.stringify(safe, null, 2) +
           '\n\nCurrent scan state:\n' +
@@ -3084,10 +5235,11 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           "- This is NOT a filesystem write and does NOT require approvals.\n" +
           "- Example args: {\"kind\":\"note\",\"title\":\"...\",\"content_type\":\"markdown\",\"content\":\"...\"}\n" +
           '\nAvailable workspace tools:\n' +
-          "- workspace.list\n" +
-          "- workspace.read_file\n" +
-          "- workspace.write_file (approval required, scan-first enforced)\n" +
-          "- workspace.delete (approval required, scan-first enforced)\n" +
+          "- workspace.list (alias: list_dir)\n" +
+          "- workspace.read_file (alias: read_file)\n" +
+          "- workspace.write_file (alias: write_file)\n" +
+          "- workspace.mkdir (alias: mkdir)\n" +
+          "- workspace.delete\n" +
           "- uploads.list\n" +
           "- uploads.read_file\n" +
           "- memory.write_scratch (append daily scratch note)\n" +
@@ -3095,17 +5247,156 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           "- memory.finalize_day (prepare durable redacted patch; invoke applies)\n" +
           "- memory.apply_durable_patch (approval required; invoke-only)\n" +
           "- memory.delete_day (approval required; confirm must be: DELETE YYYY-MM-DD)\n" +
+          "- scratch.write (args: key, content, persist?, agent_id?, project_id?)\n" +
+          "- scratch.read (args: key, agent_id?, project_id?)\n" +
+          "- scratch.list (args: agent_id?, project_id?)\n" +
+          "- scratch.clear (approval required)\n" +
+          '\nWhen the user asks to create files/apps in Alex workspace, you MUST call file tools directly. Do not ask user to create files manually.\n' +
+          'If a file tool fails, return one concise error with failing tool and path.\n' +
           '\nAttached uploads for this session (reference files):\n' +
           JSON.stringify(uploads, null, 2) + '\n';
-        const out = await llmChatOnce({ db, messageText: message, systemText, timeoutMs: 90_000 });
-        if (!out.ok) return res.status(502).json({ ok: false, error: out.error || 'WebChat failed' });
+        let out = null;
+        if (mcpServerId && shouldUseMcpBrowse(message)) {
+          browseTrace.route = 'mcp';
+          browseTrace.mcp_server_id = mcpServerId;
+        }
+        if (!out) {
+          const tDirect = Date.now();
+          const wantsContext7 = Boolean(mcpServerId && shouldUseContext7(message));
+          const wantsBrowseCtrl = Boolean(mcpServerId && shouldUseMcpBrowse(message));
+
+          if (wantsBrowseCtrl) {
+            // ── Controller path: PB drives MCP search+extract, then asks LLM to summarize ──
+            // No tool schemas are sent to the LLM — prevents tool-hallucination on local models.
+            const ctrlOut = await runMcpBrowseController(db, {
+              mcpServerId, message, rid: requestId, signal: reqAbort.signal,
+            });
+            browseTrace.stages.push({
+              stage: 'MCP_CONTROLLER',
+              ok: ctrlOut.ok,
+              duration_ms: Date.now() - tDirect,
+              sources_found: ctrlOut.sources?.length || 0,
+              ctrl_traces: ctrlOut.traces || [],
+              error: ctrlOut.error || null,
+            });
+            if (ctrlOut.ok && ctrlOut.context) {
+              const summarizePrompt =
+                `The user asked: "${message}"\n\n` +
+                `Use ONLY the following live web search results to answer. ` +
+                `Give a clear, direct answer with relevant facts. ` +
+                `End with a Sources section listing the URLs.\n\n` +
+                ctrlOut.context;
+              const sumOut = await llmChatOnce({
+                db,
+                messageText: summarizePrompt,
+                systemText: 'You are a helpful assistant. Summarize the provided search results to answer the user. Do not output <tools> JSON blocks or tool call syntax.',
+                sessionId, agentId, chatId,
+                timeoutMs: webchatTimeoutMs(),
+                signal: reqAbort.signal,
+              });
+              if (sumOut.ok) {
+                out = { ok: true, text: sumOut.text, model: sumOut.model, profile: sumOut.profile, source_type: 'mcp' };
+                routeSources = ctrlOut.sources || [];
+                browseTrace.route = 'mcp';
+                browseTrace.stages.push({ stage: 'CALL_LLM_SUMMARIZE', ok: true, duration_ms: Date.now() - tDirect });
+              }
+            }
+            if (!out) {
+              // Controller or summarization failed — fall through to a plain LLM reply.
+              out = await llmChatOnce({ db, messageText: message, systemText, sessionId, agentId, chatId, timeoutMs: webchatTimeoutMs(), signal: reqAbort.signal });
+              browseTrace.route = 'direct';
+              browseTrace.stages.push({ stage: 'CALL_LLM', ok: Boolean(out?.ok), duration_ms: Date.now() - tDirect, fallback_from: 'mcp_controller', fallback_error: ctrlOut.error || null });
+            }
+          } else {
+            // ── Context7 / direct path: use the tool-loop (context7) or plain LLM ──
+            const loopSystemText = wantsContext7
+              ? `${systemText}
+
+Code1 usage policy:
+- For library/API coding questions, call resolve-library-id first, then query-docs.
+- Return only minimal relevant snippets. Avoid large dumps.
+- Include used libraryId and source URLs in final answer.`
+              : systemText;
+            const loopOut = await runOpenAiToolLoop({
+              db,
+              message,
+              systemText: loopSystemText,
+              sessionId,
+              reqSignal: reqAbort.signal,
+              workdir: getWorkdir(),
+              mcpServerId: wantsContext7 ? mcpServerId : null,
+              includeMcpTools: wantsContext7,
+              rid: requestId,
+            });
+            if (loopOut?.ok) {
+              out = { ok: true, text: loopOut.text, model: loopOut.model, profile: loopOut.profile, context7: loopOut.context7 || null, source_type: 'builtin' };
+              browseTrace.route = 'direct';
+              browseTrace.stages.push({ stage: 'CALL_LLM_TOOLS', ok: true, duration_ms: Date.now() - tDirect, tool_traces: loopOut.traces || [] });
+            } else {
+              out = await llmChatOnce({ db, messageText: message, systemText, sessionId, agentId, chatId, timeoutMs: webchatTimeoutMs(), signal: reqAbort.signal });
+              browseTrace.route = 'direct';
+              browseTrace.stages.push({ stage: 'CALL_LLM', ok: Boolean(out?.ok), duration_ms: Date.now() - tDirect, fallback_from: 'tool_loop', fallback_error: loopOut?.error || null });
+            }
+          }
+          browseTrace.total_duration_ms = Date.now() - routeStartMs;
+          try {
+            const d = {};
+            for (const st of browseTrace.stages) {
+              const k = String(st?.stage || 'unknown');
+              d[k] = Number(d[k] || 0) + Number(st?.duration_ms || 0);
+            }
+            browseTrace.durations = d;
+          } catch {}
+        }
+        if (!out.ok) {
+          const errText = String(out.error || 'WebChat failed');
+          if (errText.toLowerCase().includes('aborted') || errText.toLowerCase().includes('client disconnected')) {
+            return res.status(499).json({ ok: false, error: 'CLIENT_ABORTED', message: 'Client disconnected', browse_trace: browseTrace });
+          }
+          const detail = out?.detail && typeof out.detail === 'object' ? out.detail : null;
+          return res.status(502).json({ ok: false, error: errText, message: errText, detail, browse_trace: browseTrace });
+        }
         reply = String(out.text || '').trim();
+        // Guard: strip any <tools> blocks or mcp.browser.* syntax that a local LLM hallucinated.
+        if (/<tools>|mcp\.browser\./i.test(reply)) {
+          console.warn(`[webchat.guardrail] Tool-hallucination detected. rid=${requestId}`);
+          reply = reply.replace(/<tools>[\s\S]*?<\/tools>/gi, '').replace(/<tools>[\s\S]*/gi, '').trim();
+          if (/mcp\.browser\./i.test(reply) || !reply) {
+            reply = routeSources.length > 0
+              ? `I found some sources but had trouble formatting the answer:\n${routeSources.slice(0, 3).map((u) => `- ${u}`).join('\n')}`
+              : 'I encountered an issue processing the response. Please try again.';
+          }
+          browseTrace.stages.push({ stage: 'GUARDRAIL', ok: false, error: 'TOOL_HALLUCINATION', stripped: true });
+        }
+        const isUrlOnly = /^https?:\/\/[^\s]+$/.test(reply.trim());
+        if (looksLikeRawBrowserDump(reply) || isUrlOnly) {
+          console.warn(`[webchat.guardrail] Rewriting potentially raw LLM output. rid=${requestId}`);
+          const sources = Array.isArray(out?.sources) ? out.sources : [];
+          if (sources.length > 0) {
+            reply = `I found some information, but had trouble summarizing it. You can check these sources:\n${sources.map(s => `- ${s}`).join('\n')}`;
+          } else {
+            reply = "I encountered an issue processing the request and couldn't retrieve a valid response.";
+          }
+          browseTrace.stages.push({ stage: 'GUARDRAIL', ok: false, error: 'LLM_OUTPUT_RAW', original_reply_preview: String(out.text || '').slice(0, 100) });
+        }
         model = out.model || null;
         provider = out.profile || null;
-        candidate = parseToolProposalFromReply(reply);
+        routeSourceType = String(out?.source_type || 'builtin');
+        routeMcpServerId = out?.mcp_server_id ? String(out.mcp_server_id) : null;
+        // Preserve sources already set by the MCP controller; fall back to out.sources otherwise.
+        if (!routeSources.length) {
+          routeSources = Array.isArray(out?.sources) ? out.sources.map((x) => String(x || '')).filter(Boolean) : [];
+        }
+        routeContext7 = out?.context7 || null;
+        if (shouldUseMcpBrowse(message) && routeSourceType !== 'mcp') {
+          // Never hard-fail: fall through with the LLM reply rather than returning an error.
+          console.warn(`[webchat.guardrail] Browse needed but MCP route not used. rid=${requestId} srv=${mcpServerId || '-'} routeType=${routeSourceType}`);
+          browseTrace.stages.push({ stage: 'GUARDRAIL', ok: false, error: 'ROUTE_NOT_MCP', remediation: 'check MCP server config' });
+        }
+        candidate = parseToolProposalFromReply(reply) || candidate;
       } catch (e) {
         runtimeSetError(e?.message || e);
-        return res.status(502).json({ ok: false, error: String(e?.message || e) });
+        return res.status(502).json({ ok: false, error: String(e?.message || e), message: String(e?.message || e), detail: { stage: 'CALL_MCP', cause: String(e?.message || e), remediation: 'Retry request and verify MCP/WebUI health.' }, browse_trace: browseTrace });
       } finally {
         runtimeThinkingEnd();
       }
@@ -3128,6 +5419,29 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     }
 
     if (candidate && TOOL_REGISTRY[candidate.toolName]) {
+      const isMemoryDraftWrite = candidate.toolName === 'memory.write_scratch' || candidate.toolName === 'memory.append';
+      if (isMemoryDraftWrite) {
+        try {
+          const runOut = await executeRegisteredTool({
+            toolName: candidate.toolName,
+            args: { ...(candidate.args || {}), session_id: sessionId },
+            workdir: getWorkdir(),
+            db,
+            sessionId,
+          });
+          const draftId = Number(runOut?.result?.draft_id || 0) || null;
+          recordEvent(db, 'memory.draft_created', { via: 'webchat-auto', draft_id: draftId, session_id: sessionId });
+          reply = `Saved as draft. You can commit it when closing PB or from the Memory panel.${draftId ? ` (draft #${draftId})` : ''}`;
+          candidate = null;
+        } catch (e) {
+          recordEvent(db, 'memory.draft_create_failed', { via: 'webchat-auto', error: String(e?.message || e).slice(0, 240), session_id: sessionId });
+          reply = `I could not save draft memory: ${String(e?.message || e)}.`;
+          candidate = null;
+        }
+      }
+    }
+
+    if (candidate && TOOL_REGISTRY[candidate.toolName]) {
       const def = TOOL_REGISTRY[candidate.toolName];
       proposal = createProposal(db, {
         sessionId,
@@ -3146,6 +5460,21 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           ? [String(candidate.args?.path || '')].filter(Boolean)
           : undefined,
       });
+    }
+    if (candidate && !TOOL_REGISTRY[candidate.toolName]) {
+      reply = `Tool error: unknown tool '${candidate.toolName}'. Available file tools are list_dir/read_file/write_file/mkdir.`;
+      candidate = null;
+    }
+
+    if (reply) {
+      try {
+        const updated = updateAfterTurn({ db, agentId, chatId, userText: message, assistantText: reply });
+        if (updated?.remembered) {
+          recordEvent(db, 'memory.fact.remembered', { agent_id: agentId, chat_id: chatId, remembered: String(updated.remembered).slice(0, 180) });
+        }
+      } catch (e) {
+        recordEvent(db, 'memory.summary.update_failed', { error: String(e?.message || e).slice(0, 240), session_id: sessionId });
+      }
     }
 
     // Best-effort daily memory continuity: append each turn and periodically refresh summary.
@@ -3183,8 +5512,38 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       reply,
       model,
       provider,
+      source_type: routeSourceType,
+      mcp_server_id: routeMcpServerId,
+      mcp_template_id: mcpTemplateId || null,
+      sources: routeSources,
+      context7: routeContext7,
+      browse_trace: browseTrace,
+      memory: {
+        enabled: true,
+        agent_id: agentId,
+        chat_id: chatId,
+        profile_chars: injectedMemory.chars.profile,
+        summary_chars: injectedMemory.chars.summary,
+        injected_preview: injectedMemory.injectedPreface.slice(0, 1200),
+        last_updated_at: nowIso(),
+      },
       proposal,
       canvas_item,
+      chosenTemplateId,
+      chosenTemplateName,
+      chosenTemplateReason,
+      chosen_mcp_server_id: chosenMcpServerId,
+      chosen_mcp_server_reason: chosenMcpServerReason,
+      browse_intent: wantsBrowse,
+      route_selected: browseTrace.route || 'direct',
+      mcp_server_selected: chosenMcpServerId,
+      mcp_reason: chosenMcpServerReason === 'auto_default' ? 'auto_intent'
+        : (chosenMcpServerReason === 'none_available' ? 'none_available'
+        : (chosenMcpServerReason === 'template_resolved' || chosenMcpServerReason === 'client_selected' || chosenMcpServerReason === 'session_meta' ? 'user_selected'
+        : chosenMcpServerReason)),
+      mcp_allowed: chosenMcpServerId !== null,
+      mcp_denied_reason: chosenMcpServerId !== null ? null
+        : (wantsBrowse ? 'no_running_server' : 'browse_not_required'),
     });
   };
 
@@ -3571,6 +5930,51 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     return res.json({ ok: true, cancelled: rows.length });
   });
 
+  r.post('/diagnostics/direct-test', async (req, res) => {
+    try {
+      const prompt = String(req.body?.message || 'Say: direct diagnostics OK').trim();
+      const out = await llmChatOnce({ db, messageText: prompt, systemText: 'diagnostics_direct_test=true', timeoutMs: webchatTimeoutMs() });
+      if (!out.ok) return res.status(502).json({ ok: false, error: out.error || 'Direct test failed', preview: null });
+      return res.json({ ok: true, mode: 'direct', preview: String(out.text || '').slice(0, 400) });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e), preview: null });
+    }
+  });
+
+  r.post('/diagnostics/search-test', async (req, res) => {
+    const base = String(process.env.SEARCH_SERVER_BASE_URL || 'http://127.0.0.1:3333').replace(/\/+$/g, '');
+    const model = String(process.env.SEARCH_SERVER_MODEL || 'gpt-4o-mini');
+    try {
+      const rr = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          stream: false,
+          messages: [{ role: 'user', content: String(req.body?.message || 'what is the weather in san antonio today') }],
+        }),
+      });
+      const txt = await rr.text();
+      let json = null;
+      try { json = txt ? JSON.parse(txt) : null; } catch {}
+      if (!rr.ok) return res.status(502).json({ ok: false, error: `Search test HTTP ${rr.status}`, preview: txt.slice(0, 500) });
+      const content = String(json?.choices?.[0]?.message?.content || json?.reply || '').trim();
+      return res.json({ ok: true, mode: 'search', preview: content.slice(0, 400) || txt.slice(0, 400) });
+    } catch (e) {
+      return res.status(502).json({ ok: false, error: String(e?.message || e), preview: null });
+    }
+  });
+
+  r.post('/diagnostics/stop-test', (req, res) => {
+    try {
+      const reason = String(req.body?.reason || 'diagnostics_stop_test').slice(0, 120);
+      recordEvent(db, 'diagnostics.stop_test', { reason });
+      return res.json({ ok: true, message: 'STOP path reachable', reason });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
   r.get('/webchat/status', (_req, res) => {
     res.json({
       providerId: kvGet(db, 'llm.providerId', 'textwebui'),
@@ -3734,9 +6138,68 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   r.post('/webchat/session-meta', (req, res) => {
     const sessionId = String(req.body?.session_id || 'webchat-default').trim() || 'webchat-default';
     const assistantName = String(req.body?.assistant_name || '').trim();
-    const meta = setWebchatSessionMeta(db, sessionId, { assistant_name: assistantName });
-    recordEvent(db, 'webchat.session_meta.updated', { session_id: sessionId, assistant_name: meta.assistant_name });
+    const mcpServerId = String(req.body?.mcp_server_id || '').trim();
+    const mcpTemplateId = String(req.body?.mcp_template_id || '').trim();
+    const meta = setWebchatSessionMeta(db, sessionId, { assistant_name: assistantName, mcp_server_id: mcpServerId, mcp_template_id: mcpTemplateId });
+    recordEvent(db, 'webchat.session_meta.updated', {
+      session_id: sessionId,
+      assistant_name: meta.assistant_name,
+      mcp_server_id: meta.mcp_server_id || null,
+      mcp_template_id: meta.mcp_template_id || null,
+    });
     return res.json({ ok: true, meta });
+  });
+
+  r.get('/webchat/memory', (req, res) => {
+    const sessionId = String(req.query?.session_id || 'webchat-default');
+    const agentId = String(req.query?.agent_id || MEMORY_AGENT_ID);
+    const injected = loadMemory({ db, agentId, chatId: sessionId });
+    return res.json({
+      ok: true,
+      agent_id: agentId,
+      chat_id: sessionId,
+      profile: injected.profileText,
+      summary: injected.summaryText,
+      profile_chars: injected.chars.profile,
+      summary_chars: injected.chars.summary,
+      updated_at: injected.updatedAt,
+      injected_preview: injected.injectedPreface.slice(0, 1200),
+    });
+  });
+
+
+  r.get('/memory/debug', (req, res) => {
+    const sessionId = String(req.query?.session_id || req.get('X-PB-Session') || 'webchat-default').trim() || 'webchat-default';
+    const agentId = String(req.query?.agent_id || req.get('X-PB-Agent') || MEMORY_AGENT_ID).trim() || MEMORY_AGENT_ID;
+    const injected = loadMemory({ db, agentId, chatId: sessionId });
+    return res.json({
+      ok: true,
+      agentId,
+      chatId: sessionId,
+      profileChars: injected.chars.profile,
+      summaryChars: injected.chars.summary,
+      updatedAt: injected.updatedAt,
+      injected_preview: injected.injectedPreface.slice(0, 400),
+    });
+  });
+
+  r.post('/webchat/memory/clear-chat', (req, res) => {
+    const sessionId = String(req.body?.session_id || req.get('X-PB-Session') || 'webchat-default').trim() || 'webchat-default';
+    const agentId = String(req.body?.agent_id || MEMORY_AGENT_ID);
+    clearChatSummary({ db, agentId, chatId: sessionId });
+    return res.json({ ok: true, chat_id: sessionId });
+  });
+
+  r.post('/webchat/memory/clear-profile', (req, res) => {
+    const agentId = String(req.body?.agent_id || MEMORY_AGENT_ID);
+    clearProfileMemory({ db, agentId });
+    return res.json({ ok: true, agent_id: agentId });
+  });
+
+  r.get('/webchat/memory/export', (req, res) => {
+    const agentId = String(req.query?.agent_id || MEMORY_AGENT_ID);
+    const rows = exportMemories({ db, agentId });
+    return res.json({ ok: true, agent_id: agentId, memories: rows });
   });
 
   r.get('/webchat/uploads', (req, res) => {
@@ -3826,6 +6289,42 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     } catch (e) {
       res.status(500).json({ ok: false, error: String(e?.message || e) });
     }
+  });
+
+  r.post('/settings/factory-reset', async (req, res) => {
+    const confirm = String(req.body?.confirm || '').trim();
+    if (confirm !== 'RESET') {
+      return res.status(400).json({
+        ok: false,
+        error: 'CONFIRM_REQUIRED',
+        remediation: 'Send JSON body: { "confirm": "RESET" }',
+      });
+    }
+
+    const workspaceRoot = getWorkspaceRoot();
+    const pbDir = path.join(workspaceRoot, '.pb');
+    const envPath = path.join(dataDir, '.env');
+    const dbPath = path.join(dataDir, 'proworkbench.db');
+
+    async function rmrf(p) {
+      try { await fsp.rm(p, { recursive: true, force: true }); return true; } catch { return false; }
+    }
+
+    // Close the DB before deleting it so SQLite flushes WAL.
+    try { if (db && typeof db.close === 'function') db.close(); } catch {}
+
+    const removed = {
+      pbDir: await rmrf(pbDir),
+      env: await rmrf(envPath),
+      db: await rmrf(dbPath),
+      dbWal: await rmrf(`${dbPath}-wal`),
+      dbShm: await rmrf(`${dbPath}-shm`),
+    };
+
+    res.json({ ok: true, removed, requires_restart: true, message: 'Factory reset complete. Server will restart.' });
+
+    // Exit so node --watch / dev runner restarts with a clean slate.
+    setTimeout(() => process.exit(0), 200);
   });
 
   return r;

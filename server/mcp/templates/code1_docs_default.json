@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "code1_docs_default",
+  "name": "Code1 Docs Default",
+  "description": "WebChat docs retrieval preset for Context7.",
+  "risk": "low",
+  "allowedChannels": [
+    "webchat"
+  ],
+  "requiresApprovalByDefault": false,
+  "fields": [
+    {
+      "key": "baseUrl",
+      "label": "Code1 MCP Base URL",
+      "type": "text",
+      "required": false,
+      "default": "http://127.0.0.1:6767"
+    }
+  ],
+  "securityDefaults": {
+    "testPlan": [
+      "resolve-library-id",
+      "query-docs"
+    ]
+  },
+  "defaultCapabilities": [
+    "resolve-library-id",
+    "query-docs"
+  ]
+}

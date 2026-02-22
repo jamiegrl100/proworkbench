@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640">
+  <rect width="1200" height="640" fill="#081125"/>
+  <text x="60" y="70" fill="#dbeafe" font-size="34" font-family="Arial" font-weight="700">ProWorkBench Architecture</text>
+  <rect x="60" y="130" width="280" height="120" rx="16" fill="#1e3a8a"/>
+  <text x="90" y="195" fill="white" font-size="24" font-family="Arial">Web UI :5173</text>
+
+  <rect x="430" y="120" width="340" height="150" rx="16" fill="#0f766e"/>
+  <text x="470" y="175" fill="white" font-size="24" font-family="Arial">PB Server :8787</text>
+  <text x="470" y="210" fill="#e6fffa" font-size="18" font-family="Arial">Policy + Jobs + State</text>
+
+  <rect x="860" y="90" width="280" height="120" rx="16" fill="#7c2d12"/>
+  <text x="900" y="160" fill="white" font-size="24" font-family="Arial">WebUI :5000</text>
+
+  <rect x="860" y="250" width="280" height="120" rx="16" fill="#4c1d95"/>
+  <text x="918" y="320" fill="white" font-size="24" font-family="Arial">Tools Runtime</text>
+
+  <rect x="860" y="410" width="280" height="120" rx="16" fill="#92400e"/>
+  <text x="930" y="480" fill="white" font-size="24" font-family="Arial">MCP Runtime</text>
+
+  <rect x="430" y="340" width="340" height="170" rx="16" fill="#334155"/>
+  <text x="485" y="400" fill="white" font-size="24" font-family="Arial">SQLite + Local Files</text>
+  <text x="500" y="435" fill="#e2e8f0" font-size="17" font-family="Arial">workflow / cache / logs</text>
+
+  <line x1="340" y1="190" x2="430" y2="190" stroke="#93c5fd" stroke-width="4"/>
+  <line x1="770" y1="165" x2="860" y2="150" stroke="#93c5fd" stroke-width="4"/>
+  <line x1="770" y1="195" x2="860" y2="300" stroke="#93c5fd" stroke-width="4"/>
+  <line x1="770" y1="220" x2="860" y2="460" stroke="#93c5fd" stroke-width="4"/>
+  <line x1="600" y1="270" x2="600" y2="340" stroke="#93c5fd" stroke-width="4"/>
+</svg>

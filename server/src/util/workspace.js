@@ -1,7 +1,11 @@
-import os from 'node:os';
 import path from 'node:path';
 
-export function getWorkspaceRoot() {
-  return String(process.env.PB_WORKDIR || path.join(os.homedir(), '.proworkbench')).trim();
-}
+const DEFAULT_ALEX_WORKSPACE_ROOT = '/home/jamiegrl100/.proworkbench/workspaces/alex';
 
+export function getWorkspaceRoot() {
+  const explicit = String(process.env.WORKSPACE_ROOT || '').trim();
+  if (explicit) return explicit;
+  const alex = String(process.env.ALEX_WORKDIR || '').trim();
+  if (alex) return alex;
+  return path.resolve(DEFAULT_ALEX_WORKSPACE_ROOT);
+}

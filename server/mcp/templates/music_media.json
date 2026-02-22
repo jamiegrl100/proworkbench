@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "music_media",
+  "name": "Music MCP",
+  "description": "Music controls for web player flows (stub).",
+  "risk": "low",
+  "allowedChannels": [
+    "webchat"
+  ],
+  "requiresApprovalByDefault": false,
+  "fields": [],
+  "securityDefaults": {
+    "testPlan": [
+      "GET /health",
+      "open music web player url",
+      "play/pause",
+      "seek/volume/queue"
+    ]
+  },
+  "defaultCapabilities": [
+    "browser.open_url",
+    "music.play",
+    "music.pause",
+    "music.seek",
+    "music.volume",
+    "music.queue"
+  ]
+}

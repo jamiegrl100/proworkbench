@@ -15,10 +15,14 @@ type InstalledRow = {
 
 export default function ExtensionsPage({
   enabledPluginIds,
+  availablePlugins,
   onChange,
+  onPluginsChanged,
 }: {
   enabledPluginIds: string[];
+  availablePlugins: any[];
   onChange: (ids: string[]) => void;
+  onPluginsChanged?: () => Promise<void> | void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -27,9 +31,11 @@ export default function ExtensionsPage({
   const [installed, setInstalled] = useState<InstalledRow[]>([]);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [signature, setSignature] = useState('');
+  const [signatureFile, setSignatureFile] = useState<File | null>(null);
+  const [expectedSha256, setExpectedSha256] = useState('');
   const [installReport, setInstallReport] = useState<any>(null);
 
-  const plugins = useMemo(() => getAllPlugins(), []);
+  const plugins = useMemo(() => getAllPlugins(availablePlugins || []), [availablePlugins]);
   const installedById = useMemo(() => {
     const map = new Map<string, InstalledRow>();
     for (const row of installed) map.set(String(row.id), row);
@@ -57,6 +63,10 @@ export default function ExtensionsPage({
   }, []);
 
   useEffect(() => {
+    setServerEnabled(enabledPluginIds || []);
+  }, [enabledPluginIds]);
+
+  useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(''), 2400);
     return () => clearTimeout(t);
@@ -74,6 +84,7 @@ export default function ExtensionsPage({
       const ids = Array.isArray(out?.enabled) ? out.enabled : payload.enabled;
       setServerEnabled(ids);
       onChange(ids);
+      await onPluginsChanged?.();
       setToast(nextEnabled ? 'Plugin enabled' : 'Plugin disabled');
     } catch (e: any) {
       setError(String(e?.detail?.error || e?.message || e));
@@ -82,9 +93,35 @@ export default function ExtensionsPage({
     }
   }
 
+  async function resolveSignatureText() {
+    const inline = String(signature || '').replace(/\s+/g, '');
+    if (inline) return inline;
+    if (!signatureFile) return '';
+    try {
+      const txt = await signatureFile.text();
+      return String(txt || '').replace(/\s+/g, '');
+    } catch {
+      return '';
+    }
+  }
+
   async function uploadInstall() {
     if (!uploadFile) {
       setError('Select a signed .zip package first.');
+      return;
+    }
+    const signatureText = await resolveSignatureText();
+    if (!signatureText) {
+      setError('Signature is required. Paste base64 signature or select a .sig file.');
+      return;
+    }
+    if (!/^[A-Za-z0-9+/=]+$/.test(signatureText)) {
+      setError('Signature must be base64 text.');
+      return;
+    }
+    const cleanedSha256 = String(expectedSha256 || '').trim().toLowerCase();
+    if (cleanedSha256 && !/^[a-f0-9]{64}$/.test(cleanedSha256)) {
+      setError('sha256 must be 64 lowercase hex chars.');
       return;
     }
     setBusy(true);
@@ -93,7 +130,8 @@ export default function ExtensionsPage({
     try {
       const fd = new FormData();
       fd.set('file', uploadFile);
-      fd.set('signature', signature.trim());
+      fd.set('signature', signatureText);
+      if (cleanedSha256) fd.set('sha256', cleanedSha256);
       const res = await fetch('/admin/extensions/upload', {
         method: 'POST',
         headers: {
@@ -109,6 +147,10 @@ export default function ExtensionsPage({
       setInstallReport(body);
       setToast(`Installed ${body.id}@${body.installedVersion}`);
       setUploadFile(null);
+      setSignatureFile(null);
+      setSignature('');
+      setExpectedSha256('');
+      await onPluginsChanged?.();
       await load();
     } catch (e: any) {
       setError(String(e?.message || e));
@@ -124,6 +166,7 @@ export default function ExtensionsPage({
     try {
       await postJson('/admin/extensions/uninstall', { id });
       setToast(`Uninstalled ${id}`);
+      await onPluginsChanged?.();
       await load();
     } catch (e: any) {
       setError(String(e?.detail?.error || e?.message || e));
@@ -137,17 +180,17 @@ export default function ExtensionsPage({
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h2 style={{ margin: 0 }}>Extensions</h2>
-          <div style={{ fontSize: 13, opacity: 0.8 }}>Signed ZIP install only. Install pipeline: stage → verify signature → scan → test → install.</div>
+          <div style={{ fontSize: 13, opacity: 0.8 }}>Signed ZIP install only. Install pipeline: stage → verify hash → verify signature → scan → test → install.</div>
         </div>
         <button onClick={load} disabled={busy} style={{ padding: '8px 12px' }}>Refresh</button>
       </div>
 
-      {error ? <div style={{ border: '1px solid #f1c6c6', background: '#fff4f4', color: '#b00020', borderRadius: 8, padding: 10 }}>{error}</div> : null}
-      {toast ? <div style={{ border: '1px solid #dbeafe', background: '#eff6ff', color: '#1d4ed8', borderRadius: 8, padding: 10 }}>{toast}</div> : null}
+      {error ? <div style={{ border: '1px solid color-mix(in srgb, var(--bad) 45%, var(--border))', background: 'color-mix(in srgb, var(--bad) 12%, var(--panel))', color: 'var(--bad)', borderRadius: 8, padding: 10 }}>{error}</div> : null}
+      {toast ? <div style={{ border: '1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))', background: 'color-mix(in srgb, var(--accent-2) 10%, var(--panel))', color: 'var(--accent-2)', borderRadius: 8, padding: 10 }}>{toast}</div> : null}
 
-      <section style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 12, display: 'grid', gap: 10 }}>
+      <section style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 12, display: 'grid', gap: 10 }}>
         <h3 style={{ margin: 0 }}>Admin Install (ZIP upload)</h3>
-        <div style={{ fontSize: 12, opacity: 0.8 }}>Fail-closed policy: unsigned/invalid signature or missing ClamAV blocks install.</div>
+        <div style={{ fontSize: 12, opacity: 0.8 }}>Fail-closed policy: unsigned/invalid signature, hash mismatch, or missing ClamAV blocks install.</div>
         <input
           type='file'
           accept='.zip,application/zip'
@@ -158,18 +201,38 @@ export default function ExtensionsPage({
           <span style={{ fontSize: 12, opacity: 0.85 }}>Signature (base64, detached)</span>
           <textarea value={signature} onChange={(e) => setSignature(e.target.value)} rows={3} style={{ width: '100%' }} />
         </label>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <label style={{ display: 'grid', gap: 6 }}>
+          <span style={{ fontSize: 12, opacity: 0.85 }}>Or select signature file (.sig/.txt)</span>
+          <input
+            type='file'
+            accept='.sig,.txt,text/plain'
+            onChange={(e) => setSignatureFile(e.target.files?.[0] || null)}
+            disabled={busy}
+          />
+        </label>
+        <label style={{ display: 'grid', gap: 6 }}>
+          <span style={{ fontSize: 12, opacity: 0.85 }}>Expected SHA-256 (optional)</span>
+          <input
+            type='text'
+            value={expectedSha256}
+            onChange={(e) => setExpectedSha256(e.target.value)}
+            placeholder='64 hex chars'
+            disabled={busy}
+          />
+        </label>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <button onClick={uploadInstall} disabled={busy || !uploadFile} style={{ padding: '8px 12px' }}>Upload & Install</button>
           <span style={{ fontSize: 12, opacity: 0.75 }}>{uploadFile ? `${uploadFile.name} (${uploadFile.size} bytes)` : 'No package selected'}</span>
+          <span style={{ fontSize: 12, opacity: 0.75 }}>{signatureFile ? `signature file: ${signatureFile.name}` : 'No signature file selected'}</span>
         </div>
         {installReport ? (
-          <div style={{ border: '1px solid #dcfce7', background: '#f0fdf4', color: '#166534', borderRadius: 8, padding: 10, fontSize: 13 }}>
-            Installed <b>{installReport.id}</b> v<b>{installReport.installedVersion}</b>. Report: <code>{installReport.reportPath}</code>
+          <div style={{ border: '1px solid color-mix(in srgb, var(--ok) 16%, var(--panel))', background: 'color-mix(in srgb, var(--ok) 14%, var(--panel))', color: 'var(--ok)', borderRadius: 8, padding: 10, fontSize: 13 }}>
+            Installed <b>{installReport.id}</b> v<b>{installReport.installedVersion}</b>. SHA-256: <code>{installReport.zipSha256}</code>
           </div>
         ) : null}
       </section>
 
-      <section style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 12 }}>
+      <section style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 12 }}>
         <h3 style={{ marginTop: 0 }}>Installed plugins</h3>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 10 }}>
           {plugins.map((p) => {
@@ -177,19 +240,22 @@ export default function ExtensionsPage({
             const row = installedById.get(p.id);
             const verified = Boolean(row?.verified);
             return (
-              <div key={p.id} style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
+              <div key={p.id} style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
                   <div style={{ fontWeight: 700 }}>{p.name}</div>
-                  <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 999, background: enabled ? '#dcfce7' : '#e5e7eb', color: enabled ? '#166534' : '#374151' }}>
+                  <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 999, background: enabled ? 'color-mix(in srgb, var(--ok) 16%, var(--panel))' : 'var(--border-soft)', color: enabled ? 'var(--ok)' : 'var(--muted)' }}>
                     {enabled ? 'Enabled' : 'Disabled'}
                   </span>
                 </div>
                 <div style={{ fontSize: 12, opacity: 0.85 }}>{p.description}</div>
                 <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  id: <code>{p.id}</code> • version: <code>{row?.version || 'not installed'}</code>
+                  id: <code>{p.id}</code> • version: <code>{row?.version || 'n/a'}</code>
                 </div>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  verification: {verified ? 'verified' : 'not verified'}
+                <div style={{ fontSize: 12, opacity: 0.88, display: 'grid', gap: 4 }}>
+                  <div>Installed: <strong>{row ? 'Yes' : 'No'}</strong></div>
+                  <div>Enabled: <strong>{enabled ? 'Yes' : 'No'}</strong></div>
+                  <div>Verified/Signed: <strong>{verified ? 'Yes' : 'No'}</strong></div>
+                  <div>Publisher: <strong>{row?.publisher || (p as any).publisher || 'Unknown'}</strong></div>
                 </div>
                 <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, opacity: 0.85 }}>
                   {(p.capabilitiesSummary || []).map((c) => <li key={c}>{c}</li>)}
@@ -207,7 +273,7 @@ export default function ExtensionsPage({
         </div>
       </section>
 
-      <section style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 12, opacity: 0.75 }}>
+      <section style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 12, opacity: 0.75 }}>
         <h3 style={{ marginTop: 0 }}>Directory browsing</h3>
         <div style={{ fontSize: 12 }}>Optional online directory browsing is disabled by default and not auto-fetched.</div>
       </section>

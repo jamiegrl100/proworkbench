@@ -1,40 +1,19 @@
 import fetch from 'node-fetch';
-import { buildMemoryContext } from '../memory/context.js';
+import { buildMemoryContextWithArchive } from '../memory/context.js';
+import { getHot } from '../memory/hot.js';
+import { DEFAULT_AGENT_ID, loadMemory } from '../memory/store.js';
 import { getWorkspaceRoot } from '../util/workspace.js';
+import { getActiveProvider, getProviderSecret, PROVIDER_TYPES } from './providerConfig.js';
 
 function nowIso() { return new Date().toISOString(); }
 const REQUIRED_DEFAULT_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
 
 function sanitizeModelText(raw) {
   let s = String(raw ?? '');
-
-  // Common "thinking" wrappers from local reasoning models.
   s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');
   s = s.replace(/<analysis>[\s\S]*?<\/analysis>/gi, '');
-
-  // Some models prefix with "Thoughts:" / "Thinking:" blocks.
   s = s.replace(/^(?:thoughts?|thinking)\s*:\s*[\s\S]*?(?:\n{2,}|$)/i, '');
-
-  // Strip common markdown headings that are used for hidden reasoning.
-  s = s.replace(/^#{1,6}\s*(?:thinking|thoughts?|analysis|思考|推理|想法)\s*[\s\S]*?(?:\n{2,}|$)/i, '');
-
-  // Remove common "boxed" wrappers (some chat templates emit these).
-  s = s.replace(/^\s*(?:BEGIN OF BOX|END OF BOX|BEGIN BOX|END BOX)\s*$/gmi, '');
-
-  // Remove standalone box-drawing lines (ASCII/Unicode frames).
-  s = s.replace(/^\s*[┌┐└┘├┤┬┴┼─━═│┃╭╮╰╯]+\s*$/gmu, '');
-
-  // Remove multi-line boxed blocks where every line starts/ends with a border char.
-  // This is conservative: it only targets lines that look like UI frames.
-  s = s.replace(/^\s*[│┃]\s*.*\s*[│┃]\s*$/gmu, (line) => {
-    // Keep content between borders.
-    const t = line.replace(/^\s*[│┃]\s*/u, '').replace(/\s*[│┃]\s*$/u, '');
-    return t;
-  });
-
-  // Trim extra whitespace/newlines.
   s = s.replace(/\n{3,}/g, '\n\n').trim();
-
   return s;
 }
 
@@ -45,7 +24,8 @@ function normalizeBaseUrl(u) {
 
 function kvGet(db, key, fallback) {
   const row = db.prepare('SELECT value_json FROM app_kv WHERE key = ?').get(key);
-  return row ? JSON.parse(row.value_json) : fallback;
+  if (!row) return fallback;
+  try { return JSON.parse(row.value_json); } catch { return fallback; }
 }
 
 function kvSet(db, key, value) {
@@ -56,161 +36,191 @@ function kvSet(db, key, value) {
 function traceInsert(db, { method, path, status, durationMs, profile, ok }) {
   db.prepare('INSERT INTO llm_request_trace (ts, method, path, status, duration_ms, profile, ok) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(nowIso(), method, path, status ?? null, durationMs ?? null, profile ?? null, ok ? 1 : 0);
-  db.exec(`
-    DELETE FROM llm_request_trace
-    WHERE id NOT IN (SELECT id FROM llm_request_trace ORDER BY id DESC LIMIT 10);
-  `);
+  db.exec('DELETE FROM llm_request_trace WHERE id NOT IN (SELECT id FROM llm_request_trace ORDER BY id DESC LIMIT 40)');
 }
 
-function getDefaultModel(db) {
-  const sel = kvGet(db, 'llm.selectedModel', null);
-  if (sel) return sel;
-  const preferred = db.prepare('SELECT id FROM llm_models_cache WHERE id = ? LIMIT 1').get(REQUIRED_DEFAULT_MODEL)?.id || null;
-  if (preferred) {
-    kvSet(db, 'llm.selectedModel', preferred);
-    return preferred;
-  }
-  const row = db.prepare('SELECT id FROM llm_models_cache ORDER BY discovered_at DESC LIMIT 1').get();
-  if (row?.id) kvSet(db, 'llm.selectedModel', row.id);
-  return row?.id ?? null;
-}
-
-async function fetchJsonWithTimeout(url, options, timeoutMs) {
+async function fetchJsonWithTimeout(url, options, timeoutMs, externalSignal = null, fetchImpl = fetch) {
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const t = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const signal = externalSignal ? AbortSignal.any([externalSignal, controller.signal]) : controller.signal;
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetchImpl(url, { ...options, signal });
     const txt = await res.text();
     let json = null;
     try { json = txt ? JSON.parse(txt) : null; } catch { json = null; }
     return { res, txt, json };
+  } catch (e) {
+    if (e?.name === 'AbortError') {
+      throw new Error(timedOut ? 'LLM timeout' : 'LLM aborted');
+    }
+    throw e;
   } finally {
     clearTimeout(t);
   }
+}
+
+function ensureModel(db, provider) {
+  const selected = String(kvGet(db, 'llm.selectedModel', '') || '').trim();
+  const providerModels = Array.isArray(provider?.models) ? provider.models.map((m) => String(m || '').trim()).filter(Boolean) : [];
+  if (selected) return selected;
+  if (providerModels.includes(REQUIRED_DEFAULT_MODEL)) {
+    kvSet(db, 'llm.selectedModel', REQUIRED_DEFAULT_MODEL);
+    return REQUIRED_DEFAULT_MODEL;
+  }
+  const first = providerModels[0] || null;
+  if (first) kvSet(db, 'llm.selectedModel', first);
+  return first;
+}
+
+function mapOpenAiMessages(systemWithMemory, messageText) {
+  const messages = [];
+  if (systemWithMemory && systemWithMemory.trim()) messages.push({ role: 'system', content: systemWithMemory });
+  messages.push({ role: 'user', content: String(messageText || '') });
+  return messages;
+}
+
+async function callOpenAiCompatible({ baseUrl, apiKey, model, systemWithMemory, messageText, temperature, maxTokens, timeoutMs, signal, fetchImpl = fetch }) {
+  const url = `${normalizeBaseUrl(baseUrl)}/v1/chat/completions`;
+  const body = {
+    model,
+    messages: mapOpenAiMessages(systemWithMemory, messageText),
+    temperature: typeof temperature === 'number' ? temperature : 0.7,
+  };
+  if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = Math.floor(maxTokens);
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  return await fetchJsonWithTimeout(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  }, timeoutMs, signal, fetchImpl);
+}
+
+async function callAnthropic({ baseUrl, apiKey, model, systemWithMemory, messageText, maxTokens, timeoutMs, signal, fetchImpl = fetch }) {
+  const url = `${normalizeBaseUrl(baseUrl)}/v1/messages`;
+  const userContent = systemWithMemory && systemWithMemory.trim()
+    ? `${systemWithMemory.trim()}\n\nUser:\n${String(messageText || '')}`
+    : String(messageText || '');
+  const body = {
+    model,
+    max_tokens: (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) ? Math.floor(maxTokens) : 1024,
+    messages: [{ role: 'user', content: userContent }],
+  };
+  return await fetchJsonWithTimeout(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(body),
+  }, timeoutMs, signal, fetchImpl);
+}
+
+async function callGemini({ baseUrl, apiKey, model, systemWithMemory, messageText, timeoutMs, signal, fetchImpl = fetch }) {
+  const m = String(model || '').replace(/^models\//, '');
+  const url = `${normalizeBaseUrl(baseUrl)}/v1beta/models/${encodeURIComponent(m)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const prompt = systemWithMemory && systemWithMemory.trim()
+    ? `${systemWithMemory.trim()}\n\nUser:\n${String(messageText || '')}`
+    : String(messageText || '');
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.7 },
+  };
+  return await fetchJsonWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, timeoutMs, signal, fetchImpl);
 }
 
 export async function llmChatOnce({
   db,
   messageText,
   systemText = null,
+  sessionId = null,
+  agentId = DEFAULT_AGENT_ID,
+  chatId = null,
   timeoutMs = 60_000,
   temperature = 0.7,
   maxTokens = null,
+  signal = null,
+  fetchImpl = fetch,
 } = {}) {
-  const providerId = kvGet(db, 'llm.providerId', 'textwebui');
-  const baseUrl = normalizeBaseUrl(kvGet(db, 'llm.baseUrl', providerId === 'openai' ? 'https://api.openai.com' : (providerId === 'anthropic' ? 'https://api.anthropic.com' : (process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:5000'))));
-  const profile = kvGet(db, 'llm.activeProfile', null); // 'openai' | 'gateway' | 'anthropic' | null
-  const model = getDefaultModel(db);
+  const provider = getActiveProvider(db);
+  const providerId = String(provider?.id || '');
+  const providerType = String(provider?.providerType || PROVIDER_TYPES.OPENAI_COMPATIBLE);
+  const baseUrl = normalizeBaseUrl(provider?.baseUrl || process.env.PROWORKBENCH_LLM_BASE_URL || 'http://127.0.0.1:5000');
+  const model = ensureModel(db, provider);
+  const apiKey = getProviderSecret(db, providerId);
 
-  if (!profile) return { ok: false, error: 'No active profile. Run LLM test.' };
-  if (!model) return { ok: false, error: 'No model available. Refresh models first.' };
-  if (providerId === 'openai' && !String(process.env.OPENAI_API_KEY || '').trim()) return { ok: false, error: 'OPENAI_API_KEY missing' };
+  if (!providerId) return { ok: false, error: 'No provider configured. Open Settings -> Models.' };
+  if (!model) return { ok: false, error: 'No model configured. Add a model ID in Settings -> Models.' };
+  if ((providerType === PROVIDER_TYPES.OPENAI || providerType === PROVIDER_TYPES.ANTHROPIC || providerType === PROVIDER_TYPES.GEMINI) && !apiKey) {
+    return { ok: false, error: `Missing API key for provider ${providerId}.` };
+  }
 
   const start = Date.now();
   try {
     let systemWithMemory = String(systemText || '');
     try {
-      const mem = await buildMemoryContext({ root: getWorkspaceRoot() });
-      if (String(mem?.text || '').trim()) {
-        systemWithMemory = `${systemWithMemory ? `${systemWithMemory.trim()}\n\n` : ''}${mem.text}`;
+      const normalizedChatId = String(chatId || sessionId || '').trim();
+      const normalizedAgentId = String(agentId || DEFAULT_AGENT_ID).trim() || DEFAULT_AGENT_ID;
+      if (normalizedChatId) {
+        const canonical = loadMemory({ db, agentId: normalizedAgentId, chatId: normalizedChatId });
+        const preface = String(canonical?.injectedPreface || '').trim();
+        if (preface && !systemWithMemory.includes('MEMORY (profile):') && !systemWithMemory.includes('MEMORY (chat summary):')) {
+          systemWithMemory = systemWithMemory ? `${systemWithMemory.trim()}\n\n${preface}` : preface;
+        }
       }
+
+      const mem = await buildMemoryContextWithArchive({ db, root: getWorkspaceRoot() });
+      const hot = getHot({ sessionId, maxItems: 20, maxChars: 8000 });
+      const hotBlock = String(hot?.text || '').trim() ? `[RECENT MEMORY]\n${hot.text}\n[/RECENT MEMORY]` : '';
+      const durableBlock = String(mem?.text || '').trim();
+      const joined = [hotBlock, durableBlock].filter(Boolean).join('\n\n');
+      if (joined) systemWithMemory = systemWithMemory ? `${systemWithMemory.trim()}\n\n${joined}` : joined;
     } catch {
-      // Never fail LLM requests if memory context cannot be built.
+      // memory is best-effort only
     }
 
-    if (profile === 'openai') {
-      const path = '/v1/chat/completions';
-      const url = baseUrl + path;
-      const messages = [];
-      if (systemWithMemory && systemWithMemory.trim()) messages.push({ role: 'system', content: systemWithMemory });
-      messages.push({ role: 'user', content: String(messageText || '') });
-      const body = {
-        model,
-        messages,
-        temperature: typeof temperature === 'number' ? temperature : 0.7,
-      };
-      if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) {
-        body.max_tokens = Math.floor(maxTokens);
-      }
-      const { res, json } = await fetchJsonWithTimeout(url, {
-        method: 'POST',
-        headers: {
-        'Content-Type': 'application/json',
-        ...(providerId === 'openai'
-          ? { Authorization: `Bearer ${String(process.env.OPENAI_API_KEY || '').trim()}` }
-          : {}),
-      },
-        body: JSON.stringify(body),
-      }, timeoutMs);
+    let call;
+    let path = '/v1/chat/completions';
 
-      traceInsert(db, { method: 'POST', path, status: res.status, durationMs: Date.now() - start, profile, ok: res.ok });
-      if (!res.ok) return { ok: false, error: `LLM HTTP ${res.status}` };
-
-      const content = json?.choices?.[0]?.message?.content ?? json?.choices?.[0]?.text ?? null;
-      if (!content || !String(content).trim()) return { ok: false, error: 'Empty LLM response.' };
-      const clean = sanitizeModelText(content);
-      if (!clean) return { ok: false, error: 'Empty LLM response.' };
-      return { ok: true, text: clean, model, profile };
+    if (providerType === PROVIDER_TYPES.ANTHROPIC) {
+      path = '/v1/messages';
+      call = await callAnthropic({ baseUrl, apiKey, model, systemWithMemory, messageText, maxTokens, timeoutMs, signal, fetchImpl });
+    } else if (providerType === PROVIDER_TYPES.GEMINI) {
+      path = '/v1beta/models/*:generateContent';
+      call = await callGemini({ baseUrl, apiKey, model, systemWithMemory, messageText, timeoutMs, signal, fetchImpl });
+    } else {
+      call = await callOpenAiCompatible({ baseUrl, apiKey, model, systemWithMemory, messageText, temperature, maxTokens, timeoutMs, signal, fetchImpl });
     }
 
-    if (providerId === 'anthropic' || profile === 'anthropic') {
-  const key = String(process.env.ANTHROPIC_API_KEY || '').trim();
-  if (!key) return { ok: false, error: 'ANTHROPIC_API_KEY missing' };
-  const path = '/v1/messages';
-  const url = baseUrl + path;
-  const userContent = systemWithMemory && systemWithMemory.trim()
-    ? `${systemWithMemory.trim()}\n\nUser:\n${String(messageText || '')}`
-    : String(messageText || '');
-	  const body = {
-	    model,
-	    max_tokens: (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) ? Math.floor(maxTokens) : 1024,
-	    messages: [{ role: 'user', content: userContent }],
-	  };
-  const { res, json } = await fetchJsonWithTimeout(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify(body),
-  }, timeoutMs);
-
-  traceInsert(db, { method: 'POST', path, status: res.status, durationMs: Date.now() - start, profile: 'anthropic', ok: res.ok });
-  if (!res.ok) return { ok: false, error: `LLM HTTP ${res.status}` };
-
-  const content = json?.content?.[0]?.text ?? null;
-  const clean = sanitizeModelText(content);
-  if (!clean) return { ok: false, error: 'Empty LLM response.' };
-  return { ok: true, text: clean, model, profile: 'anthropic' };
-}
-
-// Gateway best-effort (your legacy/custom endpoint)
-    const path = '/api/v1/chat';
-    const url = baseUrl + path;
-    const message = systemWithMemory && systemWithMemory.trim()
-      ? `${systemWithMemory.trim()}\n\nUser:\n${String(messageText || '')}`
-      : String(messageText || '');
-    const body = { model, message };
-    if (typeof temperature === 'number' && Number.isFinite(temperature)) body.temperature = temperature;
-    if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = Math.floor(maxTokens);
-    const { res, json } = await fetchJsonWithTimeout(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(providerId === 'openai'
-          ? { Authorization: `Bearer ${String(process.env.OPENAI_API_KEY || '').trim()}` }
-          : {}),
-      },
-      body: JSON.stringify(body),
-    }, timeoutMs);
-
-    traceInsert(db, { method: 'POST', path, status: res.status, durationMs: Date.now() - start, profile, ok: res.ok });
+    const { res, json } = call;
+    traceInsert(db, { method: 'POST', path, status: res.status, durationMs: Date.now() - start, profile: providerId, ok: res.ok });
     if (!res.ok) return { ok: false, error: `LLM HTTP ${res.status}` };
 
-    const content = json?.message ?? json?.reply ?? json?.text ?? json?.choices?.[0]?.message?.content ?? null;
-    if (!content || !String(content).trim()) return { ok: false, error: 'Empty LLM response.' };
+    let content = null;
+    if (providerType === PROVIDER_TYPES.ANTHROPIC) {
+      content = json?.content?.[0]?.text ?? null;
+    } else if (providerType === PROVIDER_TYPES.GEMINI) {
+      content = json?.candidates?.[0]?.content?.parts?.[0]?.text ?? null;
+    } else {
+      content = json?.choices?.[0]?.message?.content ?? json?.message ?? json?.reply ?? json?.text ?? null;
+    }
+
     const clean = sanitizeModelText(content);
-      if (!clean) return { ok: false, error: 'Empty LLM response.' };
-      return { ok: true, text: clean, model, profile };
+    if (!clean) return { ok: false, error: 'Empty LLM response.' };
+    return { ok: true, text: clean, model, profile: providerId };
   } catch (e) {
-    traceInsert(db, { method: 'POST', path: profile === 'openai' ? '/v1/chat/completions' : '/api/v1/chat', status: null, durationMs: Date.now() - start, profile, ok: false });
-    return { ok: false, error: String(e?.name === 'AbortError' ? 'LLM timeout' : (e?.message || e)) };
+    traceInsert(db, { method: 'POST', path: '/v1/chat/completions', status: null, durationMs: Date.now() - start, profile: providerId, ok: false });
+    return { ok: false, error: String(e?.message || e) };
   }
 }

@@ -13,7 +13,7 @@
     "build": "npm -w ui run build && npm -w server run build",
     "i18n:sync": "npm -w ui run i18n:sync",
     "i18n:audit": "npm -w ui run i18n:audit",
-    "start": "npm -w server run start",
+    "start": "PROWORKBENCH_ADMIN_TOKEN=admin-secret npm -w server run start",
     "plugins:smoke": "bash scripts/plugin-smoke.sh"
   },
   "devDependencies": {

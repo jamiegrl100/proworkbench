@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Directory Assistant</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #111a2e;
+      --panel2: #16213b;
+      --text: #e6edf7;
+      --muted: #9fb0ce;
+      --border: #2a3857;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --accent1: #22c55e;
+      --accent2: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: radial-gradient(1200px 500px at 10% -20%, rgba(34,197,94,.18), transparent 45%), radial-gradient(900px 460px at 95% -10%, rgba(56,189,248,.2), transparent 42%), var(--bg);
+      color: var(--text);
+    }
+    .wrap { padding: 14px; display: grid; gap: 12px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .grid { display: grid; gap: 8px; }
+    .split { display: grid; grid-template-columns: 1.2fr 1fr; gap: 10px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    input, textarea, select, button {
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font: inherit;
+    }
+    button.primary {
+      background: linear-gradient(135deg, var(--accent1), var(--accent2));
+      color: #04101f;
+      font-weight: 700;
+    }
+    button.warn { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); }
+    button.danger { border-color: color-mix(in srgb, var(--bad) 50%, var(--border)); }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 6px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; }
+    .pill { display:inline-flex; border-radius:999px; padding:2px 8px; font-size:11px; border:1px solid var(--border); background: var(--panel2); }
+    .pill.ok { color: var(--ok); }
+    .pill.warn { color: var(--warn); }
+    .pill.bad { color: var(--bad); }
+    .box { max-height: 240px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+    a { color: var(--accent2); }
+    .log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+    @media (max-width: 980px) { .split { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:flex-start;">
+        <div>
+          <h2 style="margin:0;">Directory Assistant</h2>
+          <div class="muted">Human-in-the-loop submissions. No auto-submit. No CAPTCHA bypass.</div>
+          <div class="row" style="margin-top:8px;">
+            <select id="projectSelect"></select>
+            <input id="projectName" placeholder="new project name" />
+            <input id="projectPrimaryDomain" placeholder="primary domain (optional)" />
+            <button id="saveProjectBtn" type="button">Save Project</button>
+          </div>
+        </div>
+        <div class="row">
+          <button id="refreshBtn">Refresh</button>
+          <button id="exportJsonBtn">Export JSON</button>
+          <button id="exportCsvBtn">Export CSV</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="card grid">
+        <div class="row" style="justify-content:space-between;">
+          <strong>Targets</strong>
+          <div class="row">
+            <input id="searchInput" placeholder="search url/domain/notes" />
+            <select id="statusFilter">
+              <option value="">all</option>
+              <option>new</option><option>in_progress</option><option>submitted</option><option>skipped</option>
+            </select>
+            <select id="pricingFilter">
+              <option value="">pricing: all</option>
+              <option value="unknown">unknown</option><option value="free">free</option><option value="freemium">freemium</option><option value="paid">paid</option>
+            </select>
+            <label class="row" style="font-size:12px;"><input id="vettedOnly" type="checkbox" />Vetted only</label>
+            <label class="row" style="font-size:12px;"><input id="hideSubmitted" type="checkbox" checked />Hide submitted</label>
+          </div>
+        </div>
+        <textarea id="bulkUrls" rows="4" placeholder="paste URLs (one per line)"></textarea>
+        <div class="row">
+          <button id="addUrlsBtn" class="primary">Add Targets</button>
+          <input id="importJsonFile" type="file" accept="application/json,.json" />
+          <button id="importJsonBtn" disabled>Import JSON</button>
+          <button id="genQueriesBtn">Generate Queries</button>
+        </div>
+        <div id="importJsonStatus" class="muted">Select a JSON file to import.</div>
+        <div id="queries" class="log" style="display:none"></div>
+        <div class="box">
+          <table id="targetsTable">
+            <thead><tr><th></th><th>URL</th><th>Status</th><th>Pricing</th><th>Vetting</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="grid" style="border-top:1px solid var(--border); padding-top:8px;">
+          <div class="row">
+            <strong>Bulk Ops</strong>
+            <span id="bulkSelectedCount" class="muted">0 selected</span>
+          </div>
+          <div class="row">
+            <select id="bulkStatus"><option value="">status: (no change)</option><option value="new">new</option><option value="in_progress">in_progress</option><option value="submitted">submitted</option><option value="skipped">skipped</option></select>
+            <select id="bulkPricing"><option value="">pricing: (no change)</option><option value="unknown">unknown</option><option value="free">free</option><option value="freemium">freemium</option><option value="paid">paid</option></select>
+            <input id="bulkCost" placeholder="cost (optional)" />
+            <select id="bulkVetted"><option value="">vetted: (no change)</option><option value="true">vetted</option><option value="false">not vetted</option></select>
+          </div>
+          <div class="row">
+            <input id="bulkAddTags" placeholder="add tags comma-separated" />
+            <input id="bulkRemoveTags" placeholder="remove tags comma-separated" />
+            <button id="bulkApplyBtn" type="button">Apply Bulk</button>
+            <button id="bulkExportBtn" type="button">Export Filtered JSON</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card grid">
+        <strong>Details</strong>
+        <div id="selectedHint" class="muted">Select a target.</div>
+        <div id="details" style="display:none" class="grid">
+          <div class="muted" id="selUrl"></div>
+          <div class="row">
+            <select id="selStatus">
+              <option>new</option><option>in_progress</option><option>submitted</option><option>skipped</option>
+            </select>
+            <select id="selType">
+              <option>directory</option><option>alt-search</option><option>blog-list</option><option>forum</option><option>misc</option>
+            </select>
+            <button id="saveTargetBtn">Save</button>
+            <button id="openBtn" class="primary">Open</button>
+          </div>
+          <textarea id="selNotes" rows="3" placeholder="notes"></textarea>
+          <textarea id="selTags" rows="2" placeholder="global tags comma-separated"></textarea>
+          <div class="row">
+            <select id="selPricingStatus"><option value="unknown">unknown</option><option value="free">free</option><option value="freemium">freemium</option><option value="paid">paid</option></select>
+            <input id="selCost" placeholder="cost (per project)" />
+            <label class="row"><input id="selVetted" type="checkbox" /> vetted</label>
+          </div>
+          <textarea id="selProjectTags" rows="2" placeholder="project tags comma-separated"></textarea>
+
+          <div class="row">
+            <select id="profileSelect"></select>
+            <button id="saveProfileBtn">Save Profile</button>
+            <button id="requestPrefillBtn" class="warn">Run Prefill</button>
+            <button id="runPrefillBtn" class="primary">Request Approval / Submit</button>
+          </div>
+          <div id="prefillServerBanner" class="muted" style="display:none; color:var(--warn);"></div>
+          <div class="muted">Prefill is low-risk and runs immediately. Final submit is approval-gated by policy.</div>
+          <div id="prefillReview" class="log" style="display:none"></div>
+          <div class="row">
+            <button id="markSubmittedBtn">Mark Submitted</button>
+            <button id="markSkippedBtn">Mark Skipped</button>
+            <button id="resetNewBtn">Reset to New</button>
+            <input id="submitNote" placeholder="submission note" style="flex:1;min-width:220px;" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card grid">
+      <strong>Submission Profile + Settings</strong>
+      <div class="split">
+        <div class="grid">
+          <input id="p_siteName" placeholder="site name" />
+          <input id="p_siteUrl" placeholder="site url" />
+          <input id="p_contactEmail" placeholder="contact email" />
+          <input id="p_category" placeholder="category" />
+          <input id="p_keywords" placeholder="keywords" />
+          <input id="p_country" placeholder="country" />
+          <input id="p_rssUrl" placeholder="rss url" />
+          <input id="p_logoUrl" placeholder="logo url" />
+          <textarea id="p_descShort" rows="2" placeholder="short description"></textarea>
+          <textarea id="p_descLong" rows="3" placeholder="long description"></textarea>
+        </div>
+        <div class="grid">
+          <div class="grid" style="border:1px solid var(--border); border-radius:10px; padding:10px; gap:8px;">
+            <strong>Global Browser Allowlist</strong>
+            <div class="row">
+              <input id="allowlistAddInput" placeholder="example.com or *.example.com" style="flex:1;min-width:220px;" />
+              <button id="allowlistAddBtn" type="button">Add</button>
+              <button id="allowlistRestoreBtn" type="button">Restore defaults</button>
+            </div>
+            <div id="allowlistError" class="muted" style="color:var(--bad);"></div>
+            <div id="allowlistList" class="log" style="max-height:140px; overflow:auto;"></div>
+          </div>
+          <label class="row"><input type="checkbox" id="prefillEnabled" /> prefill enabled</label>
+          <label class="row"><input type="checkbox" id="requireSubmitApprovals" checked /> require approvals for submit actions</label>
+          <label class="row"><span>browser server</span><select id="browserServerSelect"></select><button id="prefillConfigureBtn" type="button">Fix / Configure</button><button id="openMcpBtn" type="button">MCP</button></label>
+          <div class="muted">Browsing is restricted by the Global Allowlist (Admin -> Security -> Browser Access).</div>
+          <label class="row"><span>max prefill/day</span><input id="maxPrefillPerDay" type="number" value="25" /></label>
+          <label class="row"><span>throttle seconds</span><input id="throttleSeconds" type="number" value="15" /></label>
+          <select id="loggingVerbosity"><option>low</option><option selected>normal</option><option>high</option></select>
+          <input id="exportPath" placeholder="export path" />
+          <button id="saveSettingsBtn">Save Settings</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card grid">
+      <strong>Attempts</strong>
+      <div class="box">
+        <table id="attemptsTable"><thead><tr><th>When</th><th>Target</th><th>Result</th><th>Error</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <div id="toast" class="pill" style="display:none"></div>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>

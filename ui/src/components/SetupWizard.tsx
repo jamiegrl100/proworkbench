@@ -1,61 +1,166 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 
 import Card from './Card';
 import { getJson, postJson } from './api';
-import type { SetupState } from '../types';
-import { useI18n } from '../i18n/LanguageProvider';
+
+type WizardStep = 1 | 2 | 3;
+type SupportedProvider = 'telegram' | 'slack';
+type ProviderId = SupportedProvider | 'discord' | 'whatsapp' | 'signal' | 'matrix';
+type ProviderOption = {
+  id: ProviderId;
+  label: string;
+  available: boolean;
+  status?: 'available' | 'coming_soon';
+};
+type TextWebuiStatus = { running: boolean; ready: boolean; baseUrl: string; models: string[]; error?: string };
+
+const REQUIRED_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
+const SETUP_WIZARD_STORAGE_KEY = 'pb_setup_wizard_v1';
+const DEFAULT_PROVIDER_OPTIONS: ProviderOption[] = [
+  { id: 'telegram', label: 'Telegram', available: true, status: 'available' },
+  { id: 'slack', label: 'Slack', available: true, status: 'available' },
+  { id: 'discord', label: 'Discord', available: false, status: 'coming_soon' },
+  { id: 'whatsapp', label: 'WhatsApp', available: false, status: 'coming_soon' },
+  { id: 'signal', label: 'Signal', available: false, status: 'coming_soon' },
+  { id: 'matrix', label: 'Matrix', available: false, status: 'coming_soon' },
+];
+
+function isWizardStep(v: any): v is WizardStep {
+  return v === 1 || v === 2 || v === 3;
+}
+
+function isSupportedProvider(v: any): v is SupportedProvider {
+  return v === 'telegram' || v === 'slack';
+}
+
+function formatApiError(e: any): string {
+  const detail = e?.detail || {};
+  const parts = [
+    detail?.message,
+    detail?.error,
+    detail?.remediation,
+    e?.message,
+  ]
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+  return parts.length ? parts.join(' | ') : 'Request failed';
+}
+
+function safeReadWizardState(): any {
+  try {
+    const raw = sessionStorage.getItem(SETUP_WIZARD_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
 
 export default function SetupWizard({ onConfigured }: { onConfigured: () => void }) {
-  const { t } = useI18n();
-  const [step, setStep] = useState<1 | 2 | 3>(1);
-  const [err, setErr] = useState<string>('');
-  const [info, setInfo] = useState<string>('');
+  const persisted = useMemo(() => safeReadWizardState(), []);
 
-  const [botApiToken, setBotApiToken] = useState('');
-  const [tgToken, setTgToken] = useState('');
-  const [allowedIds, setAllowedIds] = useState('');
+  const [step, setStep] = useState<WizardStep>(isWizardStep(persisted?.step) ? persisted.step : 1);
+  const [err, setErr] = useState('');
+  const [info, setInfo] = useState('');
+  const [busy, setBusy] = useState(false);
 
-  const REQUIRED_MODEL = 'models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf';
+  const [providerOptions, setProviderOptions] = useState<ProviderOption[]>(DEFAULT_PROVIDER_OPTIONS);
+  const [provider, setProvider] = useState<SupportedProvider>(isSupportedProvider(persisted?.provider) ? persisted.provider : 'telegram');
+  const [msgConfigured, setMsgConfigured] = useState(false);
+  const [msgTestOk, setMsgTestOk] = useState(false);
+  const [msgTestAt, setMsgTestAt] = useState<string | null>(null);
 
-  type TextWebuiStatus = { running: boolean; ready: boolean; baseUrl: string; models: string[]; error?: string };
+  const [botApiToken, setBotApiToken] = useState(String(persisted?.botApiToken || ''));
+  const [tgToken, setTgToken] = useState(String(persisted?.tgToken || ''));
+  const [adminChatId, setAdminChatId] = useState(String(persisted?.adminChatId || ''));
 
-  const [baseUrl, setBaseUrl] = useState('http://127.0.0.1:5000');
-  const [mode, setMode] = useState<'auto' | 'force_openai' | 'force_gateway'>('auto');
-  const [testing, setTesting] = useState(false);
+  const [slackBotToken, setSlackBotToken] = useState(String(persisted?.slackBotToken || ''));
+  const [slackAppToken, setSlackAppToken] = useState(String(persisted?.slackAppToken || ''));
+  const [slackSigningSecret, setSlackSigningSecret] = useState(String(persisted?.slackSigningSecret || ''));
+  const [slackDefaultChannel, setSlackDefaultChannel] = useState(String(persisted?.slackDefaultChannel || ''));
+
+  const [baseUrl, setBaseUrl] = useState(String(persisted?.baseUrl || 'http://127.0.0.1:5000'));
+  const [mode, setMode] = useState<'auto' | 'force_openai' | 'force_gateway'>(persisted?.mode || 'auto');
+  const [testingModel, setTestingModel] = useState(false);
   const [activeProfile, setActiveProfile] = useState<'openai' | 'gateway' | null>(null);
   const [lastRefreshedAt, setLastRefreshedAt] = useState<string | null>(null);
   const [textwebui, setTextwebui] = useState<TextWebuiStatus | null>(null);
   const [textwebuiModels, setTextwebuiModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>('');
+  const [selectedModel, setSelectedModel] = useState<string>(String(persisted?.selectedModel || ''));
+
+  const canContinueMessaging = msgConfigured && msgTestOk;
+  const canContinueModel = Boolean(textwebui?.running && textwebui?.ready && selectedModel);
 
   useEffect(() => {
     (async () => {
       try {
         const s = await getJson<any>('/admin/setup/state');
+        const m = s?.messaging || {};
+        if (Array.isArray(s?.messagingProviders) && s.messagingProviders.length > 0) {
+          setProviderOptions(s.messagingProviders);
+        }
+        if (isSupportedProvider(m?.provider)) setProvider(m.provider);
+        setMsgConfigured(Boolean(m?.configured));
+        setMsgTestOk(Boolean(m?.last_test_ok));
+        setMsgTestAt(m?.last_test_at || null);
         setBaseUrl(s?.llm?.baseUrl || 'http://127.0.0.1:5000');
         setMode(s?.llm?.mode || 'auto');
         setActiveProfile(s?.llm?.activeProfile || null);
         setLastRefreshedAt(s?.llm?.lastRefreshedAt || null);
-        if (s?.secretsOk) setStep(2);
-      } catch {
-        // ignore
-      }
+      } catch {}
       try {
         const cfg = await getJson<any>('/admin/runtime/textwebui/config');
         if (cfg?.baseUrl) setBaseUrl(String(cfg.baseUrl));
         if (cfg?.selectedModel) setSelectedModel(String(cfg.selectedModel));
-      } catch {
-        // ignore
-      }
+      } catch {}
       try {
         const st = await getJson<TextWebuiStatus>('/admin/runtime/textwebui/status');
         setTextwebui(st);
         setTextwebuiModels(Array.isArray(st?.models) ? st.models : []);
-      } catch {
-        // ignore
-      }
+      } catch {}
     })();
   }, []);
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(
+        SETUP_WIZARD_STORAGE_KEY,
+        JSON.stringify({
+          step,
+          provider,
+          botApiToken,
+          tgToken,
+          adminChatId,
+          slackBotToken,
+          slackAppToken,
+          slackSigningSecret,
+          slackDefaultChannel,
+          baseUrl,
+          mode,
+          selectedModel,
+        }),
+      );
+    } catch {
+      // ignore
+    }
+  }, [
+    step,
+    provider,
+    botApiToken,
+    tgToken,
+    adminChatId,
+    slackBotToken,
+    slackAppToken,
+    slackSigningSecret,
+    slackDefaultChannel,
+    baseUrl,
+    mode,
+    selectedModel,
+  ]);
+
+  useEffect(() => {
+    if (!canContinueMessaging && step > 1) setStep(1);
+  }, [canContinueMessaging, step]);
 
   function parsedBaseUrl(u: string) {
     try {
@@ -69,44 +174,74 @@ export default function SetupWizard({ onConfigured }: { onConfigured: () => void
     }
   }
 
-  async function saveSecrets() {
+  async function saveMessagingConfig() {
     setErr('');
     setInfo('');
-    await postJson(
-      '/admin/setup/secrets',
-      {
-        BOT_API_TOKEN: botApiToken,
-        TELEGRAM_BOT_TOKEN: tgToken,
-        TELEGRAM_ALLOWED_CHAT_IDS: allowedIds,
+    setBusy(true);
+    try {
+      if (provider === 'telegram') {
+        if ((!botApiToken.trim() && !tgToken.trim()) || !adminChatId.trim()) throw new Error('Telegram bot token (BOT_API_TOKEN or TELEGRAM_BOT_TOKEN) + admin chat id are required.');
+        await postJson('/admin/setup/messaging/configure', {
+          provider: 'telegram',
+          BOT_API_TOKEN: botApiToken,
+          TELEGRAM_BOT_TOKEN: tgToken,
+          admin_chat_id: adminChatId,
+        });
+      } else {
+        if (!slackBotToken.trim() || !slackAppToken.trim() || !slackSigningSecret.trim() || !slackDefaultChannel.trim()) {
+          throw new Error('Slack bot/app/signing tokens and default channel are required.');
+        }
+        await postJson('/admin/setup/messaging/configure', {
+          provider: 'slack',
+          SLACK_BOT_TOKEN: slackBotToken,
+          SLACK_APP_TOKEN: slackAppToken,
+          SLACK_SIGNING_SECRET: slackSigningSecret,
+          default_channel: slackDefaultChannel,
+        });
       }
-    );
-    setStep(2);
+      setMsgConfigured(true);
+      setMsgTestOk(false);
+      setInfo('Messaging config saved. Run Test Connection.');
+    } catch (e: any) {
+      setErr(formatApiError(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
-  async function testAndRefresh() {
+  async function testMessaging() {
     setErr('');
     setInfo('');
-    setTesting(true);
+    setBusy(true);
+    try {
+      const out = await postJson<any>('/admin/setup/messaging/test', {});
+      const ok = Boolean(out?.test?.ok);
+      setMsgTestOk(ok);
+      setMsgTestAt(out?.test?.at || null);
+      if (!ok) throw new Error(String(out?.test?.error || 'Messaging test failed'));
+      setInfo('Messaging test passed.');
+    } catch (e: any) {
+      setMsgTestOk(false);
+      setErr(formatApiError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function testAndRefreshModel() {
+    setErr('');
+    setInfo('');
+    setTestingModel(true);
     try {
       const { host, port } = parsedBaseUrl(baseUrl);
-      // Keep Text WebUI probe config aligned with the Base URL shown to user.
       await postJson('/admin/runtime/textwebui/config', { host, port });
       await postJson('/admin/setup/llm', { baseUrl, mode });
-      // Ensure provider is set to local Text WebUI for first-run defaults.
       await postJson('/admin/llm/config', { providerId: 'textwebui', providerName: 'Text WebUI', providerGroup: 'Local', baseUrl, mode });
-
       const tw = await getJson<TextWebuiStatus>('/admin/runtime/textwebui/status');
       setTextwebui(tw);
       setTextwebuiModels(Array.isArray(tw?.models) ? tw.models : []);
-      if (!tw.running) {
-        setErr(t('setup.webui.notRunningHelp'));
-        return;
-      }
-      if (tw.running && !tw.ready) {
-        setErr(t('setup.webui.noModelHelp', { requiredModel: REQUIRED_MODEL }));
-        return;
-      }
-
+      if (!tw.running) throw new Error('Text WebUI not running on configured URL.');
+      if (!tw.ready) throw new Error(`Text WebUI running but no model loaded. Required: ${REQUIRED_MODEL}`);
       const t = await postJson<{ ok: boolean; activeProfile: 'openai' | 'gateway' | null }>('/admin/llm/test', {});
       if (!t.ok || !t.activeProfile) throw new Error('LLM test failed');
       setActiveProfile(t.activeProfile);
@@ -114,190 +249,140 @@ export default function SetupWizard({ onConfigured }: { onConfigured: () => void
       setLastRefreshedAt(rm.lastRefreshedAt);
       const cfg = await getJson<any>('/admin/runtime/textwebui/config');
       if (cfg?.selectedModel) setSelectedModel(String(cfg.selectedModel));
-      setInfo(t('setup.webui.okReady'));
+      setInfo('Model connection test passed.');
     } catch (e: any) {
-      setErr(String(e?.detail?.error || e?.message || e));
+      setErr(formatApiError(e));
     } finally {
-      setTesting(false);
+      setTestingModel(false);
     }
   }
 
   async function chooseModel(modelId: string) {
     setErr('');
     setInfo('');
-    setTesting(true);
     try {
       await postJson('/admin/runtime/textwebui/select-model', { modelId });
       setSelectedModel(modelId);
-      setInfo(t('setup.modelSelected', { modelId }));
+      setInfo(`Selected model: ${modelId}`);
     } catch (e: any) {
-      setErr(String(e?.detail?.error || e?.message || e));
-    } finally {
-      setTesting(false);
+      setErr(formatApiError(e));
     }
   }
 
   async function finish() {
     setErr('');
     setInfo('');
-    await postJson('/admin/setup/complete', {});
-    onConfigured();
+    try {
+      await postJson('/admin/setup/complete', {});
+      try { sessionStorage.removeItem(SETUP_WIZARD_STORAGE_KEY); } catch {}
+      onConfigured();
+    } catch (e: any) {
+      setErr(formatApiError(e));
+    }
   }
 
-  const base = parsedBaseUrl(baseUrl);
-  const canContinueModelStep = Boolean(textwebui?.running && textwebui?.ready && selectedModel);
-
   return (
-    <div style={{ padding: 16, maxWidth: 860 }}>
-      <h2 style={{ marginTop: 0 }}>{t('setup.title')}</h2>
-      <p style={{ opacity: 0.8 }}>{t('setup.subtitle')}</p>
+    <div style={{ padding: 16, maxWidth: 900 }}>
+      <h2 style={{ marginTop: 0 }}>Setup Wizard</h2>
+      <p style={{ opacity: 0.8 }}>Messaging setup is required to finish install.</p>
 
-      {err ? (
-        <div style={{ padding: 12, border: '1px solid #f3c2c2', background: '#fff4f4', borderRadius: 10, marginBottom: 12 }}>
-          <div style={{ fontWeight: 700, marginBottom: 6 }}>{t('setup.actionRequiredTitle')}</div>
-          <div style={{ fontSize: 13 }}>{err}</div>
-        </div>
-      ) : null}
-
-      {info ? (
-        <div style={{ padding: 12, border: '1px solid #c8e6c9', background: '#e8f5e9', borderRadius: 10, marginBottom: 12 }}>
-          <div style={{ fontWeight: 700, marginBottom: 6 }}>{t('common.ok')}</div>
-          <div style={{ fontSize: 13 }}>{info}</div>
-        </div>
-      ) : null}
+      {err ? <div style={{ padding: 12, border: '1px solid var(--bad)', borderRadius: 10, color: 'var(--bad)', marginBottom: 12, whiteSpace: 'pre-wrap' }}>{err}</div> : null}
+      {info ? <div style={{ padding: 12, border: '1px solid var(--ok)', borderRadius: 10, color: 'var(--ok)', marginBottom: 12 }}>{info}</div> : null}
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd', opacity: step === 1 ? 1 : 0.6 }}>{t('setup.step.telegram')}</div>
-        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd', opacity: step === 2 ? 1 : 0.6 }}>{t('setup.step.model')}</div>
-        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid #ddd', opacity: step === 3 ? 1 : 0.6 }}>{t('setup.step.start')}</div>
+        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid var(--border)', opacity: step === 1 ? 1 : 0.6 }}>1) Messaging</div>
+        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid var(--border)', opacity: step === 2 ? 1 : 0.6 }}>2) Model</div>
+        <div style={{ padding: '6px 10px', borderRadius: 999, border: '1px solid var(--border)', opacity: step === 3 ? 1 : 0.6 }}>3) Start</div>
       </div>
 
       {step === 1 ? (
-        <Card title={t('setup.telegramSecretsTitle')}>
+        <Card title="Messaging (required)">
           <div style={{ display: 'grid', gap: 10 }}>
             <label>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>BOT_API_TOKEN</div>
-              <input type="password" value={botApiToken} onChange={(e) => setBotApiToken(e.target.value)} style={{ width: '100%', padding: 8 }} />
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Provider</div>
+              <select value={provider} onChange={(e) => setProvider(e.target.value as SupportedProvider)} style={{ width: 300, padding: 8 }}>
+                {providerOptions.map((p) => (
+                  <option key={p.id} value={p.id} disabled={!p.available}>
+                    {p.label}{p.available ? '' : ' (coming soon)'}
+                  </option>
+                ))}
+              </select>
             </label>
-            <label>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>TELEGRAM_BOT_TOKEN</div>
-              <input type="password" value={tgToken} onChange={(e) => setTgToken(e.target.value)} style={{ width: '100%', padding: 8 }} />
-            </label>
-            <label>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>TELEGRAM_ALLOWED_CHAT_IDS</div>
-              <textarea value={allowedIds} onChange={(e) => setAllowedIds(e.target.value)} rows={3} style={{ width: '100%', padding: 8 }} placeholder={t('setup.allowedIdsPlaceholder')} />
-              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>{t('setup.allowedIdsHelp')}</div>
-            </label>
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-              <button disabled={!(botApiToken.trim() && tgToken.trim() && allowedIds.trim())} style={{ padding: '8px 12px', width: 180 }} onClick={saveSecrets}>
-                {t('setup.saveContinue')}
-              </button>
-              <button style={{ padding: '8px 12px' }} onClick={() => setStep(2)}>
-                {t('setup.skipTelegram')}
-              </button>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>
+              Only Slack and Telegram can complete setup. Other providers are listed for roadmap visibility.
+            </div>
+
+            {provider === 'telegram' ? (
+              <>
+                <label><div style={{ fontSize: 12, opacity: 0.8 }}>BOT_API_TOKEN</div><input type="password" value={botApiToken} onChange={(e) => setBotApiToken(e.target.value)} style={{ width: '100%', padding: 8 }} /></label>
+                <label><div style={{ fontSize: 12, opacity: 0.8 }}>TELEGRAM_BOT_TOKEN</div><input type="password" value={tgToken} onChange={(e) => setTgToken(e.target.value)} style={{ width: '100%', padding: 8 }} /></label>
+                <label><div style={{ fontSize: 12, opacity: 0.8 }}>Admin chat id (single)</div><input value={adminChatId} onChange={(e) => setAdminChatId(e.target.value)} style={{ width: '100%', padding: 8 }} /></label>
+              </>
+            ) : (
+              <>
+                <label><div style={{ fontSize: 12, opacity: 0.8 }}>SLACK_BOT_TOKEN</div><input type="password" value={slackBotToken} onChange={(e) => setSlackBotToken(e.target.value)} style={{ width: '100%', padding: 8 }} /></label>
+                <label><div style={{ fontSize: 12, opacity: 0.8 }}>SLACK_APP_TOKEN</div><input type="password" value={slackAppToken} onChange={(e) => setSlackAppToken(e.target.value)} style={{ width: '100%', padding: 8 }} /></label>
+                <label><div style={{ fontSize: 12, opacity: 0.8 }}>SLACK_SIGNING_SECRET</div><input type="password" value={slackSigningSecret} onChange={(e) => setSlackSigningSecret(e.target.value)} style={{ width: '100%', padding: 8 }} /></label>
+                <label><div style={{ fontSize: 12, opacity: 0.8 }}>Default channel (single)</div><input value={slackDefaultChannel} onChange={(e) => setSlackDefaultChannel(e.target.value)} style={{ width: '100%', padding: 8 }} /></label>
+              </>
+            )}
+
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <button onClick={saveMessagingConfig} disabled={busy}>Save Messaging Config</button>
+              <button onClick={testMessaging} disabled={busy || !msgConfigured}>Test Connection</button>
+              <span style={{ fontSize: 12, opacity: 0.8 }}>Configured: <b>{msgConfigured ? 'yes' : 'no'}</b> · Test: <b>{msgTestOk ? 'pass' : 'fail'}</b>{msgTestAt ? ` @ ${msgTestAt}` : ''}</span>
+            </div>
+            <div>
+              <button onClick={() => setStep(2)} disabled={!canContinueMessaging}>Continue</button>
             </div>
           </div>
         </Card>
       ) : null}
 
       {step === 2 ? (
-        <Card title={t('setup.modelServerTitle')}>
+        <Card title="Model Server">
           <div style={{ display: 'grid', gap: 10 }}>
-            <div style={{ padding: 10, borderRadius: 10, border: '1px solid #e5e7eb', background: '#fafafa' }}>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>{t('setup.requiredModelTitle')}</div>
-              <div style={{ fontSize: 13, opacity: 0.9 }}>
-                <code>{REQUIRED_MODEL}</code>
-              </div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>{t('setup.requiredModelHelp')}</div>
-            </div>
-
+            <div style={{ fontSize: 12, opacity: 0.8 }}>Required model: <code>{REQUIRED_MODEL}</code></div>
             <label>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>{t('setup.baseUrl')}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Base URL</div>
               <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} style={{ width: '100%', padding: 8 }} />
             </label>
-
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <a href={base.base} target="_blank" rel="noreferrer" style={{ padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, textDecoration: 'none', color: '#111' }}>
-                {t('setup.openTextWebui')}
-              </a>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>
-                {t('setup.webuiStatus')}: <b>{textwebui ? (textwebui.running ? (textwebui.ready ? t('setup.webuiReady') : t('setup.webuiRunning')) : t('setup.webuiNotRunning')) : '—'}</b>
-              </div>
-              {textwebui?.error ? <div style={{ fontSize: 12, color: '#b00020' }}>{textwebui.error}</div> : null}
-            </div>
-
-            {!textwebui?.running ? (
-              <div style={{ padding: 10, borderRadius: 10, border: '1px solid #fde68a', background: '#fffbeb', color: '#92400e', fontSize: 13 }}>
-                <div style={{ fontWeight: 800, marginBottom: 6 }}>{t('setup.webuiHowToStartTitle')}</div>
-                <div style={{ marginBottom: 6 }}>{t('setup.webuiHowToStartBody')}</div>
-                <pre style={{ margin: 0, padding: 10, background: '#fff', border: '1px solid #eee', borderRadius: 10, overflow: 'auto' }}>
-cd ~/Apps/text-generation-webui
-./start_linux.sh --api --api-port {base.port} --listen-host {base.host}
-                </pre>
-              </div>
-            ) : textwebui.running && !textwebui.ready ? (
-              <div style={{ padding: 10, borderRadius: 10, border: '1px solid #fde68a', background: '#fffbeb', color: '#92400e', fontSize: 13 }}>
-                <div style={{ fontWeight: 800, marginBottom: 6 }}>{t('setup.webuiLoadModelTitle')}</div>
-                <div>{t('setup.webuiLoadModelBody', { requiredModel: REQUIRED_MODEL })}</div>
-              </div>
-            ) : null}
-
             <label>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>{t('setup.endpointMode')}</div>
-              <select value={mode} onChange={(e) => setMode(e.target.value as any)} style={{ width: 320, padding: 8 }}>
-                <option value="auto">{t('setup.mode.auto')}</option>
-                <option value="force_openai">{t('setup.mode.forceOpenai')}</option>
-                <option value="force_gateway">{t('setup.mode.forceGateway')}</option>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Mode</div>
+              <select value={mode} onChange={(e) => setMode(e.target.value as any)} style={{ width: 260, padding: 8 }}>
+                <option value="auto">auto</option>
+                <option value="force_openai">force_openai</option>
+                <option value="force_gateway">force_gateway</option>
               </select>
-              {mode !== 'auto' ? <div style={{ fontSize: 12, marginTop: 6, opacity: 0.75 }}>{t('setup.modeForcedHelp')}</div> : null}
             </label>
-
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-              <button disabled={testing} style={{ padding: '8px 12px' }} onClick={testAndRefresh}>
-                {testing ? t('setup.working') : t('setup.testRefreshModels')}
-              </button>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>
-                {t('setup.active')}: <b>{activeProfile ? (activeProfile === 'openai' ? t('setup.active.openai') : t('setup.active.gateway')) : '—'}</b>
-              </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <button onClick={testAndRefreshModel} disabled={testingModel}>{testingModel ? 'Working...' : 'Test + Refresh Models'}</button>
+              <span style={{ fontSize: 12, opacity: 0.8 }}>Active profile: <b>{activeProfile || '—'}</b> · Last refresh: <b>{lastRefreshedAt || '—'}</b></span>
             </div>
-
-            <div style={{ fontSize: 12, opacity: 0.8 }}>{t('setup.lastRefreshed')}: <b>{lastRefreshedAt ?? '—'}</b></div>
-
-            {textwebui?.running && textwebuiModels.length > 0 ? (
-              <div style={{ display: 'grid', gap: 8, padding: 10, border: '1px solid #e5e7eb', borderRadius: 10, background: '#fff' }}>
-                <div style={{ fontWeight: 800 }}>{t('setup.selectModelTitle')}</div>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>{t('setup.selectModelHelp')}</div>
-                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <select value={selectedModel || ''} onChange={(e) => chooseModel(e.target.value)} style={{ width: 520, maxWidth: '100%', padding: 8 }}>
-                    <option value="" disabled>{t('setup.selectModelPlaceholder')}</option>
-                    {textwebuiModels.map((m) => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                  <button disabled={testing} style={{ padding: '8px 12px' }} onClick={() => chooseModel(REQUIRED_MODEL)}>
-                    {t('setup.useRequiredModel')}
-                  </button>
-                </div>
-                <div style={{ fontSize: 12, opacity: 0.8 }}>{t('setup.selectedModel')}: <b>{selectedModel || '—'}</b></div>
+            {textwebuiModels.length > 0 ? (
+              <div style={{ display: 'grid', gap: 8 }}>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Select model</div>
+                <select value={selectedModel || ''} onChange={(e) => chooseModel(e.target.value)} style={{ width: '100%', padding: 8 }}>
+                  <option value="" disabled>Select model</option>
+                  {textwebuiModels.map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
               </div>
             ) : null}
-
             <div style={{ display: 'flex', gap: 10 }}>
-              <button disabled={!canContinueModelStep} style={{ padding: '8px 12px', width: 160 }} onClick={() => setStep(3)}>
-                {t('setup.continue')}
-              </button>
-              <button disabled={testing} style={{ padding: '8px 12px' }} onClick={testAndRefresh}>
-                {t('setup.retry')}
-              </button>
+              <button onClick={() => setStep(1)}>Back</button>
+              <button onClick={() => setStep(3)} disabled={!canContinueModel}>Continue</button>
             </div>
           </div>
         </Card>
       ) : null}
 
       {step === 3 ? (
-        <Card title={t('setup.startTitle')}>
-          <p style={{ marginTop: 0, opacity: 0.85 }}>{t('setup.startHelp')}</p>
-          <button style={{ padding: '10px 14px', width: 220, fontWeight: 700 }} onClick={finish}>
-            {t('setup.finishStart')}
-          </button>
+        <Card title="Finish setup">
+          <p style={{ marginTop: 0, opacity: 0.85 }}>Messaging test and model setup must pass before starting.</p>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button onClick={() => setStep(2)}>Back</button>
+            <button onClick={finish} style={{ fontWeight: 700 }} disabled={!canContinueMessaging || !canContinueModel}>Finish & Start</button>
+          </div>
         </Card>
       ) : null}
     </div>

@@ -8,7 +8,7 @@ Canvas is display and organization only:
 
 ## What you’ll see
 - Tabs: Latest, History, Pinned
-- Filters: Tools, MCP, Doctor, Reports, Notes
+- Filters: Tools, MCP, ER+, Reports, Notes
 - Mission Control header (runtime status + provider/model snapshot)
 - Cards with:
   - title, timestamp, kind badge, status pill
@@ -23,7 +23,7 @@ Canvas is display and organization only:
 
 ## What you can add manually
 - Notes (markdown).
-- Doctor report can be sent to Canvas via **Send to Canvas**.
+- ER+ report can be sent to Canvas via **Send to Canvas**.
 
 ## Safety and limits
 - PB caps Canvas to 500 items.

@@ -21,6 +21,12 @@ export default function RuntimePage() {
   const [busy, setBusy] = useState(false);
   const [keepaliveEnabled, setKeepaliveEnabled] = useState<boolean>(() => localStorage.getItem("pb_keepalive_webui") === "1");
 
+  function fmtTs(ts: any) {
+    if (!ts) return '—';
+    const d = new Date(String(ts));
+    return Number.isNaN(d.getTime()) ? String(ts) : d.toLocaleString();
+  }
+
   async function loadStatus() {
     const s = await getJson<any>("/admin/runtime/textwebui/status");
     setStatus(s);
@@ -167,9 +173,9 @@ export default function RuntimePage() {
         </button>
       </div>
 
-      {err ? <div style={{ padding: 10, border: "1px solid #f1c6c6", background: "#fff4f4", borderRadius: 8, color: "#b00020" }}>{err}</div> : null}
+      {err ? <div style={{ padding: 10, border: "1px solid color-mix(in srgb, var(--bad) 45%, var(--border))", background: "color-mix(in srgb, var(--bad) 12%, var(--panel))", borderRadius: 8, color: "var(--bad)" }}>{err}</div> : null}
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+      <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>{t("runtime.textwebui.title")}</h3>
         <div>{t("runtime.baseUrl")}: <b>{status?.baseUrl || `http://${host}:${port}`}</b></div>
         <div>{t("runtime.running")}: <b>{status?.running ? t("common.yes") : t("common.no")}</b></div>
@@ -191,9 +197,20 @@ export default function RuntimePage() {
         </div>
       </section>
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+      <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>{t("runtime.workers.title")}</h3>
-        <div>{t("runtime.workers.telegram")}: <b>{telegramStatus ? (telegramStatus.running ? t("common.running") : t("common.stopped")) : t("common.unknown")}</b></div>
+        <div style={{ padding: 10, border: "1px solid var(--border-soft)", borderRadius: 8, display: "grid", gap: 6 }}>
+          <div>{t("runtime.workers.telegram")}: <b>{telegramStatus ? (telegramStatus.running ? t("common.running") : t("common.stopped")) : t("common.unknown")}</b></div>
+          <div style={{ fontSize: 12, opacity: 0.85 }}>Last poll: <b>{fmtTs(telegramStatus?.lastPollAt)}</b> · Last inbound: <b>{fmtTs(telegramStatus?.lastInboundAt)}</b></div>
+          <div style={{ fontSize: 12, opacity: 0.85 }}>Allowlist: <b>{telegramStatus?.allowlistCount ?? 0}</b> · Pending: <b>{telegramStatus?.pendingCount ?? 0}</b> · Blocked: <b>{telegramStatus?.blockedCount ?? 0}</b></div>
+          <div style={{ fontSize: 12, opacity: 0.85 }}>Allowed chat ids: <code>{Array.isArray(telegramStatus?.allowlist) && telegramStatus.allowlist.length ? telegramStatus.allowlist.join(', ') : '—'}</code></div>
+          <div style={{ fontSize: 12, color: "var(--bad)" }}>Last error: <b>{telegramStatus?.lastError || t("common.none")}</b></div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button onClick={async () => { await postJson('/admin/telegram/worker/start', {}); await loadAll(); }} disabled={busy} style={{ padding: "6px 10px" }}>Start Telegram</button>
+            <button onClick={async () => { await postJson('/admin/telegram/worker/restart', {}); await loadAll(); }} disabled={busy} style={{ padding: "6px 10px" }}>Restart Telegram</button>
+            <button onClick={async () => { await postJson('/admin/telegram/worker/stop', {}); await loadAll(); }} disabled={busy} style={{ padding: "6px 10px" }}>Stop Telegram</button>
+          </div>
+        </div>
         <div>{t("runtime.workers.slack")}: <b>{slackStatus ? (slackStatus.running ? t("common.running") : t("common.stopped")) : t("common.unknown")}</b></div>
         <div>
           {t("runtime.workers.webchat")}: <b>{webchatStatus ? t("common.available") : t("common.unknown")}</b>
@@ -202,7 +219,7 @@ export default function RuntimePage() {
         </div>
       </section>
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+      <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>{t("runtime.config.title")}</h3>
         {!supportsConfig ? (
           <div style={{ fontSize: 13, opacity: 0.8 }}>{t("runtime.config.unavailable")}</div>
@@ -228,7 +245,7 @@ export default function RuntimePage() {
         )}
       </section>
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+      <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>{t("runtime.models.title")}</h3>
         {models.length === 0 ? <div>{t("runtime.models.none")}</div> : null}
         {models.length > 0 ? (
@@ -240,21 +257,21 @@ export default function RuntimePage() {
         ) : null}
       </section>
 
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+      <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
         <h3 style={{ margin: 0 }}>{t("runtime.logs.title")}</h3>
         {!supportsLogs ? (
           <div style={{ fontSize: 13, opacity: 0.8 }}>{t("runtime.logs.unavailable")}</div>
         ) : (
-          <pre style={{ margin: 0, background: "#fafafa", border: "1px solid #eee", padding: 10, maxHeight: 220, overflow: "auto" }}>
+          <pre style={{ margin: 0, background: "var(--panel-2)", border: "1px solid var(--border-soft)", padding: 10, maxHeight: 220, overflow: "auto" }}>
             {logs || t("runtime.logs.none")}
           </pre>
         )}
       </section>
 
       {browseResult ? (
-        <section style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 12 }}>
+        <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12 }}>
           <h3 style={{ marginTop: 0 }}>{t("runtime.browseResult.title")}</h3>
-          <pre style={{ margin: 0, background: "#fafafa", border: "1px solid #eee", padding: 10, maxHeight: 180, overflow: "auto" }}>
+          <pre style={{ margin: 0, background: "var(--panel-2)", border: "1px solid var(--border-soft)", padding: 10, maxHeight: 180, overflow: "auto" }}>
             {JSON.stringify(browseResult, null, 2)}
           </pre>
         </section>

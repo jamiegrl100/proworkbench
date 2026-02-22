@@ -1,0 +1,15 @@
+{
+  "id": "directory-assistant",
+  "version": "0.1.0",
+  "name": "Directory Assistant",
+  "publisher": "Proworkbench Labs",
+  "description": "Human-in-the-loop directory submission assistant. No auto-submit, no captcha bypass.",
+  "entry": "dist/index.js",
+  "webRoot": "web",
+  "nav": [
+    { "label": "Directory Assistant", "path": "/plugins/directory-assistant/", "order": 82 }
+  ],
+  "routes": [
+    { "path": "/plugins/directory-assistant/", "pageKey": "plugin-directory-assistant" }
+  ]
+}

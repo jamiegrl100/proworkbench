@@ -40,7 +40,7 @@ export default function ReportsPage() {
   return (
     <div style={{ padding: 16, maxWidth: 1100 }}>
       <h2 style={{ marginTop: 0 }}>{t('page.reports.title')}</h2>
-      {err ? <div style={{ marginBottom: 12, color: '#b00020' }}>{err}</div> : null}
+      {err ? <div style={{ marginBottom: 12, color: 'var(--bad)' }}>{err}</div> : null}
 
       <Card title={t('reports.cadence.title')}>
         <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
@@ -80,7 +80,7 @@ export default function ReportsPage() {
             <thead>
               <tr>
                 {['ts', 'kind', 'payload'].map((h) => (
-                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid #eee', padding: '8px 6px' }}>
+                  <th key={h} style={{ textAlign: 'left', fontSize: 12, opacity: 0.75, borderBottom: '1px solid var(--border-soft)', padding: '8px 6px' }}>
                     {t(`reports.col.${h}`)}
                   </th>
                 ))}
@@ -89,9 +89,9 @@ export default function ReportsPage() {
             <tbody>
               {reports.map((r) => (
                 <tr key={r.id}>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{r.ts}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13, whiteSpace: 'nowrap' }}>{r.kind}</td>
-                  <td style={{ padding: '10px 6px', borderBottom: '1px solid #f3f3f3', fontSize: 13 }}>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{r.ts}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13, whiteSpace: 'nowrap' }}>{r.kind}</td>
+                  <td style={{ padding: '10px 6px', borderBottom: '1px solid var(--border-soft)', fontSize: 13 }}>
                     <code style={{ fontSize: 12 }}>{JSON.stringify(r.payload).slice(0, 500)}</code>
                   </td>
                 </tr>

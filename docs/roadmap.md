@@ -11,7 +11,7 @@ This roadmap is intentionally high-level. Items may shift as PB hardens.
 - Tools (policy + proposals + server-side execution)
 - Unified approvals
 - MCP templates and servers (15 presets)
-- Doctor “Fix my setup”
+- ER+ “Fix my setup”
 - Canvas (persistent outputs)
 
 ## v0.1.1 (Hardening)

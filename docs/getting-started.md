@@ -3,7 +3,7 @@
 ## What you’ll see
 - A local PB admin UI at `http://127.0.0.1:5173`
 - A local PB server at `http://127.0.0.1:8787`
-- A “Doctor” page that tells you what is missing and how to fix it
+- A “ER+” page that tells you what is missing and how to fix it
 
 ## Prerequisites
 - Node.js 20+ (recommended)
@@ -49,12 +49,12 @@ If `/v1/models` is empty, open the Text WebUI UI and load a model, then refresh 
 Known-good model path (recommended):
 - `models/quen/qwen2.5-coder-7b-instruct-q6_k.gguf`
 
-## Step 5: Run Doctor
-In PB, go to **Doctor**:
+## Step 5: Run ER+
+In PB, go to **ER+**:
 - Click **Fix my setup** (recommended)
 - Or click **Run checks only**
 
-Doctor will guide you to a green setup and tell you what PB can’t do automatically (for example: loading a model).
+ER+ will guide you to a green setup and tell you what PB can’t do automatically (for example: loading a model).
 
 ## Verify it works
 1. In **Runtime**, confirm Text WebUI is reachable and models are listed.

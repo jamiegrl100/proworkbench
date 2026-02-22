@@ -96,7 +96,7 @@ export function createExtensionsRouter({ db }) {
       const code = String(e?.code || 'INSTALL_FAILED');
       const message = String(e?.message || e || 'Install failed');
       recordEvent(db, 'extensions.install_failed', { code, message });
-      const status = code === 'CLAMAV_REQUIRED' || code === 'SIGNATURE_INVALID' || code === 'SIGNATURE_REQUIRED' ? 400 : 500;
+      const status = code === 'CLAMAV_REQUIRED' || code === 'SIGNATURE_INVALID' || code === 'SIGNATURE_REQUIRED' || code === 'HASH_MISMATCH' || code === 'HASH_FORMAT_INVALID' ? 400 : 500;
       res.status(status).json({ ok: false, error: message, code });
     }
   });

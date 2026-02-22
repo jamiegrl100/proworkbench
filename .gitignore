@@ -93,3 +93,13 @@ desktop/dist/
 *.msi
 *.deb
 
+
+# Electron / installers
+desktop/dist-installers/
+desktop/dist/
+*.AppImage
+*.dmg
+*.exe
+*.msi
+*.deb
+

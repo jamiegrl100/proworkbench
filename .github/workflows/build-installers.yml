@@ -55,6 +55,45 @@ jobs:
         working-directory: desktop
         run: npm run dist
 
+            - name: Smoke check macOS DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Listing dist-installers:"
+          ls -la desktop/dist-installers || true
+
+          DMG="$(ls -1 desktop/dist-installers/*.dmg | head -n 1)"
+          echo "DMG=$DMG"
+
+          echo "Mounting DMG..."
+          hdiutil attach "$DMG" -nobrowse -quiet
+
+          MOUNT="$(mount | grep -i '/Volumes/' | tail -n 1 | awk '{print $3}')"
+          echo "MOUNT=$MOUNT"
+          ls -la "$MOUNT"
+
+          APP="$(find "$MOUNT" -maxdepth 2 -name '*.app' -print -quit)"
+          echo "APP=$APP"
+          test -d "$APP"
+
+          echo "Checking app bundle structure..."
+          test -f "$APP/Contents/Info.plist"
+          test -d "$APP/Contents/Resources"
+          test -d "$APP/Contents/MacOS"
+          test -f "$APP/Contents/MacOS/"* || (echo "Missing MacOS executable" && exit 1)
+
+          echo "Info.plist summary:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP/Contents/Info.plist" || true
+
+          echo "codesign verify (may warn if unsigned):"
+          codesign --verify --deep --strict "$APP" || true
+
+          echo "Unmounting..."
+          hdiutil detach "$MOUNT" -quiet
+
+
       - name: Upload installers (artifacts)
         uses: actions/upload-artifact@v4
         with:

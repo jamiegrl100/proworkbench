@@ -1,4 +1,4 @@
-# ProWorkbench v0.1.1
+# ProWorkbench v0.1.2
 
 ## Highlights
 - Fixed Alex Factory Reset so it clears user conversations, memory data, session state, and temporary workspace artifacts without deleting MCP servers, tool registrations, provider settings, or the memory system itself.
@@ -6,9 +6,9 @@
 - Added a standardized desktop release pipeline for Linux, Windows, and macOS with normalized artifact names staged into `release/`.
 
 ## Packaging
-- Linux artifacts: `proworkbench-v0.1.1-linux.AppImage` and `proworkbench-v0.1.1-linux.deb`
-- Windows artifact: `proworkbench-v0.1.1-windows.exe`
-- macOS artifact: `proworkbench-v0.1.1-macos.dmg`
+- Linux artifacts: `proworkbench-v0.1.2-linux.AppImage` and `proworkbench-v0.1.2-linux.deb`
+- Windows artifact: `proworkbench-v0.1.2-windows.exe`
+- macOS artifact: `proworkbench-v0.1.2-macos.dmg`
 
 ## Verification
 - `node --test server/src/http/factoryReset.test.js`

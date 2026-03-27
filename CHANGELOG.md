@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.2
+- Re-ran the desktop release from the fixed Windows/macOS/Linux packaging pipeline so GitHub Actions can publish all three platform artifacts from the corrected source.
+- Fixed the Windows GitHub Actions packaging runner so release builds invoke `npm.cmd` correctly on `windows-latest`.
+
 ## v0.1.1
 - Fixed Alex Factory Reset so it clears user memory, history, session state, and temporary workspace data without deleting MCP servers, tool definitions, provider configuration, or the memory system itself.
 - Factory Reset now returns auth to first-run setup by clearing the stored admin password and active admin tokens while preserving the rest of the application infrastructure.

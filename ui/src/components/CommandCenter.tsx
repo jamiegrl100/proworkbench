@@ -12,9 +12,27 @@ export type RuntimeState = {
   llmStatus: "idle" | "thinking" | "running_tool" | "error" | string;
   activeToolRuns: number;
   pendingApprovals: number;
+  approvals_enabled?: boolean;
   lastError: { message: string; at: string | null } | null;
   updatedAt: string;
   helpers?: { running: number; done: number; error: number; cancelled: number };
+  tools_disabled?: boolean;
+  supports_tool_calls?: boolean;
+  fallback_enabled?: boolean;
+  tools_self_test_ok?: boolean;
+  tools_health?: {
+    ok?: boolean;
+    healthy?: boolean;
+    tools_disabled?: boolean;
+    reason?: string | null;
+    failing_check_id?: string | null;
+    failing_path?: string | null;
+    last_error?: string | null;
+    last_stdout?: string | null;
+    last_stderr?: string | null;
+    checked_at?: string | null;
+    checks?: Array<{ id: string; ok: boolean; error?: string | null; path?: string | null; stdout_preview?: string | null; stderr_preview?: string | null }>;
+  };
 };
 
 function badgeColors(kind: "idle" | "thinking" | "running_tool" | "waiting_approval" | "error") {
@@ -129,7 +147,7 @@ export function CommandCenterIndicator({ state, assistantName }: { state: Runtim
   }, [state, t]);
 
   const c = badgeColors(computed.kind);
-  const pending = Number(state?.pendingApprovals || 0);
+  const pending = Boolean(state?.approvals_enabled) ? Number(state?.pendingApprovals || 0) : 0;
   const active = Number(state?.activeToolRuns || 0);
   const modelsCount = Number(state?.modelsCount || 0);
   const modelLabel = state?.modelId ? String(state.modelId) : t("commandCenter.noModel");

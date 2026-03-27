@@ -63,6 +63,10 @@ type NavItem = {
   badge?: number;
 };
 
+type AdminMeta = {
+  approvals_enabled?: boolean;
+};
+
 const ALLOWED_PAGES = new Set<PageKey>([
   "status",
   "diagnostics",
@@ -137,6 +141,7 @@ function AdminShell({
   const [setup, setSetup] = useState<SetupState | null>(null);
   const [setupError, setSetupError] = useState("");
   const [pendingBadge, setPendingBadge] = useState<number>(0);
+  const [approvalsEnabled, setApprovalsEnabled] = useState(false);
   const [toast, setToast] = useState<{ kind: "info" | "warn"; text: string } | null>(null);
   const [watchtower, setWatchtower] = useState<any>(null);
   const [watchtowerOpen, setWatchtowerOpen] = useState(false);
@@ -177,6 +182,15 @@ function AdminShell({
     } catch {
       setEnabledPluginIds(getDefaultEnabledPluginIds());
       setAvailablePlugins([]);
+    }
+  }
+
+  async function refreshMeta() {
+    try {
+      const out = await getJson<AdminMeta>("/admin/meta");
+      setApprovalsEnabled(Boolean(out?.approvals_enabled));
+    } catch {
+      setApprovalsEnabled(false);
     }
   }
 
@@ -271,6 +285,9 @@ function AdminShell({
 
   useEffect(() => {
     refreshSetup();
+  }, [adminToken]);
+  useEffect(() => {
+    refreshMeta();
   }, [adminToken]);
   useEffect(() => {
     refreshPlugins();
@@ -494,6 +511,7 @@ function AdminShell({
       { key: "slack", label: t("nav.slack") },
       { key: "runtime", label: t("nav.runtime") },
       { key: "tools", label: t("nav.tools") },
+      ...(approvalsEnabled ? [{ key: "approvals", label: t("nav.approvals") } as NavItem] : []),
       { key: "events", label: t("nav.events") },
       { key: "reports", label: t("nav.reports") },
       { key: "security", label: t("nav.security") },
@@ -512,7 +530,7 @@ function AdminShell({
         .filter((x): x is NavItem => Boolean(x));
       return [...base, ...pluginItems];
     },
-    [pendingBadge, t, pluginNav, setup?.setupComplete]
+    [approvalsEnabled, memoryDraftCount, pendingBadge, t, pluginNav, setup?.setupComplete]
   );
 
   const content = (() => {
@@ -544,7 +562,7 @@ function AdminShell({
       case "canvas":
         return <CanvasPage />;
       case "memory":
-        return <MemoryPage />;
+        return <MemoryPage approvalsEnabled={approvalsEnabled} />;
       case "watchtower":
         return <WatchtowerPage />;
       case "writing-projects":
@@ -558,15 +576,17 @@ function AdminShell({
       case "files":
         return <FileBrowserPage />;
       case "approvals":
-        return <div style={{ padding: 12, border: "1px solid var(--border-soft)", borderRadius: 10 }}>Approvals is disabled in bare-bones mode.</div>;
+        return approvalsEnabled
+          ? <ApprovalsPage />
+          : <div style={{ padding: 12, border: "1px solid var(--border-soft)", borderRadius: 10 }}>Approvals are disabled.</div>;
       case "tools":
         return <ToolsPage />;
       case "runtime":
         return <RuntimePage />;
       case "webchat":
-        return <WebChatPage />;
+        return <WebChatPage approvalsEnabled={approvalsEnabled} />;
       case "mcp":
-        return <McpServersPage />;
+        return <McpServersPage approvalsEnabled={approvalsEnabled} />;
       case "telegram":
         return <TelegramPage onPendingBadge={setPendingBadge} />;
       case "slack":
@@ -790,7 +810,15 @@ export default function App() {
 
   // Probe on mount: verify the stored token is still valid and check if a password exists.
   useEffect(() => {
-    fetch('/admin/auth/state')
+    const token = getToken();
+    fetch('/admin/auth/state', {
+      headers: token
+        ? {
+            Authorization: `Bearer ${token}`,
+            "X-PB-Admin-Token": token,
+          }
+        : {},
+    })
       .then((r) => r.json())
       .then((data) => {
         if (!Boolean(data?.passwordSet) || !Boolean(data?.loggedIn)) {

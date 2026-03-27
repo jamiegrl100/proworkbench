@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import express from 'express';
+import Database from 'better-sqlite3';
 import { requireAuth } from './middleware.js';
 import { readEnvFile, writeEnvFile } from '../util/envStore.js';
 import { llmChatOnce } from '../llm/llmClient.js';
@@ -36,6 +37,25 @@ import { recordHot } from '../memory/hot.js';
 import { getWatchtowerMdPath } from '../watchtower/paths.js';
 import { ensureWatchtowerDir, readWatchtowerChecklist, writeWatchtowerChecklist } from '../watchtower/policy.js';
 import {
+  classifyIntent,
+  detectToolRequirement,
+  enforcePolicy as enforceToolPolicy,
+  getToolRouterConfig,
+  inferRequestedExecCommand,
+  inferRequestedArtifact,
+  resolveInWorkdir,
+  verifyLocalActionOutcome,
+} from '../agent/toolRouter.js';
+import { executeDeterministicLocalAction } from '../agent/localActionDispatcher.js';
+import { runAlexFsPreflight } from '../agent/scanPreflight.js';
+import { getAtlasEngine } from '../memory/atlas/engine.js';
+import { resetAtlasEngine } from '../memory/atlas/engine.js';
+import {
+  ATLAS_AGENT_ID,
+  ATLAS_MISSION_KV_KEY,
+  ATLAS_SESSION_MISSION_KV_PREFIX,
+} from '../memory/atlas/types.js';
+import {
   DEFAULT_WATCHTOWER_MD,
   DEFAULT_WATCHTOWER_SETTINGS,
   WATCHTOWER_OK,
@@ -44,6 +64,9 @@ import {
   normalizeWatchtowerSettings,
   parseWatchtowerResponse,
 } from '../watchtower/service.js';
+import { approvalsDisabledError, approvalsEnabled } from '../util/approvals.js';
+import { publishLiveEvent, subscribeLiveEvents } from '../liveEvents/bus.js';
+import { resetHotCache } from '../memory/hot.js';
 
 const CANVAS_MCP_ID = 'mcp_EF881B855521';
 const UPLOAD_ALLOWED_EXT = new Set(['.zip', '.txt', '.md', '.json', '.yaml', '.yml', '.log']);
@@ -55,6 +78,158 @@ const WATCHTOWER_SETTINGS_KEY = 'watchtower.settings';
 const WATCHTOWER_STATE_KEY = 'watchtower.state';
 const WEBCHAT_SESSION_META_KEY_PREFIX = 'webchat.session_meta.';
 const DEFAULT_ASSISTANT_NAME = 'Alex';
+const ALEX_SKILLS_DIRNAME = 'ALEX_SKILLS';
+const ALEX_SKILLS_REGISTRY_FILENAME = 'skills.json';
+const ALEX_BUILD_LOOP_SKILL_ID = 'build_loop';
+const ALEX_BUILD_LOOP_SKILL_FILENAME = 'build_loop.md';
+const ALEX_BUILD_LOOP_STATE_RELATIVE = path.join('.pb', 'build_loop_state.json');
+const ALEX_ACCESS_STATE_KEY = 'alex.access_state.v1';
+const ALEX_ACCESS_DEFAULT_LEVEL = 1;
+const ALEX_ALLOWED_ROOT_PREFIXES = [
+  '/home/jamiegrl100/Apps/',
+  '/var/www/',
+];
+const ALEX_BLOCKED_BROAD_ROOTS = new Set([
+  '/',
+  '/home',
+  '/home/jamiegrl100',
+  '/home/jamiegrl100/Apps',
+  '/var',
+  '/var/www',
+]);
+const ALEX_LEVEL_LABELS = {
+  0: 'L0 Read-only',
+  1: 'L1 Safe Write',
+  2: 'L2 Build Mode',
+  3: 'L3 Project Mode',
+  4: 'L4 Full Local Dev',
+};
+const ALEX_FS_PERMISSIONS = {
+  0: new Set(['workspace.list', 'workspace.read_file', 'workspace.exists', 'workspace.stat']),
+  1: new Set(['workspace.list', 'workspace.read_file', 'workspace.write_file', 'workspace.mkdir', 'workspace.exists', 'workspace.stat']),
+  2: new Set(['workspace.list', 'workspace.read_file', 'workspace.write_file', 'workspace.mkdir', 'workspace.delete', 'workspace.copy_path', 'workspace.move_path', 'workspace.exists', 'workspace.stat']),
+  3: new Set(['workspace.list', 'workspace.read_file', 'workspace.write_file', 'workspace.mkdir', 'workspace.delete', 'workspace.copy_path', 'workspace.move_path', 'workspace.exists', 'workspace.stat']),
+  4: new Set(['workspace.list', 'workspace.read_file', 'workspace.write_file', 'workspace.mkdir', 'workspace.delete', 'workspace.copy_path', 'workspace.move_path', 'workspace.exists', 'workspace.stat']),
+};
+const ALEX_EXEC_BASE_WHITELIST = [
+  'node', 'npm', 'npx', 'pnpm', 'yarn',
+  'python', 'python3',
+  'java', 'gradle', './gradlew',
+  'zip', 'unzip', 'sha256sum', 'openssl',
+  'git',
+  'ls', 'cat', 'grep', 'rg', 'find', 'sed', 'awk', 'head', 'tail', 'wc', 'pwd', 'mkdir', 'cp', 'mv', 'rm', 'chmod', 'printf', 'echo',
+];
+const ALEX_EXEC_BLOCKLIST = new Set([
+  'sudo', 'su', 'curl', 'wget', 'ssh', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'telnet', 'ftp', 'rsync', 'systemctl', 'service', 'apt', 'dnf', 'pacman', 'dd', 'mkfs', 'mount',
+]);
+const ALEX_NO_APPROVAL_MCP_IDENTIFIERS = new Set([
+  'mcp_search_browser_default',
+  'mcp_browse',
+]);
+const WORKSPACE_TEXT_WRITE_EXT_ALLOWLIST = new Set([
+  '.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log',
+  '.kt', '.kts', '.xml', '.gradle', '.properties', '.toml',
+  '.sh', '.js', '.ts', '.tsx', '.jsx', '.java', '.sql',
+  '.html', '.css', '.scss', '.proto', '.cfg', '.conf',
+  '.gitignore', '.editorconfig',
+]);
+const DEFAULT_ALEX_SKILLS_REGISTRY = [
+  {
+    id: ALEX_BUILD_LOOP_SKILL_ID,
+    title: 'Build Loop',
+    filename: ALEX_BUILD_LOOP_SKILL_FILENAME,
+    enabled: true,
+  },
+];
+const DEFAULT_BUILD_LOOP_STATE = {
+  running: false,
+  stop_requested: false,
+  started_at: null,
+  current_job_id: null,
+  completed_jobs_count: 0,
+  last_error: null,
+  stage: 'idle',
+  session_id: null,
+  mode_config: {
+    type: 'bundle_only',
+    platform: 'android',
+    bundle: 'apk',
+  },
+};
+const DEFAULT_BUILD_LOOP_SKILL_TEXT = `# build_loop
+
+## HARD RULES
+
+- This skill controls Alex's continuous factory build loop.
+- /build starts intake. It does not build immediately.
+- /stop means graceful stop: finish the current job, then stop before starting another.
+- Default deliverable is bundle-only. For Android, default to APK only unless the user explicitly says AAB.
+- Never use tools.fs.writeFile or workspace.write_file for binaries (.zip/.apk/.aab/.png/.jpg/.jpeg/.gif/.webp/.pdf/.mp4/.mov/.exe/.dll/.so/.dylib/.bin). Real artifacts must come from proc.exec/build tools, then copyPath/movePath if needed.
+- Keep all work inside Alex allowed roots and use PB tool traces for every action.
+
+## INTAKE QUESTIONS
+
+Reply with one message containing:
+1. Project name or slug
+2. Goal
+3. Deliverable
+4. Constraints
+5. Build target
+
+## OUTPUT STRUCTURE
+
+For each accepted build:
+- create jobs/YYYY-MM-DD/slug/
+- write CHECKLIST.md
+- write LISTING.md
+- write README.md
+- write product.json
+
+## BUILD LOOP RULES
+
+- After /build starts, ask intake questions.
+- After intake, create exactly one product job and complete bundle-only setup for that job.
+- Verify outputs using tools like listDir/readFile after writing files.
+- When one job is finished:
+  - if stop_requested is false, ask the intake questions again for the next job
+  - if stop_requested is true, print a short summary and exit the loop
+
+## ENFORCEMENT
+
+- Emit clear progress narration for every major step.
+- Verify created files with tool traces before claiming success.
+- If a tool fails, report the failing tool, path, and next safest recovery step.
+
+## Scaffold/Build CWD Safety
+
+- Always run scaffold/build commands from Alex root, not from inside output folders.
+- Never use a dist/output directory as cwd for build commands.
+- For Android builds, prefer Gradle from Alex root with explicit -p project path.
+
+## Android Defaults
+
+- APK only unless user explicitly requests AAB.
+- If PB signing is configured, prefer signed release output.
+- If signing is unavailable, report that clearly instead of pretending a signed build exists.
+`;
+const WORKSPACE_BINARY_WRITE_EXT_BLOCKLIST = new Set([
+  '.apk', '.aab', '.zip', '.jar', '.keystore', '.png', '.jpg', '.jpeg', '.gif', '.webp',
+  '.mp4', '.mov', '.pdf', '.exe', '.dll', '.so', '.dylib', '.msi', '.dmg', '.bin',
+]);
+const EXPLICIT_TOOL_EXECUTE_PHRASES = [
+  'run tools',
+  'execute',
+  'do it now',
+  'use tools now',
+  'build it now',
+];
+const WEBCHAT_LIVE_ACTIVITY_VERBOSE = String(process.env.PB_WEBCHAT_LIVE_ACTIVITY_VERBOSE || '').trim() === '1';
+
+// Alex request flow map:
+// 1) /webchat/send and /webchat/message receive user input (this file).
+// 2) Intent/router policy classifies request and gates tool classes.
+// 3) runOpenAiToolLoop handles model tool calls and invokes executeRegisteredTool.
+// 4) MCP browse tools are invoked via executeMcpRpc; workspace tools via executeRegisteredTool.
 
 function envValue(name, fallback = '') {
   const v = String(process.env[name] || '').trim();
@@ -86,6 +261,328 @@ function isBareBonesMode() {
   if (!bare) return true;
   if (bare === '0' || bare === 'false' || bare === 'off') return false;
   return true;
+}
+
+function approvalsAreEnabled() {
+  return approvalsEnabled();
+}
+
+function pendingApprovalsCount(db) {
+  if (!approvalsAreEnabled()) return 0;
+  return Number(db.prepare("SELECT COUNT(1) AS c FROM approvals WHERE status = 'pending'").get()?.c || 0);
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function clampInt(value, min, max) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return min;
+  return Math.max(min, Math.min(max, Math.floor(num)));
+}
+
+function alexLevelLabel(level) {
+  return ALEX_LEVEL_LABELS[level] || ALEX_LEVEL_LABELS[ALEX_ACCESS_DEFAULT_LEVEL];
+}
+
+function getAlexExecMode(level) {
+  return Number(level) >= 2 ? 'shell' : 'argv';
+}
+
+function tokenizeShellCommand(command) {
+  return String(command || '').match(/"[^"]*"|'[^']*'|\S+/g) || [];
+}
+
+function stripTokenQuotes(token) {
+  const s = String(token || '').trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) return s.slice(1, -1);
+  return s;
+}
+
+function getAlexSandboxRootReal(baseWorkdir = null) {
+  const sandbox = getAlexSandboxRoot(baseWorkdir || getWorkdir());
+  try {
+    return fs.realpathSync.native(sandbox);
+  } catch {
+    return path.resolve(sandbox);
+  }
+}
+
+function normalizeAlexLevel(input) {
+  const num = Number(input);
+  if (!Number.isFinite(num)) return ALEX_ACCESS_DEFAULT_LEVEL;
+  return Math.max(0, Math.min(4, Math.floor(num)));
+}
+
+function parseAlexLevelInput(input) {
+  if (typeof input === 'number') {
+    if (!Number.isFinite(input)) {
+      const err = new Error('Invalid Alex access level.');
+      err.code = 'INVALID_LEVEL';
+      throw err;
+    }
+    return Math.max(0, Math.min(4, Math.floor(input)));
+  }
+  if (typeof input === 'string') {
+    const raw = String(input || '').trim().toLowerCase();
+    const aliases = {
+      l0: 0,
+      l1: 1,
+      l2: 2,
+      l3: 3,
+      l4: 4,
+      'read-only': 0,
+      'safe-write': 1,
+      build: 2,
+      project: 3,
+      full: 4,
+    };
+    if (raw in aliases) return aliases[raw];
+    const err = new Error('Invalid Alex access level.');
+    err.code = 'INVALID_LEVEL';
+    throw err;
+  }
+  return normalizeAlexLevel(input);
+}
+
+function getDefaultAlexAccessState() {
+  return {
+    level: ALEX_ACCESS_DEFAULT_LEVEL,
+    project_root_id: null,
+    ttl_minutes: 30,
+    expires_at_ms: null,
+    confirmed_at_ms: null,
+    extra_roots: [],
+    updated_at_ms: nowMs(),
+  };
+}
+
+function realpathOrResolve(targetPath) {
+  const resolved = path.resolve(String(targetPath || ''));
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function getAlexProjectRoots(db, { enabledOnly = false } = {}) {
+  if (!db.prepare) return [];
+  const sql = enabledOnly
+    ? 'SELECT * FROM alex_project_roots WHERE enabled = 1 ORDER BY is_favorite DESC, label COLLATE NOCASE ASC, id ASC'
+    : 'SELECT * FROM alex_project_roots ORDER BY is_favorite DESC, label COLLATE NOCASE ASC, id ASC';
+  return db.prepare(sql).all().map((row) => ({
+    id: Number(row.id),
+    label: String(row.label || ''),
+    path: String(row.path || ''),
+    enabled: Boolean(row.enabled),
+    is_favorite: Boolean(row.is_favorite),
+    created_at: Number(row.created_at || 0),
+    updated_at: Number(row.updated_at || 0),
+    last_used_at: row.last_used_at == null ? null : Number(row.last_used_at),
+  }));
+}
+
+function getAlexProjectRootById(db, id) {
+  const row = db.prepare('SELECT * FROM alex_project_roots WHERE id = ?').get(Number(id));
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    label: String(row.label || ''),
+    path: String(row.path || ''),
+    enabled: Boolean(row.enabled),
+    is_favorite: Boolean(row.is_favorite),
+    created_at: Number(row.created_at || 0),
+    updated_at: Number(row.updated_at || 0),
+    last_used_at: row.last_used_at == null ? null : Number(row.last_used_at),
+  };
+}
+
+function validateAlexProjectRootPath(inputPath, { sandboxRoot = null } = {}) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) {
+    const err = new Error('Project root path is required.');
+    err.code = 'INVALID_PROJECT_ROOT';
+    throw err;
+  }
+  if (!path.isAbsolute(raw)) {
+    const err = new Error('Project root must be an absolute path.');
+    err.code = 'INVALID_PROJECT_ROOT';
+    throw err;
+  }
+  const normalized = realpathOrResolve(raw);
+  let stat = null;
+  try {
+    stat = fs.statSync(normalized);
+  } catch {
+    const err = new Error('Project root must exist and be a directory.');
+    err.code = 'INVALID_PROJECT_ROOT';
+    throw err;
+  }
+  if (!stat.isDirectory()) {
+    const err = new Error('Project root must be a directory.');
+    err.code = 'INVALID_PROJECT_ROOT';
+    throw err;
+  }
+  if (ALEX_BLOCKED_BROAD_ROOTS.has(normalized)) {
+    const err = new Error('Project root is too broad. Choose a specific project folder.');
+    err.code = 'PROJECT_ROOT_TOO_BROAD';
+    throw err;
+  }
+  if (!ALEX_ALLOWED_ROOT_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+    const err = new Error('Project root must be under /home/jamiegrl100/Apps/ or /var/www/.');
+    err.code = 'PROJECT_ROOT_PREFIX_DENIED';
+    throw err;
+  }
+  const alexSandbox = realpathOrResolve(sandboxRoot || getAlexSandboxRootReal());
+  const relToCandidate = path.relative(normalized, alexSandbox);
+  if (relToCandidate === '' || (!relToCandidate.startsWith('..') && !path.isAbsolute(relToCandidate))) {
+    const err = new Error('Project root would widen access over the Alex sandbox.');
+    err.code = 'PROJECT_ROOT_WIDENS_SANDBOX';
+    throw err;
+  }
+  return normalized;
+}
+
+function readAlexAccessStateRaw(db) {
+  return kvGet(db, ALEX_ACCESS_STATE_KEY, getDefaultAlexAccessState());
+}
+
+function setAlexAccessStateRaw(db, nextState) {
+  kvSet(db, ALEX_ACCESS_STATE_KEY, nextState);
+  return nextState;
+}
+
+function normalizeAlexAccessState(db, rawState = null) {
+  const src = rawState && typeof rawState === 'object' ? rawState : getDefaultAlexAccessState();
+  let level = normalizeAlexLevel(src.level);
+  const ttlRaw = src.ttl_minutes == null ? 30 : Number(src.ttl_minutes);
+  const ttlMinutes = Number.isFinite(ttlRaw) ? Math.max(0, Math.floor(ttlRaw)) : 30;
+  const now = nowMs();
+  let expiresAtMs = src.expires_at_ms == null ? null : Math.max(0, Number(src.expires_at_ms) || 0);
+  if (expiresAtMs && expiresAtMs <= now) {
+    level = ALEX_ACCESS_DEFAULT_LEVEL;
+    expiresAtMs = null;
+  }
+  let projectRootId = src.project_root_id == null ? null : Number(src.project_root_id);
+  const rootRow = projectRootId ? getAlexProjectRootById(db, projectRootId) : null;
+  if (level === 2) {
+    projectRootId = null;
+    expiresAtMs = null;
+  }
+  const normalizedTtlMinutes = level === 2 ? 0 : ttlMinutes;
+  if (level >= 3 && (!rootRow || !rootRow.enabled)) {
+    level = ALEX_ACCESS_DEFAULT_LEVEL;
+    projectRootId = null;
+    expiresAtMs = null;
+  }
+  const extraRoots = Array.isArray(src.extra_roots) ? src.extra_roots.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  return {
+    level,
+    project_root_id: projectRootId,
+    ttl_minutes: level === ALEX_ACCESS_DEFAULT_LEVEL && expiresAtMs == null && normalizedTtlMinutes === 0 ? 30 : normalizedTtlMinutes,
+    expires_at_ms: expiresAtMs,
+    confirmed_at_ms: src.confirmed_at_ms == null ? null : Number(src.confirmed_at_ms),
+    extra_roots: extraRoots,
+    updated_at_ms: src.updated_at_ms == null ? now : Number(src.updated_at_ms),
+  };
+}
+
+function getAlexAccessState(db) {
+  const normalized = normalizeAlexAccessState(db, readAlexAccessStateRaw(db));
+  const currentRaw = readAlexAccessStateRaw(db);
+  const currentJson = JSON.stringify(currentRaw || {});
+  const normalizedJson = JSON.stringify(normalized);
+  if (currentJson !== normalizedJson) setAlexAccessStateRaw(db, normalized);
+  return normalized;
+}
+
+function getAlexAllowedRoots(db, state = null) {
+  const resolvedState = state || getAlexAccessState(db);
+  const sandboxRoot = getAlexSandboxRootReal();
+  const roots = [sandboxRoot];
+  const projectRoot = resolvedState.project_root_id ? getAlexProjectRootById(db, resolvedState.project_root_id) : null;
+  if (resolvedState.level >= 3 && projectRoot?.enabled) roots.push(realpathOrResolve(projectRoot.path));
+  if (resolvedState.level >= 4) {
+    for (const extra of resolvedState.extra_roots || []) {
+      try {
+        roots.push(validateAlexProjectRootPath(extra, { sandboxRoot }));
+      } catch {}
+    }
+  }
+  return Array.from(new Set(roots));
+}
+
+function getAlexExecWhitelistForLevel(level) {
+  return level >= 2 ? [...ALEX_EXEC_BASE_WHITELIST] : [];
+}
+
+function isBinaryWriteExtension(ext) {
+  return WORKSPACE_BINARY_WRITE_EXT_BLOCKLIST.has(String(ext || '').toLowerCase());
+}
+
+function looksLikeInstructionBlob(content) {
+  const text = String(content || '').trim();
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  const lines = text.split(/\r?\n/);
+  const stepLines = text.split(/\r?\n/).filter((line) => /^\s*(?:[-*]|\d+\.)\s+/.test(line)).length;
+  const headingLines = lines.filter((line) => /^\s*#{1,6}\s+/.test(line)).length;
+  const commandLines = lines.filter((line) => /^\s*(?:`[^`]+`|\(?\s*(?:cd|rm|cp|zip|sha256sum|mkdir|find|sed|awk|rg|grep|ls|cat|pwd)\b)/i.test(line)).length;
+  const outputMentions = (text.match(/\b(?:dist|build|output|artifact)s?\/[^\s`"')]+\.(?:zip|apk|aab|jar|keystore|png|jpe?g|gif|webp|pdf|mp4|mov|exe|dll|so|dylib|bin)\b/gi) || []).length;
+  const imperativeMentions = (lower.match(/\b(?:build|create|generate|verify|replace|scaffold|ensure|confirm|update|read|list|run)\b/g) || []).length;
+  return (
+    lower.includes('copy/paste')
+    || lower.includes('do this in order')
+    || lower.includes('required steps')
+    || lower.includes('required verification')
+    || lower.includes('success conditions')
+    || /\btask:\b/i.test(text)
+    || /\bgoal:\b/i.test(text)
+    || /\bproof required\b/i.test(text)
+    || /\bfix requirements\b/i.test(text)
+    || /\brepro\b/i.test(text)
+    || (headingLines >= 2 && (stepLines >= 2 || outputMentions >= 1))
+    || (outputMentions >= 1 && (commandLines >= 1 || imperativeMentions >= 4))
+    || (lines.length >= 8 && imperativeMentions >= 5 && outputMentions >= 1)
+    || stepLines >= 3
+  );
+}
+
+function binaryWriteForbiddenMessage(ext, content = '') {
+  const base = 'Binary outputs cannot be created with writeFile. Use proc.exec to build, then copyPath/movePath.';
+  if (looksLikeInstructionBlob(content)) {
+    return `${base} This looks like mission text or instructions, so run the build command instead of writing it into ${ext || 'the output path'}.`;
+  }
+  return base;
+}
+
+function isDangerousRmTarget(token) {
+  const cleaned = stripTokenQuotes(token);
+  return (
+    !cleaned
+    || cleaned === '/'
+    || cleaned === '.'
+    || cleaned === '..'
+    || cleaned === '~'
+    || cleaned === '*'
+    || cleaned === '/*'
+    || cleaned.endsWith('/..')
+  );
+}
+
+function isAlexSession(db, sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  if (/^alex(?:[-:_]|$)/i.test(sid)) return true;
+  const meta = getWebchatSessionMeta(db, sessionId);
+  return String(meta?.assistant_name || '').trim().toLowerCase() === 'alex';
+}
+
+function alexApprovalsEnabled() {
+  const raw = envValue('ALEX_APPROVALS_ENABLED', 'false').toLowerCase();
+  return ['1', 'true', 'on', 'yes'].includes(raw);
 }
 
 function shouldUseMcpBrowse(messageText) {
@@ -170,6 +667,166 @@ function extractFirstHttpUrl(messageText) {
   return m ? String(m[0]) : '';
 }
 
+function extractBrowseQuery(messageText) {
+  const raw = String(messageText || '').trim();
+  if (!raw) return '';
+  const normalized = raw
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Prefer quoted query terms: search for "test"
+  const quoted = normalized.match(/["']([^"']{1,180})["']/);
+  if (quoted?.[1]) return quoted[1].trim().replace(/[.,;:!?]+$/g, '').slice(0, 180);
+
+  // Otherwise prefer phrase after "for": search the web for test
+  const afterFor = normalized.match(/\bfor\s+(.+)$/i);
+  if (afterFor?.[1]) {
+    const cleaned = String(afterFor[1] || '')
+      .replace(/\b(and|then)\b[\s\S]*$/i, '')
+      .replace(/[.,;:!?]+$/g, '')
+      .trim();
+    if (cleaned) return cleaned.slice(0, 180);
+  }
+
+  // Strip common command phrasing while preserving user query text.
+  const stripped = normalized
+    .replace(/\b(search|browse|look\s*up|find|web|internet|please|can you|could you)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[.,;:!?]+$/g, '');
+  return (stripped || normalized).slice(0, 180);
+}
+
+function isMcpBrowseDirective(messageText) {
+  const text = String(messageText || '').trim();
+  if (!text) return false;
+  return /\b(search\s+browser\s+mcp|mcp\s+search\s+browser|browser\.search)\b/i.test(text)
+    || (/\bmcp\b/i.test(text) && /\b(search|browse|web)\b/i.test(text))
+    || (/\b(search|browse)\b/i.test(text) && /\bmcp\b/i.test(text));
+}
+
+function detectDirectUrlBrowseIntent(messageText) {
+  const text = String(messageText || '').trim();
+  if (!text) return { hasUrl: false, wantsDirectBrowse: false, wantsBasicBrowser: false };
+  const hasUrl = /https?:\/\/[^\s,)'"]+/i.test(text);
+  const wantsDirectBrowse = hasUrl && /\b(open|fetch|extract|read|visit)\b/i.test(text);
+  const wantsBasicBrowser = wantsDirectBrowse && /\bbasic\s+browser\s+mcp\b/i.test(text);
+  return { hasUrl, wantsDirectBrowse, wantsBasicBrowser };
+}
+
+function detectExportReportIntent(messageText) {
+  const text = String(messageText || '').trim();
+  if (!text) return false;
+  return /\b(export|report|markdown|csv)\b/i.test(text)
+    || /\bexport_reports\b/i.test(text)
+    || /\bexport\s+reports\s+mcp\b/i.test(text);
+}
+
+function parseExportReportRequest(messageText) {
+  const raw = String(messageText || '').trim();
+  if (!raw) return null;
+  if (!detectExportReportIntent(raw)) return null;
+  const wantsCsv = /\bcsv\b/i.test(raw);
+  const format = wantsCsv ? 'csv' : 'markdown';
+  const pathMatch = raw.match(/([A-Za-z0-9._/-]+\.(?:md|markdown|csv))/i);
+  const path = String(pathMatch?.[1] || '').trim()
+    || (format === 'csv'
+      ? 'research-lab/mcp_probe/export_probe.csv'
+      : 'research-lab/mcp_probe/export_probe.md');
+  const withContent = raw.match(/\bwith\s+content\s+["']?([\s\S]+?)["']?$/i);
+  const content = String(withContent?.[1] || '').trim()
+    || (format === 'csv'
+      ? 'title,url\nExample Domain,https://example.com\n'
+      : '# Export Probe\n\nExample Domain\n');
+  return { format, path, content };
+}
+
+function detectPbFilesMcpIntent(messageText) {
+  const text = String(messageText || '').trim();
+  if (!text) return false;
+  return /\bpb[\s_-]*files\b/i.test(text)
+    || /\bpb_files\b/i.test(text)
+    || /\bmcp\b[\s\S]*\bfiles\b/i.test(text);
+}
+
+function parsePbFilesRequest(messageText) {
+  const raw = String(messageText || '').trim();
+  if (!raw || !detectPbFilesMcpIntent(raw)) return null;
+  const cleanPath = (s) => String(s || '').trim().replace(/[.,;:!?]+$/g, '');
+
+  const filePathMatch = raw.match(/([A-Za-z0-9._/-]+\.[A-Za-z0-9]{1,12})/);
+  const filePath = cleanPath(filePathMatch?.[1] || '') || null;
+
+  const folderLabelMatch = raw.match(/\b(?:create|make|mkdir)\s+(?:folder|directory)\s*:?\s*([A-Za-z0-9._/-]+)/i)
+    || raw.match(/\bfolder\s*:?\s*([A-Za-z0-9._/-]+)/i)
+    || raw.match(/\bmkdir\s+([A-Za-z0-9._/-]+)/i);
+  let folderPath = cleanPath(folderLabelMatch?.[1] || '') || null;
+
+  if (!folderPath && filePath && filePath.includes('/')) {
+    const idx = filePath.lastIndexOf('/');
+    folderPath = idx > 0 ? filePath.slice(0, idx) : null;
+  }
+
+  const contentMatch = raw.match(/\bwrite(?:\s+file)?(?:\s*:)?[\s\S]*?["']([\s\S]+?)["']/i)
+    || raw.match(/\bwith\s+content\s+["']([\s\S]+?)["']/i);
+  const content = String(contentMatch?.[1] || '').trim() || 'ok';
+
+  const wantsWrite = /\bwrite\b/i.test(raw) || /\bcreate\s+file\b/i.test(raw);
+  const wantsRead = /\bread\b/i.test(raw);
+  const wantsMkdir = /\bmkdir\b/i.test(raw) || /\b(?:create|make)\s+(?:folder|directory)\b/i.test(raw) || /\bfolder\s*:/i.test(raw);
+
+  if (!wantsWrite && !wantsRead && !wantsMkdir) return null;
+  if ((wantsWrite || wantsRead) && !filePath) return null;
+
+  return {
+    filePath,
+    folderPath,
+    content,
+    wantsWrite,
+    wantsRead,
+    wantsMkdir,
+  };
+}
+
+function parseKdenliveAlignedRequest(messageText) {
+  const raw = String(messageText || '').trim();
+  if (!raw) return null;
+  if (
+    !/kdenlive\.make_aligned_project/i.test(raw)
+    && !/\bmake_aligned_project\b/i.test(raw)
+    && !/\bkdenlive\b/i.test(raw)
+    && !/aligned project/i.test(raw)
+  ) return null;
+
+  let candidate = '';
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) candidate = String(fenced[1]).trim();
+  if (!candidate) {
+    const m = raw.match(/\{[\s\S]*\}$/);
+    if (m?.[0]) candidate = String(m[0]).trim();
+  }
+  if (!candidate) return null;
+
+  try {
+    const obj = JSON.parse(candidate);
+    if (!obj || typeof obj !== 'object') return null;
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+function extractRequestedMaxChars(messageText, fallback = 500) {
+  const raw = String(messageText || '').trim();
+  if (!raw) return fallback;
+  const m = raw.match(/\b(\d{2,5})\s*(?:chars?|characters?)\b/i);
+  const n = Number(m?.[1] || 0);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.max(80, Math.min(n, 6000));
+}
+
 function summarizeMcpContextText(raw, maxChars = 700) {
   const txt = String(raw || '').replace(/\s+/g, ' ').trim();
   if (!txt) return '';
@@ -218,6 +875,20 @@ function normalizeProviderBaseUrl(raw) {
   return String(raw || '').trim().replace(/\/+$/g, '').replace(/\/v1$/g, '');
 }
 
+function detectToolCallingSupport(db) {
+  const provider = getActiveProvider(db);
+  const providerType = String(provider?.providerType || provider?.kind || PROVIDER_TYPES.OPENAI_COMPATIBLE);
+  const model = selectedModelForProvider(db, provider);
+  const supported = providerType === PROVIDER_TYPES.OPENAI || providerType === PROVIDER_TYPES.OPENAI_COMPATIBLE;
+  return {
+    provider_type: providerType,
+    provider_id: String(provider?.id || ''),
+    model: model || null,
+    supports_tool_calls: supported,
+    reason: supported ? 'provider_tool_calls_supported' : `provider_type_no_tool_call_api:${providerType}`,
+  };
+}
+
 function selectedModelForProvider(db, provider) {
   const selected = String(kvGet(db, 'llm.selectedModel', '') || '').trim();
   if (selected) return selected;
@@ -244,7 +915,10 @@ async function callOpenAiWithMessages({ db, systemText, messages, tools = null, 
     ],
     temperature: 0.2,
   };
-  if (Array.isArray(tools) && tools.length) body.tools = tools;
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
 
   const headers = { 'content-type': 'application/json' };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
@@ -272,49 +946,806 @@ async function callOpenAiWithMessages({ db, systemText, messages, tools = null, 
   }
 }
 
-async function runOpenAiToolLoop({ db, message, systemText, sessionId, reqSignal, workdir, mcpServerId = null, includeMcpTools = false, rid = null }) {
+function extractToolCallsFromAssistantMessage(msg) {
+  const direct = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+  if (direct.length) return direct;
+
+  const content = msg?.content;
+  if (!Array.isArray(content)) return [];
+
+  const out = [];
+  for (const item of content) {
+    const type = String(item?.type || '').toLowerCase();
+    if (type !== 'tool_call' && type !== 'function_call') continue;
+    const name = String(item?.name || item?.function?.name || '').trim();
+    if (!name) continue;
+    const args = item?.arguments ?? item?.function?.arguments ?? '{}';
+    out.push({
+      id: String(item?.id || `call_${Date.now()}_${out.length + 1}`),
+      function: {
+        name,
+        arguments: typeof args === 'string' ? args : JSON.stringify(args || {}),
+      },
+    });
+  }
+  return out;
+}
+
+function redactSecretsDeep(input, seen = new WeakSet()) {
+  if (input == null) return input;
+  if (typeof input === 'string') {
+    return input
+      .replace(/Bearer\s+[A-Za-z0-9._\-~+/=]+/gi, 'Bearer [redacted]')
+      .replace(/(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]');
+  }
+  if (typeof input !== 'object') return input;
+  if (seen.has(input)) return '[circular]';
+  seen.add(input);
+  if (Array.isArray(input)) return input.map((v) => redactSecretsDeep(v, seen));
+  const out = {};
+  for (const [k, v] of Object.entries(input)) {
+    out[k] = /secret|token|password|key|authorization/i.test(String(k)) ? '[redacted]' : redactSecretsDeep(v, seen);
+  }
+  return out;
+}
+
+function sanitizeAssistantPayload(msg) {
+  return redactSecretsDeep(msg && typeof msg === 'object' ? msg : { content: String(msg || '') });
+}
+
+function getToolDefNames(toolDefs = []) {
+  return toolDefs
+    .map((t) => String(t?.function?.name || '').trim())
+    .filter(Boolean);
+}
+
+function matchToolCallName(toolNameRaw, toolDefs = []) {
+  const raw = String(toolNameRaw || '').trim();
+  if (!raw) return null;
+  const defs = getToolDefNames(toolDefs);
+  const lower = raw.toLowerCase();
+  const exact = defs.find((name) => name === raw);
+  if (exact) return { raw_name: exact, normalized_name: normalizeToolName(exact), corrected: false, correction_reason: null };
+  const caseFold = defs.find((name) => name.toLowerCase() === lower);
+  if (caseFold) return { raw_name: caseFold, normalized_name: normalizeToolName(caseFold), corrected: true, correction_reason: 'case_normalized' };
+  const normalized = normalizeToolName(raw);
+  const byNormalized = defs.find((name) => normalizeToolName(name) === normalized);
+  if (byNormalized) return { raw_name: byNormalized, normalized_name: normalized, corrected: true, correction_reason: 'alias_normalized' };
+  return null;
+}
+
+function toolCallSchemaError(normalizedToolName, args = {}) {
+  const tool = String(normalizedToolName || '').trim();
+  const src = args && typeof args === 'object' ? args : {};
+  if (tool === 'workspace.write_file' && (!String(src.path || '').trim() || typeof src.content !== 'string')) return 'tools.fs.writeFile requires { path, content }';
+  if (tool === 'workspace.write_file') {
+    try {
+      ensureTextWriteTarget(src.path || '');
+    } catch (err) {
+      if (String(err?.code || '') === 'INVALID_OPERATION' || String(err?.detail?.error || '') === 'writeFile_binary_blocked') {
+        throw err;
+      }
+      throw err;
+    }
+  }
+  if (tool === 'workspace.read_file' && !String(src.path || '').trim()) return 'tools.fs.readFile requires { path }';
+  if (tool === 'workspace.list' && src.path != null && typeof src.path !== 'string') return 'tools.fs.listDir path must be a string';
+  if (tool === 'workspace.mkdir' && !String(src.path || '').trim()) return 'tools.fs.mkdir requires { path }';
+  if (tool === 'workspace.exec_shell' && !String(src.command || src.input || '').trim()) return 'tools.proc.exec requires { command }';
+  if ((tool === 'memory.write_scratch' || tool === 'memory.append') && !String(src.content ?? src.text ?? '').trim()) return 'memory.write_scratch requires { content }';
+  if (tool === 'memory.read_day' && !String(src.day || '').trim()) return 'memory.read_day requires { day }';
+  if (tool === 'memory.atlas.search' && !String(src.q || '').trim()) return 'memory.atlas.search requires { q }';
+  return null;
+}
+
+function buildToolRetryPrompt(message, toolDefs = []) {
+  const names = getToolDefNames(toolDefs);
+  return [
+    'Return exactly one function/tool call now.',
+    `Original request: ${String(message || '').trim()}`,
+    `Allowed tools: ${names.join(', ')}`,
+    'Do not answer in prose before the tool call.',
+  ].join('\n');
+}
+
+function inferMemoryStoreContent(messageText) {
+  const raw = String(messageText || '').trim();
+  if (!raw) return null;
+
+  const hasFsCue = /\b(file|folder|directory|path|mkdir|write\s+file|create\s+file|\.txt|\.md|\.json)\b/i.test(raw);
+  if (hasFsCue) return null;
+
+  const isStoreIntent = /\b(store|remember|save|note)\b/i.test(raw) && /\b(this|memory|later|for later)\b/i.test(raw);
+  if (!isStoreIntent) return null;
+
+  const m = raw.match(/\b(?:store|remember|save|note)(?:\s+this)?(?:\s+in\s+memory)?\s*[:\-]\s*([\s\S]+)$/i)
+    || raw.match(/\b(?:store|remember|save|note)(?:\s+this)?(?:\s+in\s+memory)?\s+([\s\S]+)$/i);
+  const content = String(m?.[1] || raw).trim();
+  return content ? content : null;
+}
+
+function hasTraceTool(traces, predicate) {
+  return Array.isArray(traces) && traces.some((t) => predicate(String(t?.tool || '')));
+}
+
+function hasRequiredCategoryTrace(traces, requirement) {
+  const req = requirement?.categories || {};
+  if (!requirement?.required) return true;
+  const fsOk = !req.fs || hasTraceTool(
+    traces,
+    (tool) => tool.startsWith('workspace.')
+      || tool.startsWith('tools.fs.')
+      || tool.startsWith('mcp.export.')
+      || tool.startsWith('mcp.pb_files.')
+      || tool === 'mcp.kdenlive.make_aligned_project'
+  );
+  const memoryOk = !req.memory || hasTraceTool(traces, (tool) => tool.startsWith('memory.') || tool.startsWith('scratch.'));
+  const mcpOk = !req.mcp || hasTraceTool(traces, (tool) => tool.startsWith('mcp.') || tool === 'resolve-library-id' || tool === 'query-docs');
+  const execOk = !req.exec || hasTraceTool(traces, (tool) => tool === 'workspace.exec_shell' || tool === 'tools.proc.exec' || tool === 'workspace.exec');
+  return fsOk && memoryOk && mcpOk && execOk;
+}
+
+async function applyDeterministicPostconditions({
+  db,
+  message,
+  sessionId,
+  workdir,
+  intent,
+  reqSignal,
+  traces,
+  toolExecutor,
+  mcpExecutor,
+  mcpServerId = null,
+  mcpCapabilities = [],
+  requirement = null,
+  rid = null,
+}) {
+  const extraTraces = [];
+  const notes = [];
+  const runTool = toolExecutor || executeRegisteredTool;
+
+  const memoryRequested = Boolean(requirement?.categories?.memory);
+  const memoryContent = memoryRequested ? (inferMemoryStoreContent(message) || String(message || '').trim()) : inferMemoryStoreContent(message);
+  const hasMemory = hasTraceTool(traces, (tool) => tool.startsWith('memory.') || tool.startsWith('scratch.'));
+  if (memoryContent && !hasMemory) {
+    const started = Date.now();
+    const args = { content: memoryContent };
+    try {
+      const runOut = await runTool({ toolName: 'memory.write_scratch', args, workdir, db, sessionId, signal: reqSignal });
+      extraTraces.push({
+        stage: 'tool',
+        ok: true,
+        tool: 'memory.write_scratch',
+        args,
+        deterministic: true,
+        reason: 'postcondition_store_this',
+        result: runOut?.result || {},
+        duration_ms: Date.now() - started,
+      });
+      notes.push('Stored note to memory.');
+      console.log(`[llm.tool_postcondition] rid=${rid || '-'} tool=memory.write_scratch ok=true`);
+    } catch (e) {
+      extraTraces.push({
+        stage: 'tool',
+        ok: false,
+        tool: 'memory.write_scratch',
+        args,
+        deterministic: true,
+        reason: 'postcondition_store_this',
+        error: String(e?.message || e),
+        duration_ms: Date.now() - started,
+      });
+      console.warn(`[llm.tool_postcondition] rid=${rid || '-'} tool=memory.write_scratch ok=false err=${String(e?.message || e)}`);
+    }
+  }
+
+  const execRequested = Boolean(requirement?.categories?.exec);
+  const execCommand = execRequested ? inferRequestedExecCommand(message) : null;
+  const hasExec = hasTraceTool(traces, (tool) => tool === 'workspace.exec_shell' || tool === 'tools.proc.exec' || tool === 'workspace.exec');
+  if (execCommand && !hasExec) {
+    const started = Date.now();
+    const args = { command: execCommand, cwd: '.' };
+    try {
+      const runOut = await runTool({ toolName: 'workspace.exec_shell', args, workdir, db, sessionId, signal: reqSignal });
+      extraTraces.push({
+        stage: 'tool',
+        ok: true,
+        tool: 'workspace.exec_shell',
+        args,
+        deterministic: true,
+        reason: 'postcondition_exec_command',
+        result: runOut?.result || {},
+        duration_ms: Date.now() - started,
+      });
+      notes.push('Executed requested shell command.');
+      console.log(`[llm.tool_postcondition] rid=${rid || '-'} tool=workspace.exec_shell ok=true`);
+    } catch (e) {
+      extraTraces.push({
+        stage: 'tool',
+        ok: false,
+        tool: 'workspace.exec_shell',
+        args,
+        deterministic: true,
+        reason: 'postcondition_exec_command',
+        error: String(e?.message || e),
+        code: String(e?.code || ''),
+        detail: e?.detail || null,
+        duration_ms: Date.now() - started,
+      });
+      console.warn(`[llm.tool_postcondition] rid=${rid || '-'} tool=workspace.exec_shell ok=false err=${String(e?.message || e)}`);
+    }
+  }
+
+  const artifact = inferRequestedArtifact(message);
+  const skipArtifactPostcondition = shouldSkipArtifactVerification({
+    messageText: message,
+    missionTextMode: shouldForceMissionTextMode(message),
+    inferred: artifact,
+  });
+  const hasFs = hasTraceTool(
+    traces,
+    (tool) => tool.startsWith('workspace.')
+      || tool.startsWith('tools.fs.')
+      || tool.startsWith('mcp.export.')
+      || tool === 'mcp.kdenlive.make_aligned_project',
+  );
+  if (!skipArtifactPostcondition && artifact?.path && !hasFs && (Boolean(requirement?.categories?.fs) || intent === 'local_action' || intent === 'mixed' || /\b(create|write|save|make)\b/i.test(String(message || '')))) {
+    const started = Date.now();
+    const local = await executeDeterministicLocalAction({
+      message,
+      workdir,
+      executeTool: async (toolName, args) => runTool({ toolName, args, workdir, db, sessionId, signal: reqSignal }),
+      logger: console,
+    });
+    extraTraces.push({
+      stage: 'tool',
+      ok: Boolean(local?.ok),
+      tool: String(local?.parsed?.toolName || 'workspace.write_file'),
+      args: local?.parsed?.args || { path: artifact.path },
+      deterministic: true,
+      reason: 'postcondition_create_file',
+      result: local?.runOut?.result || null,
+      error: local?.ok ? null : String(local?.error || 'deterministic_local_action_failed'),
+      duration_ms: Date.now() - started,
+    });
+    if (local?.ok) notes.push(String(local.reply || '').trim());
+    console.log(`[llm.tool_postcondition] rid=${rid || '-'} tool=${String(local?.parsed?.toolName || 'workspace.write_file')} ok=${Boolean(local?.ok)}`);
+  }
+
+  const mcpRequested = Boolean(requirement?.categories?.mcp);
+  const hasMcpTrace = hasTraceTool(traces, (tool) => tool.startsWith('mcp.') || tool === 'resolve-library-id' || tool === 'query-docs');
+  if (mcpRequested && !hasMcpTrace) {
+    const started = Date.now();
+    const runMcp = mcpExecutor || executeMcpRpc;
+    const caps = Array.isArray(mcpCapabilities) ? mcpCapabilities : [];
+    const exportReq = parseExportReportRequest(message);
+    const pbFilesReq = parsePbFilesRequest(message);
+    const kdenliveReq = parseKdenliveAlignedRequest(message);
+    const directUrlIntent = detectDirectUrlBrowseIntent(message);
+    const explicitUrl = extractFirstHttpUrl(message);
+
+    if (pbFilesReq) {
+      if (!mcpServerId) {
+        return {
+          traces: extraTraces,
+          notes,
+          error: 'PB_FILES_MCP_NOT_AVAILABLE',
+          detail: { reason: 'mcp_server_not_selected' },
+        };
+      }
+      const requiredCaps = [];
+      if (pbFilesReq.wantsMkdir && pbFilesReq.folderPath) requiredCaps.push('pb_files.mkdir');
+      if (pbFilesReq.wantsWrite) requiredCaps.push('pb_files.write');
+      if (pbFilesReq.wantsRead) requiredCaps.push('pb_files.read');
+      const missingCaps = requiredCaps.filter((c) => !caps.includes(c));
+      if (missingCaps.length) {
+        return {
+          traces: extraTraces,
+          notes,
+          error: 'PB_FILES_MCP_NOT_AVAILABLE',
+          detail: { reason: 'missing_capabilities', missing_capabilities: missingCaps },
+        };
+      }
+
+      try {
+        if (pbFilesReq.wantsMkdir && pbFilesReq.folderPath) {
+          const mkdirArgs = { path: pbFilesReq.folderPath };
+          const mkdirOut = await runMcp({ db, serverId: mcpServerId, capability: 'pb_files.mkdir', args: mkdirArgs, signal: reqSignal, rid });
+          extraTraces.push({
+            stage: 'tool',
+            ok: true,
+            tool: 'mcp.pb_files.mkdir',
+            args: mkdirArgs,
+            deterministic: true,
+            reason: 'postcondition_pb_files_mcp',
+            result: mkdirOut || {},
+            duration_ms: Date.now() - started,
+          });
+        }
+        if (pbFilesReq.wantsWrite && pbFilesReq.filePath) {
+          const writeArgs = { path: pbFilesReq.filePath, content: pbFilesReq.content };
+          const writeOut = await runMcp({ db, serverId: mcpServerId, capability: 'pb_files.write', args: writeArgs, signal: reqSignal, rid });
+          extraTraces.push({
+            stage: 'tool',
+            ok: true,
+            tool: 'mcp.pb_files.write',
+            args: writeArgs,
+            deterministic: true,
+            reason: 'postcondition_pb_files_mcp',
+            result: writeOut || {},
+            duration_ms: Date.now() - started,
+          });
+        }
+        if (pbFilesReq.wantsRead) {
+          const readPath = pbFilesReq.filePath;
+          const readArgs = { path: readPath };
+          const readOut = await runMcp({ db, serverId: mcpServerId, capability: 'pb_files.read', args: readArgs, signal: reqSignal, rid });
+          extraTraces.push({
+            stage: 'tool',
+            ok: true,
+            tool: 'mcp.pb_files.read',
+            args: readArgs,
+            deterministic: true,
+            reason: 'postcondition_pb_files_mcp',
+            result: readOut || {},
+            duration_ms: Date.now() - started,
+          });
+        }
+        notes.push('PB Files MCP actions executed.');
+        return { traces: extraTraces, notes };
+      } catch (e) {
+        extraTraces.push({
+          stage: 'tool',
+          ok: false,
+          tool: 'mcp.pb_files',
+          args: { filePath: pbFilesReq.filePath, folderPath: pbFilesReq.folderPath },
+          deterministic: true,
+          reason: 'postcondition_pb_files_mcp',
+          error: String(e?.message || e),
+          duration_ms: Date.now() - started,
+        });
+        return {
+          traces: extraTraces,
+          notes,
+          error: 'PB_FILES_MCP_NOT_AVAILABLE',
+          detail: { reason: 'execution_failed', message: String(e?.message || e) },
+        };
+      }
+    }
+
+    if (kdenliveReq) {
+      if (!mcpServerId) {
+        return {
+          traces: extraTraces,
+          notes,
+          error: 'KDENLIVE_MCP_NOT_AVAILABLE',
+          detail: { reason: 'mcp_server_not_selected' },
+        };
+      }
+      if (!caps.includes('kdenlive.make_aligned_project')) {
+        return {
+          traces: extraTraces,
+          notes,
+          error: 'KDENLIVE_MCP_NOT_AVAILABLE',
+          detail: { reason: 'missing_capability', capability: 'kdenlive.make_aligned_project' },
+        };
+      }
+      try {
+        const out = await runMcp({
+          db,
+          serverId: mcpServerId,
+          capability: 'kdenlive.make_aligned_project',
+          args: kdenliveReq,
+          signal: reqSignal,
+          rid,
+        });
+        extraTraces.push({
+          stage: 'tool',
+          ok: true,
+          tool: 'mcp.kdenlive.make_aligned_project',
+          args: kdenliveReq,
+          deterministic: true,
+          reason: 'postcondition_kdenlive_mcp',
+          result: out || {},
+          duration_ms: Date.now() - started,
+        });
+        notes.push('Kdenlive aligned project generated.');
+        return { traces: extraTraces, notes };
+      } catch (e) {
+        extraTraces.push({
+          stage: 'tool',
+          ok: false,
+          tool: 'mcp.kdenlive.make_aligned_project',
+          args: kdenliveReq,
+          deterministic: true,
+          reason: 'postcondition_kdenlive_mcp',
+          error: String(e?.message || e),
+          duration_ms: Date.now() - started,
+        });
+        return {
+          traces: extraTraces,
+          notes,
+          error: 'KDENLIVE_MCP_NOT_AVAILABLE',
+          detail: { reason: 'execution_failed', message: String(e?.message || e) },
+        };
+      }
+    }
+
+    // URL + open/extract intent should execute basic browser flow, never fallback to search.
+    if (mcpServerId && directUrlIntent.wantsDirectBrowse && explicitUrl && caps.includes('browser.open_url') && caps.includes('browser.extract_text')) {
+      const maxChars = extractRequestedMaxChars(message, 500);
+      const openArgs = { url: explicitUrl };
+      const extractArgs = { url: explicitUrl, max_chars: maxChars };
+      try {
+        const openOut = await runMcp({ db, serverId: mcpServerId, capability: 'browser.open_url', args: openArgs, signal: reqSignal, rid });
+        extraTraces.push({
+          stage: 'tool',
+          ok: true,
+          tool: 'mcp.browser.open_url',
+          args: openArgs,
+          deterministic: true,
+          reason: 'postcondition_mcp_direct_url',
+          result: openOut || {},
+          duration_ms: Date.now() - started,
+        });
+        const extractOut = await runMcp({ db, serverId: mcpServerId, capability: 'browser.extract_text', args: extractArgs, signal: reqSignal, rid });
+        extraTraces.push({
+          stage: 'tool',
+          ok: true,
+          tool: 'mcp.browser.extract_text',
+          args: extractArgs,
+          deterministic: true,
+          reason: 'postcondition_mcp_direct_url',
+          result: extractOut || {},
+          duration_ms: Math.max(0, Date.now() - started),
+        });
+        notes.push('MCP browser.open_url and browser.extract_text executed.');
+        console.log(`[llm.tool_postcondition] rid=${rid || '-'} tool=browser.open_url+browser.extract_text ok=true`);
+      } catch (e) {
+        extraTraces.push({
+          stage: 'tool',
+          ok: false,
+          tool: 'mcp.browser.extract_text',
+          args: extractArgs,
+          deterministic: true,
+          reason: 'postcondition_mcp_direct_url',
+          error: String(e?.message || e),
+          duration_ms: Date.now() - started,
+        });
+        console.warn(`[llm.tool_postcondition] rid=${rid || '-'} tool=browser.open_url+browser.extract_text ok=false err=${String(e?.message || e)}`);
+      }
+      return { traces: extraTraces, notes };
+    }
+
+    // Export Reports MCP deterministic path for report writing.
+    if (mcpServerId && exportReq) {
+      const isCsv = exportReq.format === 'csv';
+      const capability = isCsv ? 'export.write_csv' : 'export.write_markdown';
+      if (caps.includes(capability)) {
+        const args = { path: exportReq.path, content: exportReq.content };
+        try {
+          const out = await runMcp({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+          extraTraces.push({
+            stage: 'tool',
+            ok: true,
+            tool: isCsv ? 'mcp.export.write_csv' : 'mcp.export.write_markdown',
+            args,
+            deterministic: true,
+            reason: 'postcondition_export_reports',
+            result: out || {},
+            duration_ms: Date.now() - started,
+          });
+          notes.push(`Exported report via MCP: ${exportReq.path}`);
+          console.log(`[llm.tool_postcondition] rid=${rid || '-'} tool=${capability} ok=true`);
+          return { traces: extraTraces, notes };
+        } catch (e) {
+          extraTraces.push({
+            stage: 'tool',
+            ok: false,
+            tool: isCsv ? 'mcp.export.write_csv' : 'mcp.export.write_markdown',
+            args,
+            deterministic: true,
+            reason: 'postcondition_export_reports',
+            error: String(e?.message || e),
+            duration_ms: Date.now() - started,
+          });
+          console.warn(`[llm.tool_postcondition] rid=${rid || '-'} tool=${capability} ok=false err=${String(e?.message || e)}`);
+        }
+      } else {
+        // Fallback to workspace fs write when Export MCP capability is unavailable.
+        const args = { path: exportReq.path, content: exportReq.content };
+        try {
+          const runOut = await runTool({ toolName: 'workspace.write_file', args, workdir, db, sessionId, signal: reqSignal });
+          extraTraces.push({
+            stage: 'tool',
+            ok: true,
+            tool: 'workspace.write_file',
+            args,
+            deterministic: true,
+            reason: 'postcondition_export_reports_fs_fallback',
+            result: runOut?.result || {},
+            duration_ms: Date.now() - started,
+          });
+          notes.push(`Export MCP unavailable; wrote via workspace fs: ${exportReq.path}`);
+          return { traces: extraTraces, notes };
+        } catch (e) {
+          extraTraces.push({
+            stage: 'tool',
+            ok: false,
+            tool: 'workspace.write_file',
+            args,
+            deterministic: true,
+            reason: 'postcondition_export_reports_fs_fallback',
+            error: String(e?.message || e),
+            duration_ms: Date.now() - started,
+          });
+        }
+      }
+    }
+
+    let capability = '';
+    if (caps.includes('browser.search')) capability = 'browser.search';
+    else if (caps.includes('resolve-library-id')) capability = 'resolve-library-id';
+    else if (caps.includes('query-docs')) capability = 'query-docs';
+    if (!capability && mcpServerId) capability = 'browser.search';
+
+    if (mcpServerId && capability) {
+      let args = {};
+      if (capability === 'browser.search') args = { q: extractBrowseQuery(message) || String(message || '').slice(0, 300), limit: 3 };
+      else if (capability === 'resolve-library-id') args = { libraryName: String(message || '').slice(0, 120) };
+      else args = { libraryId: 'react', query: String(message || '').slice(0, 300) };
+      try {
+        const mcpOut = await runMcp({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+        extraTraces.push({
+          stage: 'tool',
+          ok: true,
+          tool: capability.startsWith('browser.') ? `mcp.${capability}` : capability,
+          args,
+          deterministic: true,
+          reason: 'postcondition_mcp_required',
+          result: mcpOut || {},
+          duration_ms: Date.now() - started,
+        });
+        notes.push(`MCP ${capability} executed.`);
+        console.log(`[llm.tool_postcondition] rid=${rid || '-'} tool=${capability} ok=true`);
+      } catch (e) {
+        extraTraces.push({
+          stage: 'tool',
+          ok: false,
+          tool: capability.startsWith('browser.') ? `mcp.${capability}` : capability,
+          args,
+          deterministic: true,
+          reason: 'postcondition_mcp_required',
+          error: String(e?.message || e),
+          duration_ms: Date.now() - started,
+        });
+        console.warn(`[llm.tool_postcondition] rid=${rid || '-'} tool=${capability} ok=false err=${String(e?.message || e)}`);
+      }
+    }
+  }
+
+  return { traces: extraTraces, notes };
+}
+
+async function runOpenAiToolLoop({
+  db,
+  message,
+  systemText,
+  sessionId,
+  agentId = 'alex',
+  reqSignal,
+  workdir,
+  mcpServerId = null,
+  includeMcpTools = false,
+  rid = null,
+  intent = 'chat',
+  toolPolicyConfig = null,
+  llmCaller = callOpenAiWithMessages,
+  toolExecutor = executeRegisteredTool,
+  mcpExecutor = executeMcpRpc,
+  toolCallingSupport = null,
+}) {
+  const policyCfg = toolPolicyConfig || getToolRouterConfig();
   const serverCaps = mcpServerId
     ? db.prepare('SELECT capability FROM mcp_capabilities WHERE server_id = ? ORDER BY capability ASC').all(String(mcpServerId)).map((r) => String(r.capability || ''))
     : [];
   const mcpToolDefs = includeMcpTools && mcpServerId ? getMcpToolSchema(serverCaps) : [];
   const toolDefs = [...getOpenAiToolSchema(), ...mcpToolDefs];
+  const allowedToolNames = getToolDefNames(toolDefs);
+  const alexAccess = isAlexSession(db, sessionId) ? getAlexAccessState(db) : null;
+  const requirement = detectToolRequirement(message);
+  const toolSupport = toolCallingSupport || detectToolCallingSupport(db);
+  const supportsToolCalls = Boolean(toolSupport?.supports_tool_calls);
   console.log(`[llm.tool_schema] rid=${rid || '-'} include_mcp=${mcpToolDefs.length > 0} tool_count=${toolDefs.length} mcpServerId=${mcpServerId || '-'} caps=${serverCaps.join(',')}`);
   const messages = [{ role: 'user', content: String(message || '') }];
   const traces = [];
   let context7Used = null;
+  let forcedRetry = false;
+  const rejectedCalls = [];
+  let lastAssistantText = '';
+
+  if (requirement.required && !supportsToolCalls) {
+    const post = await applyDeterministicPostconditions({
+      db,
+      message,
+      sessionId,
+      workdir,
+      intent,
+      reqSignal,
+      traces,
+      toolExecutor,
+      mcpExecutor,
+      mcpServerId,
+      mcpCapabilities: serverCaps,
+      requirement,
+      rid,
+    });
+    if (Array.isArray(post?.traces) && post.traces.length) traces.push(...post.traces);
+    if (!hasRequiredCategoryTrace(traces, requirement)) {
+      const fallbackError = String(post?.error || 'TOOL_CALL_REJECTED');
+      return {
+        ok: false,
+        error: fallbackError,
+        reason: String(post?.error || 'tool_calls_unsupported_and_fallback_failed'),
+        detail: {
+          fallback_error: post?.error || null,
+          fallback_detail: post?.detail || null,
+          requirement,
+          reason: 'tool_calls_unsupported_and_fallback_failed',
+          tool_support: toolSupport,
+          traces_count: traces.length,
+          allowed_tools: allowedToolNames,
+          hint: 'Return a valid tool call using one of the allowed tool names.',
+        },
+        traces,
+      };
+    }
+    const note = Array.isArray(post?.notes) && post.notes.length ? `\n\n${post.notes.join('\n')}` : '';
+    return {
+      ok: true,
+      text: `${note}`.trim() || 'Executed requested tools via deterministic mode.',
+      model: null,
+      profile: toolSupport?.provider_id || null,
+      traces,
+      context7: null,
+      tool_required: true,
+      tooling_mode: 'deterministic',
+      supports_tool_calls: false,
+    };
+  }
 
   for (let step = 0; step < 6; step += 1) {
-    const llm = await callOpenAiWithMessages({ db, systemText, messages, tools: toolDefs, signal: reqSignal, timeoutMs: webchatTimeoutMs() });
+    const llm = await llmCaller({ db, systemText, messages, tools: toolDefs, signal: reqSignal, timeoutMs: webchatTimeoutMs() });
     if (!llm.ok) return { ok: false, error: llm.error, detail: llm.detail || null, traces };
     const choice = llm.raw?.choices?.[0] || {};
     const msg = choice?.message || {};
+    lastAssistantText = String(msg?.content || '').trim();
     const finish = String(choice?.finish_reason || 'stop');
-    const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+    const extractedToolCalls = extractToolCallsFromAssistantMessage(msg);
+    const sanitizedAssistant = sanitizeAssistantPayload(msg);
+    const inlineToolProposal = extractedToolCalls.length ? null : parseToolProposalFromReply(String(msg?.content || ''));
+    const toolCalls = extractedToolCalls.length
+      ? extractedToolCalls
+      : (inlineToolProposal
+        ? [{
+            id: `inline_${Date.now()}`,
+            type: 'function',
+            function: {
+              name: inlineToolProposal.rawToolName || inlineToolProposal.toolName,
+              arguments: JSON.stringify(inlineToolProposal.args || {}),
+            },
+            _pb_source: 'assistant_content_json',
+          }]
+        : []);
+
+    if (!extractedToolCalls.length && inlineToolProposal) {
+      console.log('[alex.tool_call_recovered]', JSON.stringify({
+        rid: rid || null,
+        session_id: sessionId || null,
+        route: intent,
+        model: llm.model || null,
+        tool: inlineToolProposal.rawToolName || inlineToolProposal.toolName,
+      }));
+    }
 
     if (toolCalls.length > 0) {
+      const tracesBeforeBatch = traces.length;
+      const rejectedBeforeBatch = rejectedCalls.length;
       messages.push({ role: 'assistant', content: String(msg?.content || ''), tool_calls: toolCalls });
       for (const tc of toolCalls) {
         const toolCallId = String(tc?.id || `call_${Date.now()}`);
         const toolNameRaw = String(tc?.function?.name || '').trim();
-        const toolName = normalizeToolName(toolNameRaw);
-        const args = safeJsonParse(String(tc?.function?.arguments || '{}'), {});
+        const toolMatch = matchToolCallName(toolNameRaw, toolDefs);
+        const toolName = toolMatch?.normalized_name || normalizeToolName(toolNameRaw);
+        const args = normalizeArgs(safeJsonParse(String(tc?.function?.arguments || '{}'), {}));
         const started = Date.now();
         try {
-          if ((toolNameRaw === 'mcp.browser.search' || toolNameRaw === 'mcp.browser.extract_text') && mcpServerId) {
-            const capability = toolNameRaw === 'mcp.browser.search' ? 'browser.search' : 'browser.extract_text';
+          if (!toolMatch && !toolNameRaw.startsWith('mcp.')) {
+            const err = new Error(`Unknown tool name: ${toolNameRaw || '(empty)'}`);
+            err.code = 'TOOL_CALL_REJECTED';
+            err.reason = 'unknown_tool_name';
+            throw err;
+          }
+          const schemaError = toolCallSchemaError(toolName, args);
+          if (schemaError) {
+            const err = new Error(schemaError);
+            err.code = 'TOOL_CALL_REJECTED';
+            err.reason = 'schema_mismatch';
+            throw err;
+          }
+          enforceToolPolicy({ toolName: toolMatch?.raw_name || toolNameRaw }, intent, policyCfg);
+          if (((toolMatch?.raw_name || toolNameRaw) === 'mcp.browser.search' || (toolMatch?.raw_name || toolNameRaw) === 'mcp.browser.extract_text' || (toolMatch?.raw_name || toolNameRaw) === 'tools.web.search' || toolName === 'mcp.browser.search') && mcpServerId) {
+            const capability = (toolNameRaw === 'mcp.browser.extract_text' || toolName === 'mcp.browser.extract_text')
+              ? 'browser.extract_text'
+              : 'browser.search';
             console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
-            const mcpOut = await executeMcpRpc({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            const mcpOut = await mcpExecutor({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
             console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
             const resultPayload = { ok: true, result: mcpOut || {} };
-            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content: JSON.stringify(resultPayload) });
-            traces.push({ stage: 'tool', ok: true, tool: toolNameRaw, args, result: mcpOut || {}, duration_ms: Date.now() - started });
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: toolMatch?.raw_name || toolNameRaw, args, result: mcpOut || {}, duration_ms: Date.now() - started });
+            continue;
+          }
+
+          if (((toolMatch?.raw_name || toolNameRaw) === 'mcp.browser.open_url' || toolName === 'mcp.browser.open_url') && mcpServerId) {
+            const capability = 'browser.open_url';
+            console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
+            const mcpOut = await mcpExecutor({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
+            const resultPayload = { ok: true, result: mcpOut || {} };
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: toolMatch?.raw_name || toolNameRaw, args, result: mcpOut || {}, duration_ms: Date.now() - started });
+            continue;
+          }
+
+          if (((toolMatch?.raw_name || toolNameRaw) === 'mcp.export.write_markdown' || toolName === 'mcp.export.write_markdown' || (toolMatch?.raw_name || toolNameRaw) === 'mcp.export.write_csv' || toolName === 'mcp.export.write_csv') && mcpServerId) {
+            const capability = (toolNameRaw === 'mcp.export.write_csv' || toolName === 'mcp.export.write_csv')
+              ? 'export.write_csv'
+              : 'export.write_markdown';
+            console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
+            const mcpOut = await mcpExecutor({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
+            const resultPayload = { ok: true, result: mcpOut || {} };
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: toolMatch?.raw_name || toolNameRaw, args, result: mcpOut || {}, duration_ms: Date.now() - started });
+            continue;
+          }
+
+          if ((
+            toolNameRaw === 'mcp.pb_files.list'
+            || toolName === 'mcp.pb_files.list'
+            || toolNameRaw === 'mcp.pb_files.read'
+            || toolName === 'mcp.pb_files.read'
+            || toolNameRaw === 'mcp.pb_files.write'
+            || toolName === 'mcp.pb_files.write'
+            || toolNameRaw === 'mcp.pb_files.mkdir'
+            || toolName === 'mcp.pb_files.mkdir'
+            || toolNameRaw === 'mcp.pb_files.delete'
+            || toolName === 'mcp.pb_files.delete'
+          ) && mcpServerId) {
+            const map = {
+              'mcp.pb_files.list': 'pb_files.list',
+              'mcp.pb_files.read': 'pb_files.read',
+              'mcp.pb_files.write': 'pb_files.write',
+              'mcp.pb_files.mkdir': 'pb_files.mkdir',
+              'mcp.pb_files.delete': 'pb_files.delete',
+            };
+            const key = toolNameRaw.startsWith('mcp.pb_files.') ? toolNameRaw : toolName;
+            const capability = map[String(key)] || '';
+            if (!capability) throw new Error(`Unknown PB Files MCP tool: ${toolNameRaw || toolName}`);
+            console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
+            const mcpOut = await mcpExecutor({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
+            const resultPayload = { ok: true, result: mcpOut || {} };
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: toolMatch?.raw_name || toolNameRaw, args, result: mcpOut || {}, duration_ms: Date.now() - started });
             continue;
           }
 
           if ((toolNameRaw === 'resolve-library-id' || toolNameRaw === 'query-docs' || toolNameRaw === 'mcp.resolve-library-id' || toolNameRaw === 'mcp.query-docs') && mcpServerId) {
             const capability = toolNameRaw.startsWith('mcp.') ? toolNameRaw.slice(4) : toolNameRaw;
             console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
-            const mcpOut = await executeMcpRpc({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            const mcpOut = await mcpExecutor({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
             const compact = compactContext7Result(capability, mcpOut || {}, args || {});
             if (capability === 'query-docs') {
               context7Used = {
@@ -334,45 +1765,260 @@ async function runOpenAiToolLoop({ db, message, systemText, sessionId, reqSignal
             }
             console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
             const resultPayload = { ok: true, result: compact };
-            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content: JSON.stringify(resultPayload) });
-            traces.push({ stage: 'tool', ok: true, tool: toolNameRaw, args, result: compact, duration_ms: Date.now() - started });
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: toolMatch?.raw_name || toolNameRaw, args, result: compact, duration_ms: Date.now() - started });
             continue;
           }
 
-          const runOut = await executeRegisteredTool({ toolName, args, workdir, db, sessionId, signal: reqSignal });
+          if ((toolNameRaw.startsWith('mcp.') || toolName.startsWith('mcp.')) && mcpServerId) {
+            const mcpToolName = toolNameRaw.startsWith('mcp.') ? toolNameRaw : toolName;
+            const capability = mcpToolName.slice(4);
+            if (!serverCaps.includes(capability)) throw new Error(`MCP capability not enabled for server: ${capability}`);
+            console.log(`[mcp.call.start] rid=${rid || '-'} server=${mcpServerId} capability=${capability}`);
+            const mcpOut = await mcpExecutor({ db, serverId: mcpServerId, capability, args, signal: reqSignal, rid });
+            console.log(`[mcp.call.end] rid=${rid || '-'} server=${mcpServerId} capability=${capability} ok=true`);
+            const resultPayload = { ok: true, result: mcpOut || {} };
+            messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw || mcpToolName, content: JSON.stringify(resultPayload) });
+            traces.push({ stage: 'tool', ok: true, tool: mcpToolName, args, result: mcpOut || {}, duration_ms: Date.now() - started });
+            continue;
+          }
+
+          publishSessionLiveEvent(sessionId, {
+            type: 'tool.start',
+            tool: toolMatch?.raw_name || toolNameRaw,
+            args,
+            message: `Executing ${toolMatch?.raw_name || toolNameRaw}`,
+            requestId: rid,
+          });
+          const runOut = await toolExecutor({ toolName, args, workdir, db, sessionId, signal: reqSignal });
           const resultPayload = { ok: true, result: runOut?.result || {}, stdout: runOut?.stdout || '', stderr: runOut?.stderr || '' };
           const content = JSON.stringify(resultPayload);
-          messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content });
-          traces.push({ stage: 'tool', ok: true, tool: toolNameRaw, args, result: runOut?.result || {}, stdout_preview: String(runOut?.stdout || '').slice(0, 300), stderr_preview: String(runOut?.stderr || '').slice(0, 300), duration_ms: Date.now() - started });
+          messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw, content });
+          traces.push({ stage: 'tool', ok: true, tool: toolMatch?.raw_name || toolNameRaw, args, result: runOut?.result || {}, stdout_preview: String(runOut?.stdout || '').slice(0, 300), stderr_preview: String(runOut?.stderr || '').slice(0, 300), duration_ms: Date.now() - started });
+          publishSessionLiveEvent(sessionId, {
+            type: 'tool.done',
+            tool: toolMatch?.raw_name || toolNameRaw,
+            ok: true,
+            message: `${toolMatch?.raw_name || toolNameRaw} completed (${Date.now() - started}ms)`,
+            stdout: String(runOut?.stdout || '').slice(0, 500),
+            stderr: String(runOut?.stderr || '').slice(0, 500),
+            requestId: rid,
+          });
         } catch (e) {
-          const errObj = { ok: false, error: String(e?.message || e), tool: toolNameRaw, args };
-          messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolNameRaw, content: JSON.stringify(errObj) });
-          traces.push({ stage: 'tool', ok: false, tool: toolNameRaw, args, duration_ms: Date.now() - started, error: errObj.error });
+          publishSessionLiveEvent(sessionId, {
+            type: 'tool.error',
+            tool: toolMatch?.raw_name || toolNameRaw,
+            ok: false,
+            message: `${toolMatch?.raw_name || toolNameRaw} failed: ${String(e?.message || e).slice(0, 200)}`,
+            stderr: String(e?.message || e).slice(0, 500),
+            requestId: rid,
+          });
+          const binaryBlocked = String(e?.code || '') === 'INVALID_OPERATION'
+            && String(e?.detail?.error || '') === 'writeFile_binary_blocked';
+          const blocked = String(e?.code || '') === 'ALEX_TOOL_POLICY_BLOCKED';
+          if (blocked) {
+            const corrective = String(
+              e?.correctiveMessage
+              || 'User asked for local filesystem action; do not browse. Use fs tools to create the file now.',
+            );
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCallId,
+              name: toolNameRaw,
+              content: JSON.stringify({ ok: false, error: corrective, code: e?.code || 'ALEX_TOOL_POLICY_BLOCKED' }),
+            });
+            messages.push({ role: 'assistant', content: corrective });
+            traces.push({
+              stage: 'tool',
+              ok: false,
+              tool: toolNameRaw,
+              args,
+              duration_ms: Date.now() - started,
+              error: corrective,
+              policy_blocked: true,
+            });
+            continue;
+          }
+          if (binaryBlocked) {
+            traces.push({
+              stage: 'tool',
+              ok: false,
+              tool: toolMatch?.raw_name || toolNameRaw,
+              args,
+              duration_ms: Date.now() - started,
+              error: String(e?.message || e),
+              reason: 'writefile_binary_blocked',
+              stop_retry: true,
+            });
+            return {
+              ok: false,
+              error: 'TOOL_CALL_REJECTED',
+              reason: 'writefile_binary_blocked',
+              detail: {
+                reason: 'writefile_binary_blocked',
+                allowed_tools: allowedToolNames,
+                rejected_calls: [{
+                  tool: toolNameRaw,
+                  normalized_tool: toolName || null,
+                  reason: 'writefile_binary_blocked',
+                  error: String(e?.message || e),
+                  args,
+                }],
+                assistant_message: sanitizedAssistant,
+                hint: 'Build binary artifacts with tools.proc.exec, then move or copy the finished file.',
+                stop_retry: true,
+                tool_error: e?.detail || null,
+              },
+              traces,
+            };
+          }
+          const rejection = {
+            tool: toolNameRaw,
+            normalized_tool: toolName || null,
+            reason: String(e?.reason || e?.code || 'tool_call_execution_failed'),
+            error: String(e?.message || e),
+            args,
+          };
+          rejectedCalls.push(rejection);
+          console.warn('[alex.tool_call_rejected]', JSON.stringify({
+            rid: rid || null,
+            agent_id: agentId || null,
+            level: alexAccess?.level ?? null,
+            session_id: sessionId || null,
+            route: intent,
+            model: llm.model || null,
+            tool_call: rejection,
+            assistant_message: sanitizedAssistant,
+          }));
+          const errObj = { ok: false, error: rejection.error, code: 'TOOL_CALL_REJECTED', reason: rejection.reason, tool: toolNameRaw, args };
+          messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolMatch?.raw_name || toolNameRaw, content: JSON.stringify(errObj) });
+          traces.push({ stage: 'tool', ok: false, tool: toolMatch?.raw_name || toolNameRaw, args, duration_ms: Date.now() - started, error: errObj.error, reason: rejection.reason });
         }
+      }
+      const batchTraces = traces.slice(tracesBeforeBatch);
+      const batchRejected = rejectedCalls.slice(rejectedBeforeBatch);
+      const requirementSatisfied = requirement?.required && hasRequiredCategoryTrace(traces, requirement);
+      if (batchRejected.length > 0 && !batchTraces.some((trace) => trace?.ok) && !requirementSatisfied) {
+        return {
+          ok: false,
+          error: 'TOOL_CALL_REJECTED',
+          reason: batchRejected[0]?.reason || 'tool_call_rejected',
+          detail: {
+            reason: batchRejected[0]?.reason || 'tool_call_rejected',
+            allowed_tools: allowedToolNames,
+            rejected_calls: batchRejected,
+            assistant_message: sanitizedAssistant,
+            hint: 'Use a valid PB tool-call envelope with an allowed tool name and matching JSON arguments.',
+          },
+          traces,
+        };
       }
       continue;
     }
 
     if (finish === 'stop' || !toolCalls.length) {
+      if (!toolCalls.length && requirement.required && supportsToolCalls && !forcedRetry) {
+        forcedRetry = true;
+        messages.push({ role: 'assistant', content: String(msg?.content || '').trim() || '(no content)' });
+        messages.push({ role: 'user', content: buildToolRetryPrompt(message, toolDefs) });
+        continue;
+      }
+      let post = await applyDeterministicPostconditions({
+        db,
+        message,
+        sessionId,
+        workdir,
+        intent,
+        reqSignal,
+        traces,
+        toolExecutor,
+        mcpExecutor,
+        mcpServerId,
+        mcpCapabilities: serverCaps,
+        requirement,
+        rid,
+      });
+      if (Array.isArray(post?.traces) && post.traces.length) traces.push(...post.traces);
+      if (requirement.required && !hasRequiredCategoryTrace(traces, requirement)) {
+        post = await applyDeterministicPostconditions({
+          db,
+          message,
+          sessionId,
+          workdir,
+          intent,
+          reqSignal,
+          traces,
+          toolExecutor,
+          mcpExecutor,
+          mcpServerId,
+          mcpCapabilities: serverCaps,
+          requirement,
+          rid,
+        });
+        if (Array.isArray(post?.traces) && post.traces.length) traces.push(...post.traces);
+      }
+      if (requirement.required && !hasRequiredCategoryTrace(traces, requirement)) {
+        const fallbackError = String(post?.error || 'TOOL_CALL_REJECTED');
+        return {
+          ok: false,
+          error: fallbackError,
+          reason: rejectedCalls[0]?.error || post?.error || 'model_returned_no_tool_calls',
+          detail: {
+            reason: rejectedCalls[0]?.reason || post?.error || 'model_returned_no_tool_calls',
+            fallback_error: post?.error || null,
+            fallback_detail: post?.detail || null,
+            requirement,
+            traces_count: Array.isArray(traces) ? traces.length : 0,
+            mcp_server_id: mcpServerId || null,
+            mcp_capabilities: serverCaps,
+            allowed_tools: allowedToolNames,
+            rejected_calls: rejectedCalls,
+            assistant_message: sanitizedAssistant,
+            hint: 'Return a valid tool call with one of the allowed tool names and matching JSON arguments.',
+          },
+          traces,
+        };
+      }
+      const note = Array.isArray(post?.notes) && post.notes.length ? `\n\n${post.notes.join('\n')}` : '';
+      const normalizedReply = normalizeToolLoopReply(String(msg?.content || '').trim(), traces);
       return {
         ok: true,
-        text: String(msg?.content || '').trim(),
+        text: `${normalizedReply}${note}`.trim(),
         model: llm.model,
         profile: llm.provider,
         traces,
         context7: context7Used,
+        tool_required: requirement.required,
+        tooling_mode: supportsToolCalls ? 'tool_calling' : 'deterministic',
+        supports_tool_calls: supportsToolCalls,
       };
     }
+  }
+  if (requirement.required && hasRequiredCategoryTrace(traces, requirement)) {
+    return {
+      ok: true,
+      text: lastAssistantText || 'Executed requested tools.',
+      model: null,
+      profile: toolSupport?.provider_id || null,
+      traces,
+      context7: context7Used,
+      tool_required: true,
+      tooling_mode: supportsToolCalls ? 'tool_calling' : 'deterministic',
+      supports_tool_calls: supportsToolCalls,
+    };
   }
   return { ok: false, error: 'TOOL_LOOP_MAX_STEPS', traces };
 }
 
 // Controller-style MCP browse: PB drives search+extract, returns plain-text context for LLM to summarize.
 // No tool schemas are ever sent to the LLM — prevents tool-hallucination on local/quantized models.
-async function runMcpBrowseController(db, { mcpServerId, message, rid, signal }) {
+async function runMcpBrowseController(db, { mcpServerId, message, rid, signal, rpcExecutor = executeMcpRpc }) {
   const traces = [];
   const sources = [];
   const extracts = [];
+  const searchQuery = extractBrowseQuery(message);
+  const directUrlIntent = detectDirectUrlBrowseIntent(message);
+  const requestedMaxChars = extractRequestedMaxChars(message, 500);
 
   // Detect if the message contains an explicit URL to browse directly.
   const explicitUrls = (message.match(/https?:\/\/[^\s,)'"]+/gi) || [])
@@ -386,11 +2032,22 @@ async function runMcpBrowseController(db, { mcpServerId, message, rid, signal })
     traces.push({ stage: 'URL_DETECTED', ok: true, urls: explicitUrls });
     for (const url of explicitUrls.slice(0, 3)) {
       try {
-        const extOut = await executeMcpRpc({
+        if (directUrlIntent.wantsDirectBrowse) {
+          await rpcExecutor({
+            db,
+            serverId: mcpServerId,
+            capability: 'browser.open_url',
+            args: { url },
+            signal,
+            rid,
+          });
+          traces.push({ stage: 'OPEN_URL', ok: true, url });
+        }
+        const extOut = await rpcExecutor({
           db,
           serverId: mcpServerId,
           capability: 'browser.extract_text',
-          args: { url, max_chars: 6000 },
+          args: { url, max_chars: requestedMaxChars },
           signal,
           rid,
         });
@@ -404,7 +2061,12 @@ async function runMcpBrowseController(db, { mcpServerId, message, rid, signal })
           traces.push({ stage: 'EXTRACT', ok: false, url, error: 'empty_body' });
         }
       } catch (e) {
-        traces.push({ stage: 'EXTRACT', ok: false, url, error: String(e?.message || e) });
+        traces.push({
+          stage: directUrlIntent.wantsDirectBrowse ? 'OPEN_OR_EXTRACT' : 'EXTRACT',
+          ok: false,
+          url,
+          error: String(e?.message || e),
+        });
       }
     }
     if (!extracts.length) {
@@ -417,16 +2079,20 @@ async function runMcpBrowseController(db, { mcpServerId, message, rid, signal })
     const context =
       `[LIVE PAGE CONTENT for: "${message}"]\n\n` +
       `Extracted page content:\n${extractedBlocks}`;
-    return { ok: true, context, sources, traces };
+    const directText = extracts.map((e) => {
+      const header = e.title ? `${e.title} — ${e.url}` : e.url;
+      return `${header}\n${String(e.text || '').slice(0, 500)}`;
+    }).join('\n\n');
+    return { ok: true, context, sources, traces, direct_text: directText };
   }
 
   // ── Search path: search then extract top results ──
   try {
-    const searchOut = await executeMcpRpc({
+    const searchOut = await rpcExecutor({
       db,
       serverId: mcpServerId,
       capability: 'browser.search',
-      args: { q: message, limit: 5 },
+      args: { q: searchQuery || message, limit: 5 },
       signal,
       rid,
     });
@@ -439,7 +2105,7 @@ async function runMcpBrowseController(db, { mcpServerId, message, rid, signal })
     const searchDebug = Array.isArray(rawResults?.search_debug) ? rawResults.search_debug : [];
     searchResults = list;
     if (searchDebug.length) traces.push({ stage: 'SEARCH_DEBUG', ok: true, items: searchDebug.slice(0, 10) });
-    traces.push({ stage: 'SEARCH', ok: true, count: searchResults.length });
+    traces.push({ stage: 'SEARCH', ok: true, count: searchResults.length, query: searchQuery || message });
   } catch (e) {
     traces.push({ stage: 'SEARCH', ok: false, error: String(e?.message || e) });
     return { ok: false, error: String(e?.message || e), traces, sources: [], context: '' };
@@ -456,7 +2122,7 @@ async function runMcpBrowseController(db, { mcpServerId, message, rid, signal })
     .slice(0, 5);
   for (const url of topUrls.slice(0, 3)) {
     try {
-      const extOut = await executeMcpRpc({
+      const extOut = await rpcExecutor({
         db,
         serverId: mcpServerId,
         capability: 'browser.extract_text',
@@ -494,7 +2160,7 @@ async function runMcpBrowseController(db, { mcpServerId, message, rid, signal })
   }).join('\n\n');
 
   const context =
-    `[LIVE WEB SEARCH for: "${message}"]\n\n` +
+    `[LIVE WEB SEARCH for: "${searchQuery || message}"]\n\n` +
     `Top results:\n${topResultsList}` +
     (extractedBlocks ? `\n\nExtracted page content:\n${extractedBlocks}` : '');
 
@@ -707,6 +2373,15 @@ function tableHas(db, name) {
   return Boolean(row);
 }
 
+function tableColumnHas(db, tableName, columnName) {
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
+    return rows.some((row) => String(row?.name || '') === String(columnName));
+  } catch {
+    return false;
+  }
+}
+
 function getIdleBlockers(db) {
   const blockers = {
     streamingGeneration: RUNTIME_STATE.activeThinking > 0,
@@ -804,10 +2479,580 @@ function normalizeAssistantName(name) {
   return raw.slice(0, 40);
 }
 
+function isAlexNoApprovalMcpContext(db, { sessionId, mcpServerId, routeId = '' } = {}) {
+  if (!isAlexSession(db, sessionId)) return false;
+  const sid = String(mcpServerId || '').trim();
+  const rid = String(routeId || '').trim();
+  return Boolean(
+    (sid && ALEX_NO_APPROVAL_MCP_IDENTIFIERS.has(sid))
+    || (rid && ALEX_NO_APPROVAL_MCP_IDENTIFIERS.has(rid))
+  );
+}
+
+function createAlexProjectRoot(db, { label, path: rootPath, enabled = true, isFavorite = false }) {
+  const sandboxRoot = getAlexSandboxRootReal();
+  const normalizedPath = validateAlexProjectRootPath(rootPath, { sandboxRoot });
+  const now = nowMs();
+  const cleanLabel = String(label || path.basename(normalizedPath) || normalizedPath).trim().slice(0, 120);
+  if (!cleanLabel) {
+    const err = new Error('Project root label is required.');
+    err.code = 'INVALID_PROJECT_ROOT';
+    throw err;
+  }
+  const info = db.prepare(`
+    INSERT INTO alex_project_roots
+      (label, path, enabled, is_favorite, created_at, updated_at, last_used_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run(cleanLabel, normalizedPath, enabled ? 1 : 0, isFavorite ? 1 : 0, now, now);
+  return getAlexProjectRootById(db, Number(info.lastInsertRowid || 0));
+}
+
+function updateAlexProjectRoot(db, id, patch = {}) {
+  const existing = getAlexProjectRootById(db, id);
+  if (!existing) {
+    const err = new Error('Project root not found.');
+    err.code = 'PROJECT_ROOT_NOT_FOUND';
+    throw err;
+  }
+  const nextPath = patch.path != null ? validateAlexProjectRootPath(patch.path, { sandboxRoot: getAlexSandboxRootReal() }) : existing.path;
+  const nextLabel = patch.label != null ? String(patch.label || '').trim().slice(0, 120) : existing.label;
+  if (!nextLabel) {
+    const err = new Error('Project root label is required.');
+    err.code = 'INVALID_PROJECT_ROOT';
+    throw err;
+  }
+  const enabled = patch.enabled == null ? existing.enabled : Boolean(patch.enabled);
+  const isFavorite = patch.is_favorite == null ? existing.is_favorite : Boolean(patch.is_favorite);
+  const now = nowMs();
+  db.prepare(`
+    UPDATE alex_project_roots
+    SET label = ?, path = ?, enabled = ?, is_favorite = ?, updated_at = ?
+    WHERE id = ?
+  `).run(nextLabel, nextPath, enabled ? 1 : 0, isFavorite ? 1 : 0, now, Number(id));
+  return getAlexProjectRootById(db, id);
+}
+
+function deleteAlexProjectRoot(db, id) {
+  const existing = getAlexProjectRootById(db, id);
+  if (!existing) {
+    const err = new Error('Project root not found.');
+    err.code = 'PROJECT_ROOT_NOT_FOUND';
+    throw err;
+  }
+  db.prepare('DELETE FROM alex_project_roots WHERE id = ?').run(Number(id));
+  const current = getAlexAccessState(db);
+  if (Number(current.project_root_id || 0) === Number(id)) {
+    setAlexAccessStateRaw(db, { ...getDefaultAlexAccessState(), updated_at_ms: nowMs() });
+  }
+  return existing;
+}
+
+function markAlexProjectRootUsed(db, id) {
+  const now = nowMs();
+  db.prepare('UPDATE alex_project_roots SET last_used_at = ?, updated_at = ? WHERE id = ?').run(now, now, Number(id));
+}
+
+function setAlexAccessState(db, { level, project_root_id = null, ttl_minutes = 30, confirm_dangerous = false, extra_roots = [] } = {}) {
+  const nextLevel = normalizeAlexLevel(level);
+  const ttlRaw = ttl_minutes == null ? (nextLevel === 2 ? 0 : 30) : Number(ttl_minutes);
+  const ttlMinutes = Number.isFinite(ttlRaw) ? Math.max(0, Math.floor(ttlRaw)) : (nextLevel === 2 ? 0 : 30);
+  const now = nowMs();
+  let projectRootId = project_root_id == null ? null : Number(project_root_id);
+  if (nextLevel === 2) {
+    projectRootId = null;
+  }
+  if (nextLevel >= 3) {
+    const root = projectRootId ? getAlexProjectRootById(db, projectRootId) : null;
+    if (!root || !root.enabled) {
+      const err = new Error('Project mode requires an enabled project root.');
+      err.code = 'PROJECT_ROOT_REQUIRED';
+      throw err;
+    }
+    markAlexProjectRootUsed(db, projectRootId);
+  } else {
+    projectRootId = null;
+  }
+  if (nextLevel === 4 && !confirm_dangerous) {
+    const err = new Error('L4 requires explicit per-session confirmation.');
+    err.code = 'ALEX_L4_CONFIRM_REQUIRED';
+    throw err;
+  }
+  const normalizedExtraRoots = nextLevel >= 4
+    ? Array.from(new Set((Array.isArray(extra_roots) ? extra_roots : [])
+      .map((item) => validateAlexProjectRootPath(item, { sandboxRoot: getAlexSandboxRootReal() }))))
+    : [];
+  const next = {
+    level: nextLevel,
+    project_root_id: projectRootId,
+    ttl_minutes: ttlMinutes,
+    expires_at_ms: ttlMinutes > 0 && nextLevel >= 3 ? now + (ttlMinutes * 60 * 1000) : null,
+    confirmed_at_ms: nextLevel === 4 ? now : null,
+    extra_roots: normalizedExtraRoots,
+    updated_at_ms: now,
+  };
+  setAlexAccessStateRaw(db, next);
+  return getAlexAccessState(db);
+}
+
+function resolveAlexAccessContext(db) {
+  const state = getAlexAccessState(db);
+  const allowedRoots = getAlexAllowedRoots(db, state);
+  const selectedProjectRoot = state.project_root_id ? getAlexProjectRootById(db, state.project_root_id) : null;
+  const now = nowMs();
+  return {
+    ...state,
+    level_label: alexLevelLabel(state.level),
+    approvals_enabled: approvalsAreEnabled() && alexApprovalsEnabled(),
+    sandbox_root: getAlexSandboxRootReal(),
+    selected_project_root: selectedProjectRoot,
+    allowed_roots: allowedRoots,
+    exec_whitelist: getAlexExecWhitelistForLevel(state.level),
+    exec_mode: getAlexExecMode(state.level),
+    allow_shell_operators: getAlexExecMode(state.level) === 'shell',
+    expires_in_ms: state.expires_at_ms ? Math.max(0, state.expires_at_ms - now) : null,
+  };
+}
+
+function isPathWithinAnyRoot(targetPath, roots) {
+  return (Array.isArray(roots) ? roots : []).some((root) => {
+    const rel = path.relative(root, targetPath);
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  });
+}
+
+function resolveAlexPathInAllowedRoots(userPath, { roots = [], defaultRoot = null } = {}) {
+  const raw = String(userPath || '').trim();
+  const baseRoot = defaultRoot || roots[0] || getAlexSandboxRootReal();
+  const sandboxRoot = roots[0] || getAlexSandboxRootReal();
+  const normalizedRaw = raw === '/home/alex' || raw === '~'
+    ? sandboxRoot
+    : (raw.startsWith('/home/alex/') ? path.join(sandboxRoot, raw.slice('/home/alex/'.length)) : raw);
+  const lexical = raw
+    ? (path.isAbsolute(normalizedRaw) ? path.resolve(normalizedRaw) : path.resolve(baseRoot, normalizedRaw))
+    : path.resolve(baseRoot);
+  const containment = roots.find((root) => {
+    const check = inspectPathContainment(root, lexical);
+    return check.inside && !check.escapedBySymlink;
+  });
+  if (!containment) {
+    const err = new Error('Path is outside the allowed Alex roots.');
+    err.code = 'ACCESS_DENIED';
+    err.detail = { error: 'ACCESS_DENIED', reason: 'path_outside_allowed_roots', path: lexical, allowed_roots: roots };
+    throw err;
+  }
+  return lexical;
+}
+
+function getAlexFsPermission(level, toolName) {
+  const allowed = ALEX_FS_PERMISSIONS[level] || ALEX_FS_PERMISSIONS[ALEX_ACCESS_DEFAULT_LEVEL];
+  return allowed.has(toolName);
+}
+
+function validateAlexExecCommand(command, { cwd, allowedRoots = [], level = 1, execMode = null } = {}) {
+  const cmd = String(command || '').trim();
+  if (!cmd) return { ok: false, error: 'ACCESS_DENIED', reason: 'missing_command', hint: 'Provide a command string.' };
+  const mode = execMode || getAlexExecMode(level);
+  if (mode !== 'shell' && /[\n\r;&|><`]/.test(cmd)) {
+    return { ok: false, error: 'ACCESS_DENIED', reason: 'shell_operators_blocked', hint: 'Run a single whitelisted command without shell chaining.' };
+  }
+  if (level < 2) {
+    return { ok: false, error: 'ACCESS_DENIED', reason: 'proc_exec_disabled_for_level', hint: 'Switch Alex access to L2 Build Mode or higher.' };
+  }
+  const tokens = tokenizeShellCommand(cmd).map(stripTokenQuotes).filter(Boolean);
+  const execToken = String(tokens[0] || '');
+  const execBase = path.basename(execToken);
+  const whitelist = getAlexExecWhitelistForLevel(level);
+  const cwdResolved = resolveAlexPathInAllowedRoots(cwd || '.', { roots: allowedRoots, defaultRoot: allowedRoots[0] });
+  if (ALEX_EXEC_BLOCKLIST.has(execBase)) {
+    return { ok: false, error: 'ACCESS_DENIED', reason: 'command_blocked', hint: `${execBase} is blocked for Alex.` };
+  }
+  if (execBase === 'git') {
+    const sub = String(tokens[1] || '').trim();
+    if (!['status', 'diff', 'log', 'show'].includes(sub)) {
+      return { ok: false, error: 'ACCESS_DENIED', reason: 'git_subcommand_blocked', hint: 'Only git status, diff, log, and show are allowed.' };
+    }
+  } else if (execBase === 'openssl') {
+    const sub = String(tokens[1] || '').trim();
+    if (sub !== 'dgst') {
+      return { ok: false, error: 'ACCESS_DENIED', reason: 'openssl_subcommand_blocked', hint: 'Only openssl dgst is allowed.' };
+    }
+  } else if (!whitelist.includes(execToken) && !whitelist.includes(execBase)) {
+    return { ok: false, error: 'ACCESS_DENIED', reason: 'command_not_whitelisted', hint: 'Use a whitelisted build or local-dev command.' };
+  }
+  if (execBase === 'rm' && tokens.some((tok) => tok === '-rf' || tok === '-fr' || tok === '-r' || tok === '-f')) {
+    const targets = tokens.slice(1).filter((tok) => {
+      const stripped = stripTokenQuotes(tok);
+      return stripped && !stripped.startsWith('-');
+    });
+    if (targets.length === 0 || targets.some(isDangerousRmTarget)) {
+      return { ok: false, error: 'ACCESS_DENIED', reason: 'rm_target_blocked', hint: 'rm requires an explicit safe target inside the active Alex roots.' };
+    }
+  }
+  for (const token of tokens.slice(1)) {
+    if (!token || token.startsWith('-')) continue;
+    if (token.startsWith('http://') || token.startsWith('https://')) {
+      return { ok: false, error: 'ACCESS_DENIED', reason: 'network_fetch_blocked', hint: 'curl/wget and direct network fetches are blocked.' };
+    }
+    if (path.isAbsolute(token) || token.includes('/')) {
+      try {
+        resolveAlexPathInAllowedRoots(token, { roots: allowedRoots, defaultRoot: cwdResolved });
+      } catch {
+        return { ok: false, error: 'ACCESS_DENIED', reason: 'command_path_outside_allowed_roots', hint: 'Command paths must stay inside the active Alex roots.' };
+      }
+    }
+  }
+  return { ok: true, cwd: cwdResolved, exec: execBase, exec_mode: mode };
+}
+
+function getAlexToolRegistryInfo(db, { agentId = 'alex', message = '', route = '', includeMcp = false, mcpServerId = null } = {}) {
+  const access = resolveAlexAccessContext(db);
+  const includeMcpTools = Boolean(includeMcp || mcpServerId);
+  const serverCaps = includeMcpTools && mcpServerId
+    ? db.prepare('SELECT capability FROM mcp_capabilities WHERE server_id = ? ORDER BY capability ASC').all(String(mcpServerId)).map((r) => String(r.capability || ''))
+    : [];
+  const allowedTools = [
+    ...getToolDefNames(getOpenAiToolSchema()),
+    ...(includeMcpTools ? getToolDefNames(getMcpToolSchema(serverCaps)) : []),
+  ];
+  return {
+    ok: true,
+    agent_id: String(agentId || 'alex'),
+    route: String(route || resolveRegistryRouteMode(message, { includeMcp: includeMcpTools })),
+    route_mode: String(route || resolveRegistryRouteMode(message, { includeMcp: includeMcpTools })),
+    model: selectedModelForProvider(db, getActiveProvider(db)) || null,
+    approvals_enabled: access.approvals_enabled,
+    allowed_tools: allowedTools,
+    allowed_roots: access.allowed_roots,
+    exec_whitelist: access.exec_whitelist,
+    sandbox_root: access.sandbox_root,
+    access_level: access.level,
+    access_level_label: access.level_label,
+    exec_mode: access.exec_mode,
+    allow_shell_operators: access.allow_shell_operators,
+    project_root_id: access.project_root_id,
+    include_mcp: includeMcpTools,
+    mcp_server_id: mcpServerId || null,
+  };
+}
+
+function buildAlexToolAccessContext(db, sessionId, workdir = null) {
+  const sandboxRoot = getAlexSandboxRootReal(workdir || getWorkdir());
+  if (!isAlexSession(db, sessionId)) {
+    return {
+      is_alex: false,
+      level: ALEX_ACCESS_DEFAULT_LEVEL,
+      level_label: alexLevelLabel(ALEX_ACCESS_DEFAULT_LEVEL),
+      allowed_roots: [sandboxRoot],
+      sandbox_root: sandboxRoot,
+      exec_whitelist: [],
+      approvals_enabled: approvalsAreEnabled() && alexApprovalsEnabled(),
+    };
+  }
+  return {
+    is_alex: true,
+    ...resolveAlexAccessContext(db),
+  };
+}
+
+function accessDeniedError(reason, detail = {}, hint = 'Adjust Alex access settings or choose a path inside the allowed roots.') {
+  const err = new Error(String(detail?.message || reason || 'Access denied.'));
+  err.code = 'ACCESS_DENIED';
+  err.detail = {
+    ok: false,
+    error: 'ACCESS_DENIED',
+    reason,
+    hint,
+    ...detail,
+  };
+  return err;
+}
+
+function toolValidationError(code, message, detail = {}) {
+  const err = new Error(String(message || code || 'Invalid tool arguments.'));
+  err.code = String(code || 'INVALID_TOOL_ARGS');
+  err.detail = {
+    ok: false,
+    error: String(code || 'INVALID_TOOL_ARGS'),
+    message: String(message || code || 'Invalid tool arguments.'),
+    ...detail,
+  };
+  return err;
+}
+
+function binaryWriteBlockedError(rawPath, content = '') {
+  const ext = path.extname(path.basename(String(rawPath || '').trim())).toLowerCase();
+  const message = 'Binary outputs cannot be created with writeFile. Use proc.exec + copyPath/movePath.';
+  const err = new Error(message);
+  err.code = 'INVALID_OPERATION';
+  err.detail = {
+    ok: false,
+    code: 'INVALID_OPERATION',
+    error: 'writeFile_binary_blocked',
+    message,
+    path: String(rawPath || ''),
+    extension: ext,
+    attempted_content_preview: previewText(content, 240),
+  };
+  return err;
+}
+
+function previewText(text, maxChars = 400) {
+  const s = String(text || '');
+  return s.length <= maxChars ? s : `${s.slice(0, maxChars)}...[truncated]`;
+}
+
+function toLiveToolName(toolName) {
+  const t = normalizeToolName(toolName);
+  if (t === 'workspace.list') return 'tools.fs.listDir';
+  if (t === 'workspace.read_file') return 'tools.fs.readFile';
+  if (t === 'workspace.write_file') return 'tools.fs.writeFile';
+  if (t === 'workspace.mkdir') return 'tools.fs.mkdir';
+  if (t === 'workspace.delete') return 'tools.fs.deletePath';
+  if (t === 'workspace.copy_path') return 'tools.fs.copyPath';
+  if (t === 'workspace.move_path') return 'tools.fs.movePath';
+  if (t === 'workspace.exists') return 'tools.fs.exists';
+  if (t === 'workspace.stat') return 'tools.fs.stat';
+  if (t === 'workspace.exec_shell') return 'tools.proc.exec';
+  return t;
+}
+
+function sanitizeLiveArgs(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return {};
+  const out = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (value == null) continue;
+    if (typeof value === 'string') {
+      out[key] = value.length > 400 ? `${value.slice(0, 400)}...[truncated]` : value;
+      continue;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      out[key] = value;
+      continue;
+    }
+    try {
+      out[key] = JSON.parse(JSON.stringify(value));
+    } catch {
+      out[key] = String(value);
+    }
+  }
+  return out;
+}
+
+function buildLiveToolEndPayload(toolName, out) {
+  const payload = {
+    ok: true,
+    stdout: previewText(out?.stdout || '', 2000),
+    stderr: previewText(out?.stderr || '', 2000),
+    artifacts: Array.isArray(out?.artifacts) ? out.artifacts.slice(0, 20) : [],
+  };
+  if (toolName === 'workspace.exec_shell') {
+    payload.exit_code = Number(out?.result?.exit_code ?? 0);
+  }
+  return payload;
+}
+
+function buildLiveToolErrorPayload(err) {
+  const detail = err?.detail && typeof err.detail === 'object' ? err.detail : {};
+  return {
+    ok: false,
+    message: String(err?.message || err || 'Tool failed.'),
+    stderr: previewText(detail?.stderr || detail?.message || err?.message || err || '', 2000),
+    stdout: previewText(detail?.stdout || '', 2000),
+    exit_code: Number.isFinite(Number(detail?.code)) ? Number(detail.code) : undefined,
+  };
+}
+
+function publishSessionLiveEvent(sessionId, event = {}, options = {}) {
+  if (!String(sessionId || '').trim()) return null;
+  if (WEBCHAT_LIVE_ACTIVITY_VERBOSE && event && typeof event === 'object' && !Object.prototype.hasOwnProperty.call(event, 'verbose')) {
+    event = { ...event, verbose: true };
+  }
+  return publishLiveEvent(sessionId, event, options);
+}
+
+function hasMarkdownContaminatedPath(rawPath) {
+  const raw = String(rawPath ?? '');
+  if (!raw) return false;
+  if (raw !== raw.trim()) return true;
+  if (/[\r\n\t`]/.test(raw)) return true;
+  if (raw.includes('```') || raw.includes('~~~')) return true;
+  return false;
+}
+
+function validateWorkspaceToolPathInput(rawPath) {
+  const raw = String(rawPath ?? '');
+  if (!raw.trim()) {
+    throw toolValidationError('INVALID_PATH', 'Path is required.', { path: raw });
+  }
+  if (hasMarkdownContaminatedPath(raw)) {
+    throw toolValidationError(
+      'INVALID_PATH',
+      'Path contains invalid characters (likely markdown/backticks).',
+      { path: raw },
+    );
+  }
+  return raw;
+}
+
+function ensureTextWriteTarget(rawPath) {
+  const normalized = validateWorkspaceToolPathInput(rawPath);
+  const ext = path.extname(path.basename(normalized)).toLowerCase();
+  if (isBinaryWriteExtension(ext)) {
+    throw binaryWriteBlockedError(normalized);
+  }
+  if (ext && !WORKSPACE_TEXT_WRITE_EXT_ALLOWLIST.has(ext)) {
+    throw binaryWriteBlockedError(normalized);
+  }
+  return normalized;
+}
+
+function isExplicitToolExecutionMessage(messageText) {
+  const text = String(messageText || '').trim().toLowerCase();
+  return EXPLICIT_TOOL_EXECUTE_PHRASES.some((phrase) => text.includes(phrase));
+}
+
+function shouldForceMissionTextMode(messageText) {
+  const text = String(messageText || '');
+  const lower = text.toLowerCase();
+  if (!text.trim()) return false;
+  const lines = text.split(/\r?\n/);
+  const headingLines = lines.filter((line) => /^\s*#{1,6}\s+/.test(line)).length;
+  const outputMentions = (text.match(/\b(?:dist|build|output|artifact)s?\/[^\s`"')]+\.(?:zip|apk|aab|jar|keystore|png|jpe?g|gif|webp|pdf|mp4|mov|exe|dll|so|dylib|bin)\b/gi) || []).length;
+  const looksMission =
+    lower.includes('mega mission')
+    || lower.includes('codex mega mission')
+    || lower.includes('paste-ready mission')
+    || lower.includes('here is the mission')
+    || lower.includes('for codex')
+    || lower.includes('copy/paste')
+    || lower.includes('do this in order')
+    || /\btask:\b/i.test(text)
+    || /\bgoal:\b/i.test(text)
+    || /\bproof required\b/i.test(text)
+    || /\bfix requirements\b/i.test(text)
+    || /\brepro\b/i.test(text)
+    || lower.includes('required steps')
+    || lower.includes('required verification')
+    || lower.includes('success conditions')
+    || (headingLines >= 2 && outputMentions >= 1)
+    || (text.length > 700 && (/^#+\s/m.test(text) || /^[*-]\s/m.test(text) || /^\d+\.\s/m.test(text)));
+  return looksMission && !isExplicitToolExecutionMessage(text);
+}
+
+function shouldSkipArtifactVerification({ messageText, missionTextMode = false, inferred = null } = {}) {
+  if (missionTextMode) return true;
+  const text = String(messageText || '');
+  if (!text.trim()) return false;
+  if (inferred?.binary && looksLikeInstructionBlob(text)) return true;
+  if (
+    inferred?.binary
+    && text.includes('\n')
+    && text.length >= 200
+    && /\b(?:build|create|generate|verify|replace|scaffold|zip|sha256sum)\b/i.test(text)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function parseWebchatControlCommand(messageText) {
+  const raw = String(messageText || '').trim();
+  if (!raw.startsWith('/')) return { kind: 'none', message: raw, allow_tools_override: false };
+  if (/^\/mission(?:\s+on)?$/i.test(raw)) {
+    return { kind: 'mission_on', message: '', allow_tools_override: false };
+  }
+  if (/^\/mission\s+off$/i.test(raw)) {
+    return { kind: 'mission_off', message: '', allow_tools_override: false };
+  }
+  if (/^\/run$/i.test(raw)) {
+    return { kind: 'run_session_on', message: '', allow_tools_override: false };
+  }
+  const runMatch = raw.match(/^\/run\s+([\s\S]+)$/i);
+  if (runMatch) {
+    return { kind: 'run_override', message: String(runMatch[1] || '').trim(), allow_tools_override: true };
+  }
+  if (/^\/build(?:\s+status)?$/i.test(raw)) {
+    return { kind: /\bstatus\b/i.test(raw) ? 'build_status' : 'build_start', message: '', allow_tools_override: false };
+  }
+  if (/^\/stop$/i.test(raw)) {
+    return { kind: 'build_stop', message: '', allow_tools_override: false };
+  }
+  if (/^\/skills\s+print\s+([a-z0-9._-]+)$/i.test(raw)) {
+    const match = raw.match(/^\/skills\s+print\s+([a-z0-9._-]+)$/i);
+    return { kind: 'skills_print', message: '', allow_tools_override: false, skill_id: String(match?.[1] || '').trim().toLowerCase() };
+  }
+  if (/^\/skills(?:\s+list)?$/i.test(raw)) {
+    return { kind: 'skills_list', message: '', allow_tools_override: false };
+  }
+  if (/^\/overnight\s+show$/i.test(raw)) {
+    return { kind: 'skills_print', message: '', allow_tools_override: false, skill_id: ALEX_BUILD_LOOP_SKILL_ID };
+  }
+  if (/^\/overnight\s+edit$/i.test(raw)) {
+    return { kind: 'skills_edit', message: '', allow_tools_override: false, skill_id: ALEX_BUILD_LOOP_SKILL_ID };
+  }
+  if (/^\/overnight(?:\s+build)?$/i.test(raw)) {
+    return {
+      kind: 'build_start',
+      message: '',
+      allow_tools_override: false,
+    };
+  }
+  return { kind: 'none', message: raw, allow_tools_override: false };
+}
+
+function buildTextOnlyBlockedReply() {
+  return 'Text-only mode is ON. Use /run to allow tools for this message.';
+}
+
+function evaluateWebchatTextOnlyInterception({ messageText, textOnlyMode = false, allowToolsOverride = false, toolRequirement = null } = {}) {
+  const requirement = toolRequirement || detectToolRequirement(messageText);
+  const blocked = Boolean(textOnlyMode && !allowToolsOverride && requirement?.required);
+  return {
+    blocked,
+    reply: blocked ? buildTextOnlyBlockedReply() : '',
+    toolRequirement: requirement,
+  };
+}
+
+function ensureAlexFsToolAllowed(accessContext, toolName, targetPath) {
+  if (!accessContext?.is_alex) return;
+  if (!getAlexFsPermission(accessContext.level, toolName)) {
+    throw accessDeniedError('fs_tool_blocked_for_level', {
+      tool: toolName,
+      level: accessContext.level,
+      path: targetPath || null,
+    }, `Switch Alex access to a higher level to use ${toolName}.`);
+  }
+}
+
 function normalizeMcpServerId(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
   return raw.slice(0, 120);
+}
+
+function resolveMcpServerIdentifier(db, identifier) {
+  const needle = normalizeMcpServerId(identifier);
+  if (!needle) return null;
+  const exact = db.prepare('SELECT id FROM mcp_servers WHERE id = ?').get(needle);
+  if (exact?.id) return String(exact.id);
+  try {
+    const bySpec = db.prepare('SELECT id FROM mcp_servers WHERE spec_id = ? ORDER BY updated_at DESC LIMIT 1').get(needle);
+    if (bySpec?.id) return String(bySpec.id);
+  } catch {}
+  try {
+    const rows = db.prepare('SELECT id, aliases_json FROM mcp_servers WHERE aliases_json IS NOT NULL AND aliases_json != \'\'').all();
+    const want = needle.toLowerCase();
+    for (const row of rows) {
+      const aliases = Array.isArray(safeJsonParse(row.aliases_json || '[]', []))
+        ? safeJsonParse(row.aliases_json || '[]', [])
+        : [];
+      if (aliases.some((a) => String(a || '').trim().toLowerCase() === want)) return String(row.id);
+    }
+  } catch {}
+  const byName = db.prepare('SELECT id FROM mcp_servers WHERE lower(name) = lower(?) ORDER BY updated_at DESC LIMIT 1').get(needle);
+  if (byName?.id) return String(byName.id);
+  return null;
 }
 
 function normalizeMcpTemplateId(value) {
@@ -816,6 +3061,12 @@ function normalizeMcpTemplateId(value) {
   if (raw === 'context7') return 'code1';
   if (raw === 'context7_docs_default') return 'code1_docs_default';
   return raw.slice(0, 120);
+}
+
+function normalizeWebchatToolsMode(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'session') return 'session';
+  return 'off';
 }
 
 function getWebchatSessionMeta(db, sessionId) {
@@ -828,10 +3079,20 @@ function getWebchatSessionMeta(db, sessionId) {
       assistant_name: normalizeAssistantName(cur.assistant_name),
       mcp_server_id: normalizeMcpServerId(cur.mcp_server_id),
       mcp_template_id: normalizeMcpTemplateId(cur.mcp_template_id),
+      webchat_text_only: Boolean(cur.webchat_text_only),
+      webchat_tools_mode: normalizeWebchatToolsMode(cur.webchat_tools_mode),
       updated_at: cur.updated_at || null,
     };
   }
-  const next = { session_id: sid, assistant_name: DEFAULT_ASSISTANT_NAME, mcp_server_id: null, mcp_template_id: null, updated_at: nowIso() };
+  const next = {
+    session_id: sid,
+    assistant_name: DEFAULT_ASSISTANT_NAME,
+    mcp_server_id: null,
+    mcp_template_id: null,
+    webchat_text_only: false,
+    webchat_tools_mode: 'off',
+    updated_at: nowIso(),
+  };
   kvSet(db, key, next);
   return next;
 }
@@ -844,10 +3105,474 @@ function setWebchatSessionMeta(db, sessionId, patch) {
     assistant_name: normalizeAssistantName(patch?.assistant_name ?? prev.assistant_name),
     mcp_server_id: normalizeMcpServerId(patch?.mcp_server_id ?? prev.mcp_server_id),
     mcp_template_id: normalizeMcpTemplateId(patch?.mcp_template_id ?? prev.mcp_template_id),
+    webchat_text_only: patch?.webchat_text_only == null ? Boolean(prev.webchat_text_only) : Boolean(patch.webchat_text_only),
+    webchat_tools_mode: patch?.webchat_tools_mode == null ? normalizeWebchatToolsMode(prev.webchat_tools_mode) : normalizeWebchatToolsMode(patch.webchat_tools_mode),
     updated_at: nowIso(),
   };
   kvSet(db, webchatSessionMetaKey(sid), next);
   return next;
+}
+
+function overnightStateKey(sessionId) {
+  return `webchat.overnight.${String(sessionId || '').trim() || 'webchat-default'}`;
+}
+
+function getOvernightState(db, sessionId) {
+  const sid = String(sessionId || '').trim() || 'webchat-default';
+  const cur = kvGet(db, overnightStateKey(sid), null);
+  if (!cur || typeof cur !== 'object') return null;
+  return {
+    session_id: sid,
+    active: Boolean(cur.active),
+    mode: String(cur.mode || 'standard').trim() === 'build' ? 'build' : 'standard',
+    preset: String(cur.preset || 'overnight_standard').trim() || 'overnight_standard',
+    stage: String(cur.stage || 'awaiting_brief').trim() || 'awaiting_brief',
+    started_at: cur.started_at || null,
+  };
+}
+
+function setOvernightState(db, sessionId, patch) {
+  const sid = String(sessionId || '').trim() || 'webchat-default';
+  const prev = getOvernightState(db, sid) || {
+    session_id: sid,
+    active: false,
+    mode: 'standard',
+    preset: 'overnight_standard',
+    stage: 'awaiting_brief',
+    started_at: null,
+  };
+  const next = {
+    ...prev,
+    ...patch,
+    session_id: sid,
+  };
+  kvSet(db, overnightStateKey(sid), next);
+  return next;
+}
+
+function clearOvernightState(db, sessionId) {
+  kvSet(db, overnightStateKey(sessionId), null);
+}
+
+function slugifyJobName(input) {
+  const base = String(input || '')
+    .toLowerCase()
+    .replace(/[`"'“”‘’]/g, ' ')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return base || `overnight-${getLocalDayKey()}`;
+}
+
+async function readAlexFactoryModeText() {
+  const file = getAlexOvernightMissionPath();
+  return readAlexMissionFile(file);
+}
+
+function getAlexOvernightMissionPath() {
+  const alexRoot = getAlexSandboxRoot();
+  return path.join(alexRoot, 'MISSIONS', 'overnight.md');
+}
+
+function getAlexOvernightMissionPathRelative() {
+  return path.posix.join('MISSIONS', 'overnight.md');
+}
+
+async function readAlexMissionFile(file) {
+  try {
+    return await fsp.readFile(file, 'utf8');
+  } catch {
+    try {
+      const legacy = path.join(path.dirname(file), 'OVERNIGHT.md');
+      return await fsp.readFile(legacy, 'utf8');
+    } catch {
+      return '';
+    }
+  }
+}
+
+async function writeAlexMissionFile(content, file = getAlexOvernightMissionPath()) {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await fsp.writeFile(file, String(content || ''), 'utf8');
+  return file;
+}
+
+function atlasMissionKey(sessionId) {
+  const sid = String(sessionId || '').trim() || 'webchat-default';
+  return `${ATLAS_SESSION_MISSION_KV_PREFIX}${sid}`;
+}
+
+function getAtlasMissionPath(db, sessionId) {
+  const perSession = kvGet(db, atlasMissionKey(sessionId), null);
+  if (perSession) return String(perSession);
+  const globalPath = kvGet(db, ATLAS_MISSION_KV_KEY, null);
+  return globalPath ? String(globalPath) : getAlexOvernightMissionPath();
+}
+
+async function persistAtlasMission({ db, sessionId, missionText, missionPath = null }) {
+  const sid = String(sessionId || '').trim() || 'webchat-default';
+  const targetPath = missionPath || getAlexOvernightMissionPath();
+  const finalPath = await writeAlexMissionFile(missionText, targetPath);
+  kvSet(db, ATLAS_MISSION_KV_KEY, finalPath);
+  kvSet(db, atlasMissionKey(sid), finalPath);
+  getAtlasEngine().rememberMission({
+    sessionId: sid,
+    missionText: String(missionText || ''),
+    missionPath: finalPath,
+  });
+  return finalPath;
+}
+
+async function loadAtlasMission({ db, sessionId }) {
+  const missionPath = getAtlasMissionPath(db, sessionId);
+  const missionText = await readAlexMissionFile(missionPath);
+  return {
+    mission_path: missionPath,
+    mission_text: String(missionText || ''),
+  };
+}
+
+function ingestAtlasTurn(sessionId, role, content, meta = {}) {
+  try {
+    getAtlasEngine().ingestMessage({ sessionId, role, content, meta });
+  } catch (e) {
+    console.warn('[atlas.ingest.turn.failed]', String(e?.message || e));
+  }
+}
+
+function ingestAtlasToolResult(sessionId, toolName, args, out, ok = true) {
+  try {
+    getAtlasEngine().ingestToolResult({
+      sessionId,
+      toolName,
+      args,
+      stdout: String(out?.stdout || ''),
+      stderr: String(out?.stderr || ''),
+      result: out?.result || out?.detail || null,
+      ok,
+    });
+  } catch (e) {
+    console.warn('[atlas.ingest.tool.failed]', String(e?.message || e));
+  }
+}
+
+function getAlexSkillsDir() {
+  return path.join(getAlexSandboxRoot(), ALEX_SKILLS_DIRNAME);
+}
+
+function getAlexSkillsRegistryPath() {
+  return path.join(getAlexSkillsDir(), ALEX_SKILLS_REGISTRY_FILENAME);
+}
+
+function getAlexSkillFilePath(filename) {
+  return path.join(getAlexSkillsDir(), String(filename || '').trim());
+}
+
+function getAlexBuildLoopSkillPath() {
+  return getAlexSkillFilePath(ALEX_BUILD_LOOP_SKILL_FILENAME);
+}
+
+function getAlexBuildLoopSkillRelativePath() {
+  return path.posix.join(ALEX_SKILLS_DIRNAME, ALEX_BUILD_LOOP_SKILL_FILENAME);
+}
+
+function getAlexBuildLoopStatePath() {
+  return path.join(getAlexSandboxRoot(), ALEX_BUILD_LOOP_STATE_RELATIVE);
+}
+
+async function ensureAlexSkillFiles() {
+  const skillsDir = getAlexSkillsDir();
+  const registryPath = getAlexSkillsRegistryPath();
+  const buildLoopPath = getAlexBuildLoopSkillPath();
+  await fsp.mkdir(skillsDir, { recursive: true });
+  await fsp.mkdir(path.dirname(getAlexBuildLoopStatePath()), { recursive: true });
+
+  const registryExists = await fsp.stat(registryPath).then(() => true).catch(() => false);
+  if (!registryExists) {
+    await fsp.writeFile(registryPath, `${JSON.stringify(DEFAULT_ALEX_SKILLS_REGISTRY, null, 2)}\n`, 'utf8');
+  }
+
+  const buildLoopExists = await fsp.stat(buildLoopPath).then(() => true).catch(() => false);
+  if (!buildLoopExists) {
+    await fsp.writeFile(buildLoopPath, `${DEFAULT_BUILD_LOOP_SKILL_TEXT.trim()}\n`, 'utf8');
+  }
+
+  const statePath = getAlexBuildLoopStatePath();
+  const stateExists = await fsp.stat(statePath).then(() => true).catch(() => false);
+  if (!stateExists) {
+    await fsp.writeFile(statePath, `${JSON.stringify(DEFAULT_BUILD_LOOP_STATE, null, 2)}\n`, 'utf8');
+  }
+}
+
+async function readAlexSkillsRegistry() {
+  await ensureAlexSkillFiles();
+  try {
+    const raw = await fsp.readFile(getAlexSkillsRegistryPath(), 'utf8');
+    const parsed = safeJsonParse(raw, DEFAULT_ALEX_SKILLS_REGISTRY);
+    return Array.isArray(parsed) ? parsed : DEFAULT_ALEX_SKILLS_REGISTRY;
+  } catch {
+    return DEFAULT_ALEX_SKILLS_REGISTRY;
+  }
+}
+
+async function loadAlexSkills() {
+  const registry = await readAlexSkillsRegistry();
+  const loaded = [];
+  for (const item of registry) {
+    const id = String(item?.id || '').trim();
+    const filename = String(item?.filename || '').trim();
+    if (!id || !filename) continue;
+    const enabled = item?.enabled !== false;
+    const absPath = getAlexSkillFilePath(filename);
+    let content = '';
+    let missing = false;
+    if (enabled) {
+      try {
+        content = await fsp.readFile(absPath, 'utf8');
+      } catch {
+        missing = true;
+      }
+    }
+    loaded.push({
+      id,
+      title: String(item?.title || id),
+      filename,
+      enabled,
+      path: absPath,
+      content,
+      missing,
+    });
+  }
+  return loaded;
+}
+
+function buildAlexSkillsPrompt(skills = []) {
+  const enabled = (Array.isArray(skills) ? skills : []).filter((skill) => skill?.enabled);
+  if (!enabled.length) {
+    return 'SKILLS LOADED:\n- none';
+  }
+  const headerLines = ['SKILLS LOADED:'];
+  for (const skill of enabled) {
+    headerLines.push(`- ${skill.id} (${path.posix.join(ALEX_SKILLS_DIRNAME, skill.filename)})`);
+  }
+  const blocks = enabled.map((skill) => {
+    if (skill.missing) {
+      return `BEGIN SKILL: ${skill.id}\nWARNING: Skill file missing at ${skill.path}\nEND SKILL`;
+    }
+    return `BEGIN SKILL: ${skill.id}\n${String(skill.content || '').trim()}\nEND SKILL`;
+  });
+  return `${headerLines.join('\n')}\n\n${blocks.join('\n\n')}`;
+}
+
+async function readBuildLoopState() {
+  await ensureAlexSkillFiles();
+  try {
+    const raw = await fsp.readFile(getAlexBuildLoopStatePath(), 'utf8');
+    const parsed = safeJsonParse(raw, DEFAULT_BUILD_LOOP_STATE);
+    return {
+      ...DEFAULT_BUILD_LOOP_STATE,
+      ...(parsed && typeof parsed === 'object' ? parsed : {}),
+      mode_config: {
+        ...DEFAULT_BUILD_LOOP_STATE.mode_config,
+        ...(parsed?.mode_config && typeof parsed.mode_config === 'object' ? parsed.mode_config : {}),
+      },
+    };
+  } catch {
+    return { ...DEFAULT_BUILD_LOOP_STATE };
+  }
+}
+
+async function writeBuildLoopState(nextState) {
+  await ensureAlexSkillFiles();
+  const normalized = {
+    ...DEFAULT_BUILD_LOOP_STATE,
+    ...(nextState && typeof nextState === 'object' ? nextState : {}),
+    mode_config: {
+      ...DEFAULT_BUILD_LOOP_STATE.mode_config,
+      ...(nextState?.mode_config && typeof nextState.mode_config === 'object' ? nextState.mode_config : {}),
+    },
+  };
+  await fsp.writeFile(getAlexBuildLoopStatePath(), `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+  return normalized;
+}
+
+async function updateBuildLoopState(patch) {
+  const prev = await readBuildLoopState();
+  return writeBuildLoopState({
+    ...prev,
+    ...(patch && typeof patch === 'object' ? patch : {}),
+    mode_config: {
+      ...prev.mode_config,
+      ...(patch?.mode_config && typeof patch.mode_config === 'object' ? patch.mode_config : {}),
+    },
+  });
+}
+
+function buildBuildLoopIntakeReply({ state = null, memory = null, skillText = '' } = {}) {
+  const memoryHint = memory?.summaryText || memory?.profileText
+    ? `Recent memory:\n${String(memory.summaryText || memory.profileText || '').slice(0, 280)}\n\n`
+    : '';
+  const enforcementMatch = String(skillText || '').match(/## ENFORCEMENT[\s\S]*$/i);
+  const enforcement = enforcementMatch ? String(enforcementMatch[0]).slice(0, 1000) : '';
+  const completed = Number(state?.completed_jobs_count || 0);
+  return [
+    `Build loop is running. Completed jobs so far: ${completed}.`,
+    'Reply with one message containing:',
+    '1. Project name or slug',
+    '2. Goal',
+    '3. Deliverable',
+    '4. Constraints',
+    '5. Build target',
+    memoryHint.trim(),
+    enforcement ? `Skill enforcement reminder:\n${enforcement}` : '',
+    'Default: bundle-only. For Android, default to APK unless you explicitly request AAB.',
+  ].filter(Boolean).join('\n\n');
+}
+
+async function getAlexSkillById(skillId) {
+  const safeId = String(skillId || '').trim().toLowerCase();
+  const skills = await loadAlexSkills();
+  return skills.find((skill) => String(skill.id || '').trim().toLowerCase() === safeId) || null;
+}
+
+async function readMemoryDayFile({ workspaceRoot, day, kind = 'scratch', maxChars = 12000 } = {}) {
+  const safeDay = String(day || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(safeDay)) {
+    throw toolValidationError('INVALID_DAY', 'day must match YYYY-MM-DD', { day: safeDay || null });
+  }
+  const safeKind = String(kind || 'scratch').trim().toLowerCase();
+  const suffix = safeKind === 'summary'
+    ? `${safeDay}.summary.md`
+    : safeKind === 'meta'
+      ? `${safeDay}.meta.json`
+      : safeKind === 'scratch'
+        ? `${safeDay}.scratch.md`
+        : null;
+  if (!suffix) {
+    throw toolValidationError('INVALID_KIND', 'kind must be one of scratch, summary, or meta', { kind: safeKind });
+  }
+  const baseDir = path.join(String(workspaceRoot || getAlexSandboxRoot()), '.pb', 'memory', 'daily');
+  const baseReal = await fsp.realpath(baseDir).catch(() => null);
+  if (!baseReal) {
+    const err = new Error('Memory daily directory not found.');
+    err.code = 'not_found';
+    err.detail = { ok: false, error: 'not_found', day: safeDay, kind: safeKind, path: path.join(baseDir, suffix) };
+    throw err;
+  }
+  const filePath = path.join(baseDir, suffix);
+  const fileReal = await fsp.realpath(filePath).catch(() => null);
+  if (!fileReal || !isPathWithinAnyRoot(fileReal, [baseReal])) {
+    const err = new Error('Memory day file not found.');
+    err.code = 'not_found';
+    err.detail = { ok: false, error: 'not_found', day: safeDay, kind: safeKind, path: filePath };
+    throw err;
+  }
+  const content = await fsp.readFile(fileReal, 'utf8');
+  const max = Math.max(256, Math.min(Number(maxChars || 12000) || 12000, 200000));
+  const truncated = content.length > max;
+  return {
+    ok: true,
+    day: safeDay,
+    kind: safeKind,
+    path: fileReal,
+    content: truncated ? content.slice(-max) : content,
+    truncated,
+  };
+}
+
+function buildOvernightIntakeReply({ mode = 'standard', memory = null, factoryModeText = '' } = {}) {
+  const memoryHint = memory?.summaryText || memory?.profileText
+    ? `Recent memory:\n${String(memory.summaryText || memory.profileText || '').slice(0, 280)}\n\n`
+    : '';
+  const enforcementMatch = String(factoryModeText || '').match(/ENFORCEMENT[\s\S]*$/i);
+  const enforcement = enforcementMatch ? String(enforcementMatch[0]).slice(0, 900) : '';
+  return [
+    `Overnight ${mode === 'build' ? 'build ' : ''}intake started. Preset: overnight_standard.`,
+    'Reply with one message containing:',
+    '1. Project name or slug',
+    '2. Goal',
+    '3. Deliverable',
+    '4. Constraints',
+    '5. Build target',
+    memoryHint.trim(),
+    enforcement ? `Factory enforcement reminder:\n${enforcement}` : '',
+  ].filter(Boolean).join('\n\n');
+}
+
+function detectMemoryRecallQuery(messageText) {
+  const text = String(messageText || '').trim();
+  if (!text) return null;
+  const m = text.match(/\bwhat did (?:i|we) (?:say|decide) about\s+(.+?)(?:\?|$)/i)
+    || text.match(/\bremind me about\s+(.+?)(?:\?|$)/i);
+  const q = String(m?.[1] || '').trim().replace(/[.?!]+$/g, '');
+  return q || null;
+}
+
+async function createBuildLoopJobFromReply({ db, sessionId, message, mode = 'build' }) {
+  const memory = loadMemory({ db, agentId: MEMORY_AGENT_ID, chatId: sessionId });
+  const firstLine = String(message || '').split('\n').map((line) => line.trim()).find(Boolean) || `overnight-${mode}`;
+  const slug = slugifyJobName(firstLine);
+  const day = getLocalDayKey();
+  const jobRel = path.posix.join('jobs', day, slug);
+  const checklistRel = path.posix.join(jobRel, 'CHECKLIST.md');
+  const listingRel = path.posix.join(jobRel, 'LISTING.md');
+  const readmeRel = path.posix.join(jobRel, 'README.md');
+  const productRel = path.posix.join(jobRel, 'product.json');
+  const traces = [];
+  const workdir = getAlexSandboxRoot();
+  const runTool = async (toolName, args) => {
+    const started = Date.now();
+    publishSessionLiveEvent(sessionId, {
+      type: 'status',
+      message: `Calling tool ${toLiveToolName(toolName)}`,
+      tool: toLiveToolName(toolName),
+      args: sanitizeLiveArgs(args),
+    });
+    const out = await executeRegisteredTool({ toolName, args, workdir, db, sessionId });
+    traces.push({
+      stage: 'tool',
+      ok: true,
+      tool: toolName,
+      args,
+      result: out?.result || {},
+      stdout_preview: String(out?.stdout || '').slice(0, 280),
+      stderr_preview: String(out?.stderr || '').slice(0, 280),
+      duration_ms: Date.now() - started,
+    });
+    return out;
+  };
+  const checklistText = `# Build Loop Checklist\n\n- [x] Intake captured\n- [ ] Scaffold project\n- [ ] Build deliverable\n- [ ] Verify artifacts\n\n## Intake\n\n${String(message || '').trim()}\n`;
+  const listingText = `# Job Listing\n\n- Job: ${slug}\n- Day: ${day}\n- Mode: ${mode}\n- Deliverable: bundle-only\n- Skill file: ${getAlexBuildLoopSkillRelativePath()}\n`;
+  const readmeText = `# ${firstLine}\n\nCreated from /build intake.\n\n## Brief\n\n${String(message || '').trim()}\n\n## Memory\n\n${String(memory.injectedPreface || '').slice(0, 1000)}\n\n## Canonical Skill\n\nSee ${getAlexBuildLoopSkillRelativePath()} for the current build loop rules and intake menu.\n`;
+  const productJson = JSON.stringify({
+    ok: true,
+    preset: 'build_loop',
+    mode,
+    job_slug: slug,
+    day,
+    job_path: jobRel,
+    download_file: null,
+    delivery_mode: 'bundle-only',
+  }, null, 2);
+
+  publishSessionLiveEvent(sessionId, { type: 'status', message: `Creating job folder ${jobRel}` });
+  await runTool('workspace.mkdir', { path: jobRel });
+  publishSessionLiveEvent(sessionId, { type: 'status', message: `Writing ${checklistRel}` });
+  await runTool('workspace.write_file', { path: checklistRel, content: checklistText });
+  publishSessionLiveEvent(sessionId, { type: 'status', message: `Writing ${listingRel}` });
+  await runTool('workspace.write_file', { path: listingRel, content: listingText });
+  publishSessionLiveEvent(sessionId, { type: 'status', message: `Writing ${readmeRel}` });
+  await runTool('workspace.write_file', { path: readmeRel, content: readmeText });
+  publishSessionLiveEvent(sessionId, { type: 'status', message: `Writing ${productRel}` });
+  await runTool('workspace.write_file', { path: productRel, content: productJson });
+  publishSessionLiveEvent(sessionId, { type: 'status', message: `Verifying ${jobRel}` });
+  const listed = await runTool('workspace.list', { path: jobRel });
+  return {
+    traces,
+    job_rel: jobRel,
+    slug,
+    listed: listed?.result || {},
+  };
 }
 
 
@@ -895,30 +3620,42 @@ function resolveMcpServerFromTemplate(db, templateId) {
   return null;
 }
 
-function resolveAnyEnabledBrowserServer(db) {
+function resolveAnyEnabledBrowserServer(db, opts = {}) {
+  const requireCaps = Array.isArray(opts?.requireCapabilities) ? opts.requireCapabilities.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  const preferTemplate = String(opts?.preferTemplate || '').trim();
   const rows = db.prepare(`
-    SELECT s.id
+    SELECT s.id, s.template_id
     FROM mcp_servers s
     WHERE s.status = 'running'
     ORDER BY datetime(s.updated_at) DESC
     LIMIT 100
   `).all();
+  const preferred = [];
+  const fallback = [];
   for (const row of rows) {
     const id = String(row?.id || '').trim();
     if (!id || !isServerEnabledInWebchat(db, id)) continue;
     const caps = db.prepare('SELECT capability FROM mcp_capabilities WHERE server_id = ?').all(id).map((r) => String(r.capability || ''));
     const hasBrowser = caps.includes('browser.open_url') || caps.includes('browser.extract_text') || caps.includes('browser.search');
-    if (hasBrowser) return id;
+    const hasReq = requireCaps.every((cap) => caps.includes(cap));
+    if (!hasReq) continue;
+    if (!hasBrowser && requireCaps.length === 0) continue;
+    const templateId = String(row?.template_id || '').trim();
+    if (preferTemplate && templateId.includes(preferTemplate)) preferred.push(id);
+    else fallback.push(id);
   }
-  return null;
+  return preferred[0] || fallback[0] || null;
 }
 
 // Broad fallback: any running, approved, webchat-enabled MCP server (no capability filter).
 function resolveAnyRunningMcpServer(db) {
+  const whereHidden = tableColumnHas(db, 'mcp_servers', 'hidden')
+    ? 'AND (hidden IS NULL OR hidden = 0)'
+    : '';
   const rows = db.prepare(`
     SELECT id FROM mcp_servers
     WHERE status = 'running'
-      AND (hidden IS NULL OR hidden = 0)
+      ${whereHidden}
     ORDER BY updated_at DESC, created_at DESC
     LIMIT 50
   `).all();
@@ -932,7 +3669,8 @@ function resolveAnyRunningMcpServer(db) {
 // Auto-select a default browser template when none is specified.
 // Priority: id containing 'search_browser' > id containing 'basic_browser' > first enabled.
 // Returns { id, name, reason } or null when no enabled templates exist at all.
-function resolveDefaultBrowserTemplate(db) {
+function resolveDefaultBrowserTemplate(db, opts = {}) {
+  const prefer = String(opts?.prefer || '').trim();
   let rows;
   try {
     rows = db.prepare('SELECT id, name FROM mcp_templates ORDER BY name ASC').all();
@@ -941,6 +3679,10 @@ function resolveDefaultBrowserTemplate(db) {
   }
   const enabled = rows.filter((r) => isTemplateEnabledInWebchat(db, String(r?.id || '')));
   if (!enabled.length) return null;
+  if (prefer) {
+    const forced = enabled.find((r) => String(r.id || '').includes(prefer));
+    if (forced) return { id: String(forced.id), name: String(forced.name || forced.id), reason: `preferred_${prefer}` };
+  }
   for (const pref of ['search_browser', 'basic_browser']) {
     const match = enabled.find((r) => String(r.id || '').includes(pref));
     if (match) return { id: String(match.id), name: String(match.name || match.id), reason: `preferred_${pref}` };
@@ -1269,8 +4011,33 @@ function firstJsonObject(text) {
   return null;
 }
 
+function extractExplicitToolEnvelopeText(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return null;
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced?.[1]) {
+    const inner = String(fenced[1] || '').trim();
+    return inner.startsWith('{') && inner.endsWith('}') ? inner : null;
+  }
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
+  return null;
+}
+
 function normalizeArgs(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  if (raw.args && typeof raw.args === 'object' && !Array.isArray(raw.args)) return normalizeArgs(raw.args);
+  if (raw.arguments && typeof raw.arguments === 'object' && !Array.isArray(raw.arguments)) return normalizeArgs(raw.arguments);
+  if (raw.input && typeof raw.input === 'object' && !Array.isArray(raw.input)) return normalizeArgs(raw.input);
+  if (raw.payload && typeof raw.payload === 'object' && !Array.isArray(raw.payload)) return normalizeArgs(raw.payload);
+  if (raw.params && typeof raw.params === 'object' && !Array.isArray(raw.params)) return normalizeArgs(raw.params);
+  if (raw.path && typeof raw.path === 'object' && !Array.isArray(raw.path)) {
+    const p = raw.path;
+    return {
+      ...raw,
+      path: typeof p.path === 'string' ? p.path : (typeof p.value === 'string' ? p.value : ''),
+      content: raw.content ?? p.content,
+    };
+  }
   return raw;
 }
 
@@ -1287,10 +4054,71 @@ function parseToolCommand(message) {
   return { toolName, args };
 }
 
+function trimOptionalQuotes(value) {
+  const raw = String(value || '').trim();
+  const q = raw.match(/^(['"])([\s\S]*)\1$/);
+  return q ? String(q[2] || '').trim() : raw;
+}
+
+function parseStructuredToolInstruction(message) {
+  const text = String(message || '');
+  if (!text.trim()) return null;
+  if (!/(^|\n)\s*Use\s+tools\.proc\.exec\s+with\s*:/i.test(text)) return null;
+  const cwdMatch = text.match(/(?:^|\n)\s*cwd:\s*(.+)$/im);
+  const commandMatch = text.match(/(?:^|\n)\s*command:\s*(.+)$/im);
+  const timeoutMatch = text.match(/(?:^|\n)\s*timeoutMs:\s*(\d+)\s*$/im);
+  const cwd = trimOptionalQuotes(cwdMatch?.[1] || '');
+  const command = trimOptionalQuotes(commandMatch?.[1] || '');
+  if (!command) return null;
+  return {
+    toolName: 'workspace.exec_shell',
+    args: {
+      command,
+      ...(cwd ? { cwd } : {}),
+      ...(timeoutMatch?.[1] ? { timeoutMs: Number(timeoutMatch[1]) } : {}),
+    },
+  };
+}
+
+function normalizeToolLoopReply(text, traces = []) {
+  const raw = String(text || '').trim();
+  if (!raw) return raw;
+  const stripped = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+  if (!(stripped.startsWith('{') && stripped.endsWith('}'))) return raw;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(stripped);
+  } catch {
+    return raw;
+  }
+  if (!parsed || typeof parsed !== 'object') return raw;
+  const touched = Array.isArray(parsed.files_touched) ? parsed.files_touched.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  const hasToolTraces = Array.isArray(traces) && traces.some((trace) => trace?.tool);
+  if (!hasToolTraces) return raw;
+  if (touched.length > 0) {
+    return `Executed requested tools.\nTouched: ${touched.slice(0, 10).join(', ')}`;
+  }
+  const nextAction = String(parsed.next_action || '').trim();
+  if (nextAction) return `Executed requested tools.\nNext: ${nextAction}`;
+  return 'Executed requested tools.';
+}
+
+function buildMissionModeSystemText(systemText) {
+  return `${systemText}
+
+Mission-mode safety:
+- If the user pasted a mission, spec, checklist, or large instruction block, treat it as actionable instructions, not as file content to write verbatim.
+- Do not call writeFile just because mission text mentions filenames, backticks, build outputs, or paths like dist/*.zip.
+- Binary outputs such as .zip, .apk, .aab, .jar, .keystore, .png, .jpg, .pdf, .mp4, and .mov must be built with proc.exec, then placed with copyPath/movePath.
+- If the mission lists steps like TASK:, COPY/PASTE, or DO THIS IN ORDER, execute those steps safely instead of writing the mission into a file.
+- When unsure, ask the next best question instead of inventing artifacts.`;
+}
+
 function normalizeToolName(name) {
   const n = String(name || '').trim();
   if (n === 'workspace.read') return 'workspace.read_file';
   if (n === 'workspace.write') return 'workspace.write_file';
+  if (n === 'workspace.list_dir') return 'workspace.list';
   if (n === 'read_file') return 'workspace.read_file';
   if (n === 'write_file') return 'workspace.write_file';
   if (n === 'list_dir') return 'workspace.list';
@@ -1300,12 +4128,23 @@ function normalizeToolName(name) {
   if (n === 'tools.fs.listDir') return 'workspace.list';
   if (n === 'tools.fs.mkdir') return 'workspace.mkdir';
   if (n === 'tools.fs.delete') return 'workspace.delete';
+  if (n === 'tools.fs.deletePath') return 'workspace.delete';
+  if (n === 'tools.fs.copyPath') return 'workspace.copy_path';
+  if (n === 'tools.fs.movePath') return 'workspace.move_path';
+  if (n === 'tools.fs.exists') return 'workspace.exists';
+  if (n === 'tools.fs.stat') return 'workspace.stat';
   if (n === 'tools.proc.exec') return 'workspace.exec_shell';
+  if (n === 'tools.web.search') return 'mcp.browser.search';
   if (n === 'uploads.read') return 'uploads.read_file';
   if (n === 'memory_write_scratch') return 'memory.write_scratch';
+  if (n === 'memory.read_day') return 'memory.read_day';
+  if (n === 'memory_read_day') return 'memory.read_day';
   if (n === 'memory_search') return 'memory.search';
   if (n === 'memory_get') return 'memory.get';
   if (n === 'memory_finalize_day') return 'memory.finalize_day';
+  if (n === 'memory_atlas_search') return 'memory.atlas.search';
+  if (n === 'memory_atlas_dump') return 'memory.atlas.dump';
+  if (n === 'memory_atlas_get_mission') return 'memory.atlas.get_mission';
   if (n === 'scratch_write') return 'scratch.write';
   if (n === 'scratch_read') return 'scratch.read';
   if (n === 'scratch_list') return 'scratch.list';
@@ -1314,12 +4153,17 @@ function normalizeToolName(name) {
 }
 
 function parseToolProposalFromReply(replyText) {
-  const objText = firstJsonObject(replyText);
+  const objText = extractExplicitToolEnvelopeText(replyText);
   if (!objText) return null;
   const obj = safeJsonParse(objText, null);
   if (!obj || typeof obj !== 'object') return null;
+  const looksExplicit =
+    Object.prototype.hasOwnProperty.call(obj, 'tool_name')
+    || Object.prototype.hasOwnProperty.call(obj, 'function_call')
+    || (Object.prototype.hasOwnProperty.call(obj, 'name') && Object.prototype.hasOwnProperty.call(obj, 'arguments'));
+  if (!looksExplicit) return null;
 
-  const toolName = normalizeToolName(String(
+  const rawToolName = String(
     obj.tool_name ||
     obj.toolId ||
     obj.tool ||
@@ -1328,18 +4172,54 @@ function parseToolProposalFromReply(replyText) {
     obj.function_name ||
     obj?.function_call?.name ||
     ''
-  ).trim());
+  ).trim();
+  const toolName = normalizeToolName(rawToolName);
   if (!toolName) return null;
 
   const rawArgs = obj.args || obj.args_json || obj.input || obj.arguments || obj?.function_call?.arguments || {};
   const argsObj = typeof rawArgs === 'string' ? safeJsonParse(rawArgs, {}) : rawArgs;
   const args = normalizeArgs(argsObj);
-  return { toolName, args };
+  return { rawToolName: rawToolName || toolName, toolName, args };
+}
+
+function ensureToolTracePresence(toolRequirement, loopOut) {
+  const traces = Array.isArray(loopOut?.traces) ? loopOut.traces : [];
+  if (!toolRequirement?.required) return loopOut;
+  if (traces.length > 0) return loopOut;
+  return {
+    ok: false,
+    error: 'TOOL_TRACE_MISSING',
+    detail: {
+      reason: 'tool_executed_without_trace',
+      message: 'Tool executed without trace — bug. Refusing output.',
+      tool_required: true,
+    },
+    traces: [],
+  };
+}
+
+function summarizeExecutedToolReply(toolTraces) {
+  const traces = Array.isArray(toolTraces) ? toolTraces.filter((t) => t && t.ok) : [];
+  if (!traces.length) return 'Executed requested tools.';
+  const paths = [];
+  for (const trace of traces) {
+    const relPath = String(
+      trace?.result?.path
+      || trace?.args?.path
+      || trace?.args?.cwd
+      || ''
+    ).trim();
+    if (relPath && !paths.includes(relPath)) paths.push(relPath);
+  }
+  if (paths.length >= 2) return `Executed requested tools for ${paths.slice(0, 2).join(' and ')}.`;
+  if (paths.length === 1) return `Executed requested tools for ${paths[0]}.`;
+  return 'Executed requested tools successfully.';
 }
 
 function detectDirectFileIntent(text) {
   const raw = String(text || '').trim();
   if (!raw) return null;
+  if (shouldForceMissionTextMode(raw)) return null;
 
   const cleaned = raw.replace(/[.]+$/, '').trim();
 
@@ -1348,6 +4228,8 @@ function detectDirectFileIntent(text) {
     || cleaned.match(/^(?:please\s+)?(?:create|make|write|overwrite)\s+([^\s]+\.[a-z0-9_]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?(?:\s+with\s+content\s+([\s\S]+))?$/i);
   if (create) {
     const p = String(create[1] || '').trim();
+    if (hasMarkdownContaminatedPath(p)) return null;
+    if (isBinaryWriteExtension(path.extname(path.basename(p)).toLowerCase())) return null;
     const quoted = cleaned.match(/with\s+content\s+['"]([\s\S]*?)['"](?:\.|$)/i);
     let content = quoted ? String(quoted[1] || '') : String(create[2] || 'Created by Alex');
     content = content.trim();
@@ -1358,18 +4240,32 @@ function detectDirectFileIntent(text) {
   const edit = cleaned.match(/^(?:please\s+)?(?:edit|update|replace)\s+(?:file\s+)?([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?\s+(?:with|to)\s+([\s\S]+)$/i);
   if (edit) {
     const p = String(edit[1] || '').trim();
+    if (hasMarkdownContaminatedPath(p)) return null;
+    if (isBinaryWriteExtension(path.extname(path.basename(p)).toLowerCase())) return null;
     let content = String(edit[2] || '').trim().replace(/^['"]|['"]$/g, '');
     return { toolName: 'workspace.write_file', args: { path: p, content } };
   }
 
   const mkdir = cleaned.match(/^(?:please\s+)?(?:create|make)\s+(?:directory|folder)\s+([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
-  if (mkdir) return { toolName: 'workspace.mkdir', args: { path: String(mkdir[1] || '').trim() } };
+  if (mkdir) {
+    const p = String(mkdir[1] || '').trim();
+    if (hasMarkdownContaminatedPath(p)) return null;
+    return { toolName: 'workspace.mkdir', args: { path: p } };
+  }
 
   const read = cleaned.match(/^(?:please\s+)?(?:read|show)\s+(?:file\s+)?([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
-  if (read) return { toolName: 'workspace.read_file', args: { path: String(read[1] || '').trim() } };
+  if (read) {
+    const p = String(read[1] || '').trim();
+    if (hasMarkdownContaminatedPath(p)) return null;
+    return { toolName: 'workspace.read_file', args: { path: p } };
+  }
 
   const del = cleaned.match(/^(?:please\s+)?(?:delete|remove)\s+(?:file\s+|folder\s+|directory\s+)?([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
-  if (del) return { toolName: 'workspace.delete', args: { path: String(del[1] || '').trim() } };
+  if (del) {
+    const p = String(del[1] || '').trim();
+    if (hasMarkdownContaminatedPath(p)) return null;
+    return { toolName: 'workspace.delete', args: { path: p } };
+  }
 
   if (/^(?:please\s+)?list\s+files\s+in\s+(?:my\s+|his\s+|alex(?:'s)?\s+)?(?:workspace|working\s+directory)$/i.test(cleaned)
       || /^(?:please\s+)?list\s+(?:my\s+|his\s+|alex(?:'s)?\s+)?workspace\s+files$/i.test(cleaned)) {
@@ -1377,9 +4273,101 @@ function detectDirectFileIntent(text) {
   }
 
   const list = cleaned.match(/^(?:please\s+)?list\s+(?:dir|directory|folder)\s+([^\s]+)(?:\s+in\s+(?:my|his|alex(?:'s)?|the)\s+(?:workspace|working\s+directory))?$/i);
-  if (list) return { toolName: 'workspace.list', args: { path: String(list[1] || '').trim() } };
+  if (list) {
+    const p = String(list[1] || '').trim();
+    if (hasMarkdownContaminatedPath(p)) return null;
+    return { toolName: 'workspace.list', args: { path: p } };
+  }
 
   return null;
+}
+
+function formatLocalActionReply(toolName, runOut) {
+  const result = runOut?.result || {};
+  if (toolName === 'workspace.write_file') {
+    const absPath = String(result.abs_path || result.path || '');
+    const bytes = Number(result.bytes || 0);
+    return `Created ${absPath} (${bytes} bytes).`;
+  }
+  if (toolName === 'workspace.mkdir') {
+    const dir = String(result.abs_path || result.path || '');
+    return `Created directory ${dir || '.'}.`;
+  }
+  if (toolName === 'workspace.list') {
+    const items = Array.isArray(result.items) ? result.items : [];
+    const names = items.slice(0, 8).map((i) => String(i?.name || '')).filter(Boolean);
+    return `Listed ${items.length} entries in ${String(result.abs_path || result.path || '.')}.\n${names.length ? names.join('\n') : '(empty)'}`;
+  }
+  if (toolName === 'workspace.read_file') {
+    const content = String(result.content || '');
+    return `Read ${String(result.abs_path || result.path || '')}.\n${content.slice(0, 300)}`;
+  }
+  if (toolName === 'workspace.delete') {
+    return `Deleted ${String(result.abs_path || result.path || result.path || '')}.`;
+  }
+  return `Executed ${toolName}.`;
+}
+
+function formatExecWhitelistError(db, sessionId, err) {
+  const detail = err?.detail && typeof err.detail === 'object' ? err.detail : {};
+  if (String(detail.reason || '') !== 'command_not_whitelisted') return null;
+  const command = String(detail.command || '').trim();
+  const firstToken = stripTokenQuotes(String(tokenizeShellCommand(command)[0] || '').trim());
+  const access = buildAlexToolAccessContext(db, sessionId, null);
+  const whitelist = Array.isArray(access?.exec_whitelist) ? access.exec_whitelist : [];
+  const shownWhitelist = whitelist.slice(0, 16).join(', ');
+  const safeSuggestions = ['ls -la', 'rg -n overnight -S .'];
+  const tokenLabel = firstToken || '(unknown command)';
+  return [
+    `Command blocked: \`${tokenLabel}\` is not in Alex's exec whitelist.`,
+    shownWhitelist ? `Allowed commands: ${shownWhitelist}` : 'Allowed commands: none for this access level.',
+    `Try a safe alternative such as \`${safeSuggestions[0]}\` first, then \`${safeSuggestions[1]}\`.`,
+  ].join('\n');
+}
+
+function formatLocalActionError(db, sessionId, err, fallbackMessage = 'Local action failed.') {
+  const whitelistMsg = formatExecWhitelistError(db, sessionId, err);
+  if (whitelistMsg) return whitelistMsg;
+  return String(err?.message || fallbackMessage || 'Local action failed.');
+}
+
+async function runLocalActionWithRetry({ db, sessionId, workdir, candidate, message, maxRetries = 1 }) {
+  let attempts = 0;
+  let lastError = null;
+  const toolName = String(candidate?.toolName || '').trim();
+  const args = candidate?.args && typeof candidate.args === 'object' ? candidate.args : {};
+  const artifact = inferRequestedArtifact(message);
+  const skipArtifactVerify = shouldSkipArtifactVerification({
+    messageText: message,
+    missionTextMode: shouldForceMissionTextMode(message),
+    inferred: artifact,
+  });
+
+  while (attempts <= maxRetries) {
+    attempts += 1;
+    try {
+      const runOut = await executeRegisteredTool({ toolName, args, workdir, db, sessionId });
+      if (artifact?.path && !skipArtifactVerify) {
+        const verify = await verifyLocalActionOutcome({ workdir, userText: message });
+        if (!verify.ok) {
+          lastError = new Error(`Verification failed: ${verify.reason || 'unknown'}`);
+          if (attempts <= maxRetries) continue;
+          throw lastError;
+        }
+      }
+      return { ok: true, attempts, runOut };
+    } catch (e) {
+      lastError = e;
+      if (attempts > maxRetries) break;
+    }
+  }
+
+  return {
+    ok: false,
+    attempts,
+    error: String(lastError?.message || lastError || 'Local action failed'),
+    err: lastError || null,
+  };
 }
 
 function isCanvasWriteToolName(name) {
@@ -1425,6 +4413,11 @@ function getWorkdir() {
   fs.mkdirSync(root, { recursive: true });
   ensureAlexWorkdir(root);
   return root;
+}
+
+function getAlexSandboxRoot(workspaceRoot = null) {
+  const root = workspaceRoot ? path.resolve(String(workspaceRoot)) : getWorkdir();
+  return ensureAlexWorkdir(root);
 }
 
 function getUploadsRoot(workdir) {
@@ -1495,7 +4488,7 @@ function pathGrantMatches(absPath, prefixPath) {
 
 function pathActionForTool(toolName) {
   if (toolName === 'workspace.list' || toolName === 'workspace.read_file') return 'read';
-  if (toolName === 'workspace.write_file' || toolName === 'workspace.mkdir') return 'write';
+  if (toolName === 'workspace.write_file' || toolName === 'workspace.mkdir' || toolName === 'workspace.copy_path' || toolName === 'workspace.move_path') return 'write';
   if (toolName === 'workspace.delete') return 'delete';
   if (toolName === 'workspace.exec_shell' || toolName === 'workspace.exec') return 'exec';
   return null;
@@ -1566,6 +4559,274 @@ async function wipeWorkdirContents(workdir, { preservePaths = [] } = {}) {
   const counter = { deleted: 0 };
   await pruneDirectoryWithKeeps(root, keepPaths, counter);
   return counter.deleted;
+}
+
+function deleteAppKvKeys(db, { exact = [], prefixes = [] } = {}) {
+  if (!hasTable(db, 'app_kv')) return 0;
+  const exactKeys = Array.isArray(exact) ? exact.map((k) => String(k || '').trim()).filter(Boolean) : [];
+  const prefixKeys = Array.isArray(prefixes) ? prefixes.map((k) => String(k || '').trim()).filter(Boolean) : [];
+  if (!exactKeys.length && !prefixKeys.length) return 0;
+
+  const clauses = [];
+  const params = [];
+  for (const key of exactKeys) {
+    clauses.push('key = ?');
+    params.push(key);
+  }
+  for (const prefix of prefixKeys) {
+    clauses.push('key LIKE ?');
+    params.push(`${prefix}%`);
+  }
+  const where = clauses.join(' OR ');
+  const count = Number(db.prepare(`SELECT COUNT(1) AS c FROM app_kv WHERE ${where}`).get(...params)?.c || 0);
+  if (count > 0) {
+    db.prepare(`DELETE FROM app_kv WHERE ${where}`).run(...params);
+  }
+  return count;
+}
+
+async function removeAllowedPaths(rootPath, relativeTargets = []) {
+  const root = path.resolve(String(rootPath || ''));
+  const deleted = [];
+  const missing = [];
+  const errors = [];
+  for (const rel of relativeTargets) {
+    const cleanRel = String(rel || '').trim();
+    if (!cleanRel) continue;
+    const abs = path.resolve(root, cleanRel);
+    const relFromRoot = path.relative(root, abs);
+    if (!relFromRoot || relFromRoot.startsWith('..') || path.isAbsolute(relFromRoot)) {
+      errors.push({ path: cleanRel, error: 'outside_root' });
+      continue;
+    }
+    try {
+      await fsp.rm(abs, { recursive: true, force: true });
+      if (fs.existsSync(abs)) {
+        errors.push({ path: cleanRel, error: 'still_exists' });
+      } else {
+        deleted.push(cleanRel);
+      }
+    } catch (e) {
+      if (!fs.existsSync(abs)) {
+        missing.push(cleanRel);
+      } else {
+        errors.push({ path: cleanRel, error: String(e?.message || e) });
+      }
+    }
+  }
+  return { deleted, missing, errors };
+}
+
+function clearTableRows(db, tableName, report) {
+  if (!hasTable(db, tableName)) {
+    report.skipped.push(tableName);
+    return 0;
+  }
+  const count = tableCount(db, tableName);
+  db.prepare(`DELETE FROM ${tableName}`).run();
+  report.cleared[tableName] = count;
+  return count;
+}
+
+function clearAtlasData(dataDir) {
+  const report = { cleared: {}, skipped: [], errors: [] };
+  const atlasPath = path.join(dataDir, 'atlas.db');
+  if (!fs.existsSync(atlasPath)) {
+    report.skipped.push('atlas.db');
+    return report;
+  }
+
+  try {
+    resetAtlasEngine();
+  } catch (e) {
+    report.errors.push(`reset_atlas_engine:${String(e?.message || e)}`);
+  }
+
+  let atlasDb = null;
+  try {
+    atlasDb = new Database(atlasPath);
+    atlasDb.pragma('foreign_keys = OFF');
+    for (const table of ['summary_parents', 'context_items', 'summaries', 'messages', 'conversations', 'large_files']) {
+      try {
+        const exists = atlasDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+        if (!exists) {
+          report.skipped.push(table);
+          continue;
+        }
+        const count = Number(atlasDb.prepare(`SELECT COUNT(1) AS c FROM ${table}`).get()?.c || 0);
+        atlasDb.prepare(`DELETE FROM ${table}`).run();
+        report.cleared[table] = count;
+      } catch (e) {
+        report.errors.push(`${table}:${String(e?.message || e)}`);
+      }
+    }
+    try { atlasDb.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
+  } catch (e) {
+    report.errors.push(`atlas_db:${String(e?.message || e)}`);
+  } finally {
+    try { atlasDb?.close(); } catch {}
+  }
+
+  return report;
+}
+
+async function executeFactoryReset({ db, dataDir }) {
+  const resetAt = nowIso();
+  const workspaceRoot = getWorkspaceRoot();
+  const workdir = getWorkdir();
+  const tables = {
+    cleared: {},
+    skipped: [],
+  };
+  const appKv = { deleted: 0 };
+
+  const workdirTargets = [
+    '.pb/memory',
+    '.pb/watchtower/WATCHTOWER.md',
+    '.pb/build_loop_state.json',
+    '.pb/extensions/reports',
+    '.pb/extensions/installed-trash',
+    '.pb/extensions/staging',
+    '.pb/extensions/uploads',
+    'MEMORY.md',
+    'MEMORY_ARCHIVE',
+    'scratch',
+    'data/uploads',
+    'mcp_servers/staging',
+  ];
+  const preservedWorkdirTargets = [
+    '.pb/plugins',
+    '.pb/extensions/installed',
+    '.pb/extensions/trusted-signers',
+    '.pb/watchtower',
+    'ALEX_SKILLS',
+    'mcp_servers/installed',
+    'dev-plugins',
+    'writing',
+    'workspaces',
+  ];
+
+  const tx = db.transaction(() => {
+    if (hasTable(db, 'admin_auth')) {
+      db.prepare('UPDATE admin_auth SET password_hash = NULL, created_at = NULL WHERE id = 1').run();
+      tables.cleared.admin_auth = 1;
+    } else {
+      tables.skipped.push('admin_auth');
+    }
+    for (const table of ['admin_tokens', 'admin_sessions', 'sessions']) {
+      clearTableRows(db, table, tables);
+    }
+    for (const table of [
+      'messages',
+      'memory_entries',
+      'memory_archive',
+      'memories',
+      'memory_facts',
+      'llm_pending_requests',
+      'llm_request_trace',
+      'llm_models_cache',
+      'jobs',
+      'tool_proposals',
+      'tool_runs',
+      'tool_approvals',
+      'tool_audit',
+      'web_tool_proposals',
+      'web_tool_runs',
+      'web_tool_approvals',
+      'web_tool_audit',
+      'approvals',
+      'approval_requests',
+      'capability_grants',
+      'mcp_approvals',
+      'mcp_server_logs',
+      'agent_runs',
+      'canvas_items',
+      'webchat_uploads',
+      'security_events',
+      'security_daily',
+      'directory_targets',
+      'directory_profiles',
+      'directory_attempts',
+      'directory_projects',
+      'directory_project_targets',
+      'doctor_checks',
+      'doctor_reports',
+      'doctor_runs',
+      'slack_allowed',
+      'slack_pending',
+      'slack_blocked',
+      'telegram_allowed',
+      'telegram_pending',
+      'telegram_blocked',
+      'telegram_admin_lockouts',
+      'telegram_admin_login_attempts',
+      'telegram_tool_oneshot',
+      'alex_project_roots',
+    ]) {
+      clearTableRows(db, table, tables);
+    }
+
+    appKv.deleted = deleteAppKvKeys(db, {
+      exact: [
+        SCAN_STATE_KEY,
+        WATCHTOWER_STATE_KEY,
+        ALEX_ACCESS_STATE_KEY,
+        ATLAS_MISSION_KV_KEY,
+        'telegram.pendingOverflowActive',
+      ],
+      prefixes: [
+        WEBCHAT_SESSION_META_KEY_PREFIX,
+        'memory.patch.',
+        ATLAS_SESSION_MISSION_KV_PREFIX,
+      ],
+    });
+  });
+  tx();
+
+  resetHotCache();
+  const atlas = clearAtlasData(dataDir);
+  const workdirCleanup = await removeAllowedPaths(workdir, workdirTargets);
+  const dataCleanup = await removeAllowedPaths(dataDir, ['uploads']);
+
+  const report = {
+    at: resetAt,
+    workspace_root: workspaceRoot,
+    workdir,
+    data_dir: dataDir,
+    cleared: {
+      tables: tables.cleared,
+      app_kv_keys: appKv.deleted,
+      atlas_tables: atlas.cleared,
+      workdir_paths: workdirCleanup.deleted,
+      data_paths: dataCleanup.deleted,
+    },
+    skipped: {
+      tables: tables.skipped,
+      atlas_tables: atlas.skipped,
+      workdir_paths: workdirCleanup.missing,
+      data_paths: dataCleanup.missing,
+    },
+    preserved: {
+      db_tables: ['app_kv', 'mcp_templates', 'mcp_servers', 'mcp_capabilities', 'tool_versions', 'migrations'],
+      auth_behavior: 'auth rows cleared; bootstrap password setup required again',
+      workdir_paths: preservedWorkdirTargets,
+      data_paths: ['.env', 'proworkbench.db', 'proworkbench.db-wal', 'proworkbench.db-shm', 'atlas.db', 'atlas.db-wal', 'atlas.db-shm'],
+    },
+    errors: [
+      ...atlas.errors.map((msg) => `atlas:${msg}`),
+      ...workdirCleanup.errors.map((row) => `workdir:${row.path}:${row.error}`),
+      ...dataCleanup.errors.map((row) => `data:${row.path}:${row.error}`),
+    ],
+  };
+
+  try {
+    recordEvent(db, 'factory_reset_executed', report);
+  } catch {}
+  try {
+    console.info('[factory_reset]', JSON.stringify(report));
+  } catch {}
+
+  return report;
 }
 
 async function executePanicWipe({ db, scope }) {
@@ -1719,6 +4980,38 @@ const TOOL_REGISTRY = {
     requiresApproval: true,
     description: 'Deletes files or folders under PB_WORKDIR.',
   },
+  'workspace.copy_path': {
+    id: 'workspace.copy_path',
+    source_type: 'builtin',
+    label: 'Copy Workspace File/Directory',
+    risk: 'high',
+    requiresApproval: true,
+    description: 'Copies files or folders under PB_WORKDIR.',
+  },
+  'workspace.move_path': {
+    id: 'workspace.move_path',
+    source_type: 'builtin',
+    label: 'Move Workspace File/Directory',
+    risk: 'high',
+    requiresApproval: true,
+    description: 'Moves or renames files or folders under PB_WORKDIR.',
+  },
+  'workspace.exists': {
+    id: 'workspace.exists',
+    source_type: 'builtin',
+    label: 'Check Workspace Path Exists',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Checks whether a file or directory exists under PB_WORKDIR.',
+  },
+  'workspace.stat': {
+    id: 'workspace.stat',
+    source_type: 'builtin',
+    label: 'Stat Workspace Path',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Returns file metadata for a path under PB_WORKDIR.',
+  },
   'workspace.exec_shell': {
     id: 'workspace.exec_shell',
     source_type: 'builtin',
@@ -1790,6 +5083,38 @@ const TOOL_REGISTRY = {
     risk: 'low',
     requiresApproval: false,
     description: 'Searches memory files (daily + durable + optional archive).',
+  },
+  'memory.read_day': {
+    id: 'memory.read_day',
+    source_type: 'builtin',
+    label: 'Read Daily Memory File',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Reads a daily scratch, summary, or meta memory file from the Alex workspace.',
+  },
+  'memory.atlas.search': {
+    id: 'memory.atlas.search',
+    source_type: 'builtin',
+    label: 'Search Atlas Memory',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Searches Atlas conversation memory for prior turns, tool outputs, and summaries.',
+  },
+  'memory.atlas.dump': {
+    id: 'memory.atlas.dump',
+    source_type: 'builtin',
+    label: 'Dump Atlas Conversation',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Returns stored Atlas conversation entries for a session.',
+  },
+  'memory.atlas.get_mission': {
+    id: 'memory.atlas.get_mission',
+    source_type: 'builtin',
+    label: 'Get Current Mission',
+    risk: 'low',
+    requiresApproval: false,
+    description: 'Reads the current canonical mission file and returns its text.',
   },
   memory_search: {
     id: 'memory_search',
@@ -1867,11 +5192,16 @@ const TOOL_REGISTRY = {
 
 
 function getMcpToolSchema(capabilities = []) {
-  const caps = Array.isArray(capabilities) ? capabilities.map((c) => String(c || '').trim()) : [];
+  const caps = Array.isArray(capabilities) ? Array.from(new Set(capabilities.map((c) => String(c || '').trim()).filter(Boolean))) : [];
   const has = (c) => caps.includes(String(c));
   const defs = [];
+  const coveredCaps = new Set();
+  const addDef = (capability, def) => {
+    coveredCaps.add(String(capability));
+    defs.push(def);
+  };
   if (has('browser.search')) {
-    defs.push({
+    addDef('browser.search', {
       type: 'function',
       function: {
         name: 'mcp.browser.search',
@@ -1888,8 +5218,25 @@ function getMcpToolSchema(capabilities = []) {
       },
     });
   }
+  if (has('browser.open_url')) {
+    addDef('browser.open_url', {
+      type: 'function',
+      function: {
+        name: 'mcp.browser.open_url',
+        description: 'Open a URL in the browser MCP runtime and return load metadata.',
+        parameters: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'Absolute URL to open.' },
+          },
+          required: ['url'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
   if (has('browser.extract_text') || has('browser.open_url')) {
-    defs.push({
+    addDef('browser.extract_text', {
       type: 'function',
       function: {
         name: 'mcp.browser.extract_text',
@@ -1907,7 +5254,7 @@ function getMcpToolSchema(capabilities = []) {
     });
   }
   if (has('resolve-library-id')) {
-    defs.push({
+    addDef('resolve-library-id', {
       type: 'function',
       function: {
         name: 'resolve-library-id',
@@ -1925,7 +5272,7 @@ function getMcpToolSchema(capabilities = []) {
     });
   }
   if (has('query-docs')) {
-    defs.push({
+    addDef('query-docs', {
       type: 'function',
       function: {
         name: 'query-docs',
@@ -1942,11 +5289,265 @@ function getMcpToolSchema(capabilities = []) {
       },
     });
   }
+  if (has('export.write_markdown')) {
+    addDef('export.write_markdown', {
+      type: 'function',
+      function: {
+        name: 'mcp.export.write_markdown',
+        description: 'Write a markdown report file through Export Reports MCP.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative output path in workspace.' },
+            content: { type: 'string', description: 'Markdown content.' },
+          },
+          required: ['path', 'content'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('export.write_csv')) {
+    addDef('export.write_csv', {
+      type: 'function',
+      function: {
+        name: 'mcp.export.write_csv',
+        description: 'Write a CSV report file through Export Reports MCP.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative output path in workspace.' },
+            content: { type: 'string', description: 'CSV content.' },
+          },
+          required: ['path', 'content'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('pb_files.list')) {
+    addDef('pb_files.list', {
+      type: 'function',
+      function: {
+        name: 'mcp.pb_files.list',
+        description: 'List files/directories from PB Files MCP under workspace sandbox.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative directory path.' },
+          },
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('pb_files.read')) {
+    addDef('pb_files.read', {
+      type: 'function',
+      function: {
+        name: 'mcp.pb_files.read',
+        description: 'Read a UTF-8 file through PB Files MCP.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative file path.' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('pb_files.write')) {
+    addDef('pb_files.write', {
+      type: 'function',
+      function: {
+        name: 'mcp.pb_files.write',
+        description: 'Write a UTF-8 file through PB Files MCP.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative file path.' },
+            content: { type: 'string', description: 'File content.' },
+          },
+          required: ['path', 'content'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('pb_files.mkdir')) {
+    addDef('pb_files.mkdir', {
+      type: 'function',
+      function: {
+        name: 'mcp.pb_files.mkdir',
+        description: 'Create a directory through PB Files MCP.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative directory path.' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('pb_files.delete')) {
+    addDef('pb_files.delete', {
+      type: 'function',
+      function: {
+        name: 'mcp.pb_files.delete',
+        description: 'Delete a file/directory through PB Files MCP.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative target path.' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  if (has('kdenlive.make_aligned_project')) {
+    addDef('kdenlive.make_aligned_project', {
+      type: 'function',
+      function: {
+        name: 'mcp.kdenlive.make_aligned_project',
+        description: 'Create a Kdenlive MLT project with scene-aligned 5s slots on V1/A1/A2/A3.',
+        parameters: {
+          type: 'object',
+          properties: {
+            project_name: { type: 'string' },
+            fps: { type: 'number' },
+            width: { type: 'number' },
+            height: { type: 'number' },
+            scene_duration_s: { type: 'number' },
+            scenes: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  video: { type: 'string' },
+                  voice: { type: 'string' },
+                  music: { type: 'string' },
+                  sfx: { type: 'string' },
+                },
+                required: ['video'],
+                additionalProperties: false,
+              },
+            },
+            output_project_path: { type: 'string' },
+          },
+          required: ['project_name', 'fps', 'width', 'height', 'scene_duration_s', 'scenes', 'output_project_path'],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+  for (const capability of caps) {
+    if (coveredCaps.has(capability)) continue;
+    addDef(capability, {
+      type: 'function',
+      function: {
+        name: capability.startsWith('mcp.') ? capability : `mcp.${capability}`,
+        description: `Invoke enabled MCP capability ${capability}.`,
+        parameters: {
+          type: 'object',
+          properties: {},
+          additionalProperties: true,
+        },
+      },
+    });
+  }
   return defs;
 }
 
 export function __test_getMcpToolSchema(capabilities = []) {
   return getMcpToolSchema(capabilities);
+}
+
+export async function __test_runOpenAiToolLoop(params = {}) {
+  return runOpenAiToolLoop(params);
+}
+
+export function __test_detectToolCallingSupport(db) {
+  return detectToolCallingSupport(db);
+}
+
+export function __test_extractBrowseQuery(messageText) {
+  return extractBrowseQuery(messageText);
+}
+
+export function __test_evaluateSandboxFsAutoApproval(payload = {}) {
+  return evaluateSandboxFsAutoApproval(payload);
+}
+
+export function __test_isAlexNoApprovalMcpContext(db, payload = {}) {
+  return isAlexNoApprovalMcpContext(db, payload);
+}
+
+export function __test_isMcpBrowseDirective(messageText) {
+  return isMcpBrowseDirective(messageText);
+}
+
+export function __test_detectDirectUrlBrowseIntent(messageText) {
+  return detectDirectUrlBrowseIntent(messageText);
+}
+
+export function __test_detectDirectFileIntent(messageText) {
+  return detectDirectFileIntent(messageText);
+}
+
+export function __test_shouldForceMissionTextMode(messageText) {
+  return shouldForceMissionTextMode(messageText);
+}
+
+export function __test_shouldSkipArtifactVerification(params = {}) {
+  return shouldSkipArtifactVerification(params);
+}
+
+export function __test_validateAlexExecCommand(command, options = {}) {
+  return validateAlexExecCommand(command, options);
+}
+
+export function __test_getAlexExecWhitelistForLevel(level) {
+  return getAlexExecWhitelistForLevel(level);
+}
+
+export function __test_parseWebchatControlCommand(messageText) {
+  return parseWebchatControlCommand(messageText);
+}
+
+export function __test_parseToolCommand(messageText) {
+  return parseToolCommand(messageText);
+}
+
+export function __test_parseStructuredToolInstruction(messageText) {
+  return parseStructuredToolInstruction(messageText);
+}
+
+export function __test_formatLocalActionError(messageText, { sessionId = 'alex-test', db = null, err = null } = {}) {
+  const database = db || getDb();
+  const resolvedErr = err || { message: String(messageText || 'Local action failed') };
+  return formatLocalActionError(database, sessionId, resolvedErr, String(messageText || 'Local action failed'));
+}
+
+export function __test_normalizeToolLoopReply(text, traces = []) {
+  return normalizeToolLoopReply(text, traces);
+}
+
+export function __test_evaluateWebchatTextOnlyInterception(params = {}) {
+  return evaluateWebchatTextOnlyInterception(params);
+}
+
+export async function __test_runMcpBrowseController(db, params = {}) {
+  return runMcpBrowseController(db, params);
+}
+
+export async function __test_executeRegisteredTool(params = {}) {
+  return executeRegisteredTool(params);
 }
 
 
@@ -1956,7 +5557,7 @@ function getOpenAiToolSchema() {
       type: 'function',
       function: {
         name: 'tools.fs.writeFile',
-        description: 'Create or overwrite a text file in workspace/home.',
+        description: 'Create or overwrite a text file in workspace/home. Never use this for binary outputs like .zip/.apk/.aab; build those with proc.exec and then copyPath/movePath.',
         parameters: {
           type: 'object',
           properties: {
@@ -2017,8 +5618,89 @@ function getOpenAiToolSchema() {
     {
       type: 'function',
       function: {
+        name: 'tools.fs.deletePath',
+        description: 'Delete a file or directory path inside the Alex sandbox.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+            recursive: { type: 'boolean' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.copyPath',
+        description: 'Copy a file or directory path inside the Alex sandbox. Use this for existing build artifacts, including binaries.',
+        parameters: {
+          type: 'object',
+          properties: {
+            src: { type: 'string' },
+            dst: { type: 'string' },
+            recursive: { type: 'boolean' },
+            overwrite: { type: 'boolean' },
+          },
+          required: ['src', 'dst'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.movePath',
+        description: 'Move or rename a file or directory path inside the Alex sandbox. Use this for existing build artifacts, including binaries.',
+        parameters: {
+          type: 'object',
+          properties: {
+            src: { type: 'string' },
+            dst: { type: 'string' },
+            overwrite: { type: 'boolean' },
+          },
+          required: ['src', 'dst'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.exists',
+        description: 'Check whether a path exists inside the Alex sandbox.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tools.fs.stat',
+        description: 'Return stat metadata for a path inside the Alex sandbox.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+          },
+          required: ['path'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'tools.proc.exec',
-        description: 'Execute a shell command in a working directory.',
+        description: 'Execute a shell command in a working directory. Use this to build binary artifacts like .zip/.apk/.aab, then verify them with listDir/readFile/stat.',
         parameters: {
           type: 'object',
           properties: {
@@ -2031,7 +5713,200 @@ function getOpenAiToolSchema() {
         },
       },
     },
+    {
+      type: 'function',
+      function: {
+        name: 'memory.write_scratch',
+        description: 'Store a note in today scratch memory for later recall.',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: { type: 'string', description: 'Note content to store.' },
+          },
+          required: ['content'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'memory.read_day',
+        description: 'Read a daily memory scratch, summary, or meta file for a specific YYYY-MM-DD day.',
+        parameters: {
+          type: 'object',
+          properties: {
+            day: { type: 'string', description: 'YYYY-MM-DD' },
+            kind: { type: 'string', enum: ['scratch', 'summary', 'meta'], default: 'scratch' },
+            max_chars: { type: 'integer', default: 12000 },
+          },
+          required: ['day'],
+          additionalProperties: false,
+        },
+      },
+    },
   ];
+}
+
+function resolveRegistryRouteMode(messageText = '', { includeMcp = false } = {}) {
+  const requirement = detectToolRequirement(messageText);
+  if (includeMcp || requirement?.categories?.mcp) return 'mcp';
+  if (requirement?.categories?.fs || requirement?.categories?.memory) return 'tools';
+  return 'direct';
+}
+
+async function runAlexToolsSelfTest(db, { sessionId = 'alex-self-test', workdir = null } = {}) {
+  const root = path.resolve(String(workdir || getWorkdir()));
+  const sandboxRoot = getAlexSandboxRootReal(root);
+  const ts = new Date().toISOString();
+  const registry = getAlexToolRegistryInfo(db, { agentId: 'alex', route: 'tools' });
+  const expectedTools = [
+    'tools.fs.listDir',
+    'tools.fs.readFile',
+    'tools.fs.writeFile',
+    'tools.fs.mkdir',
+    'tools.proc.exec',
+    'memory.write_scratch',
+    'memory.read_day',
+  ];
+  const failures = [];
+  const results = {};
+  const originalAccess = getAlexAccessState(db);
+  const tmpProjectPath = '/home/jamiegrl100/Apps/proworkbench';
+  let tempRoot = db.prepare('SELECT * FROM alex_project_roots WHERE path = ?').get(realpathOrResolve(tmpProjectPath));
+  if (!tempRoot) {
+    tempRoot = createAlexProjectRoot(db, { label: 'Alex Self-Test Project', path: tmpProjectPath, enabled: true, isFavorite: false });
+  }
+  const fileContent = 'hello';
+  const memoryContent = `ok ${ts}`;
+
+  try {
+    results.registry = {
+      ok: expectedTools.every((name) => registry.allowed_tools.includes(name)),
+      allowed_tools: registry.allowed_tools,
+      expected_tools: expectedTools,
+      allowed_roots: registry.allowed_roots,
+      exec_whitelist: registry.exec_whitelist,
+    };
+    if (!results.registry.ok) failures.push({ step: 'registry', error: 'missing_expected_tools' });
+
+    setAlexAccessState(db, { level: 0, ttl_minutes: 30 });
+    try {
+      await executeRegisteredTool({ toolName: 'workspace.write_file', args: { path: 'jobs/_tool_test/l0.txt', content: 'blocked' }, workdir: root, db, sessionId });
+      results.l0 = { ok: false, error: 'write_should_have_been_denied' };
+      failures.push({ step: 'l0', error: 'write_should_have_been_denied' });
+    } catch (e) {
+      results.l0 = { ok: String(e?.code || '') === 'ACCESS_DENIED', error: String(e?.message || e), code: String(e?.code || '') };
+    }
+
+    setAlexAccessState(db, { level: 1, ttl_minutes: 30 });
+    results.l1 = {};
+    results.l1.mkdir = await executeRegisteredTool({ toolName: 'workspace.mkdir', args: { path: 'jobs/_tool_test' }, workdir: root, db, sessionId });
+    results.l1.write = await executeRegisteredTool({ toolName: 'workspace.write_file', args: { path: 'jobs/_tool_test/hello.txt', content: fileContent }, workdir: root, db, sessionId });
+    results.l1.read = await executeRegisteredTool({ toolName: 'workspace.read_file', args: { path: 'jobs/_tool_test/hello.txt' }, workdir: root, db, sessionId });
+    results.l1.list = await executeRegisteredTool({ toolName: 'workspace.list', args: { path: 'jobs/_tool_test' }, workdir: root, db, sessionId });
+    try {
+      await executeRegisteredTool({ toolName: 'workspace.exec_shell', args: { command: 'pwd', cwd: '.' }, workdir: root, db, sessionId });
+      failures.push({ step: 'l1.proc', error: 'exec_should_have_been_denied' });
+      results.l1.exec = { ok: false, error: 'exec_should_have_been_denied' };
+    } catch (e) {
+      results.l1.exec = { ok: String(e?.code || '') === 'ACCESS_DENIED', error: String(e?.message || e), code: String(e?.code || '') };
+    }
+    try {
+      await executeRegisteredTool({ toolName: 'workspace.exec_shell', args: { command: 'pwd && whoami', cwd: '.' }, workdir: root, db, sessionId });
+      failures.push({ step: 'l1.operators', error: 'shell_operators_should_have_been_denied' });
+      results.l1.operators = { ok: false, error: 'shell_operators_should_have_been_denied' };
+    } catch (e) {
+      results.l1.operators = { ok: String(e?.detail?.reason || e?.message || '').includes('proc_exec_disabled_for_level') || String(e?.detail?.reason || '') === 'shell_operators_blocked', error: String(e?.message || e), code: String(e?.code || ''), reason: String(e?.detail?.reason || '') };
+    }
+
+    setAlexAccessState(db, { level: 2, ttl_minutes: 0 });
+    results.l2 = {};
+    results.l2.npm = await executeRegisteredTool({ toolName: 'workspace.exec_shell', args: { command: 'npm --version', cwd: '.' }, workdir: root, db, sessionId });
+    results.l2.operators = await executeRegisteredTool({ toolName: 'workspace.exec_shell', args: { command: 'pwd && whoami && ls -la', cwd: '.' }, workdir: root, db, sessionId });
+    results.l2.pipe = await executeRegisteredTool({ toolName: 'workspace.exec_shell', args: { command: 'echo ok | head -n 1', cwd: '.' }, workdir: root, db, sessionId });
+    results.l2.redirect = await executeRegisteredTool({ toolName: 'workspace.exec_shell', args: { command: 'echo "hello" > jobs/_tool_test/shell_out.txt && cat jobs/_tool_test/shell_out.txt', cwd: '.' }, workdir: root, db, sessionId });
+    try {
+      await executeRegisteredTool({ toolName: 'workspace.exec_shell', args: { command: 'curl https://example.com', cwd: '.' }, workdir: root, db, sessionId });
+      failures.push({ step: 'l2.curl', error: 'curl_should_have_been_denied' });
+      results.l2.curl = { ok: false, error: 'curl_should_have_been_denied' };
+    } catch (e) {
+      results.l2.curl = { ok: String(e?.code || '') === 'ACCESS_DENIED', error: String(e?.message || e), code: String(e?.code || '') };
+    }
+    const l2Loop = await runOpenAiToolLoop({
+      db,
+      message: 'Run this exact shell command in the sandbox and show the output: pwd && whoami && ls -la',
+      systemText: 'You are Alex. Use tools to execute local shell commands in the sandbox.',
+      sessionId,
+      agentId: 'alex',
+      reqSignal: null,
+      workdir: root,
+      intent: 'local_action',
+    });
+    results.l2.webchat_style = {
+      ok: Boolean(l2Loop?.ok),
+      error: l2Loop?.error || null,
+      reason: l2Loop?.reason || null,
+      traces_count: Array.isArray(l2Loop?.traces) ? l2Loop.traces.length : 0,
+    };
+    if (!l2Loop?.ok) failures.push({ step: 'l2.webchat_style', error: String(l2Loop?.error || 'unknown') });
+    if (String(l2Loop?.error || '') === 'TOOL_REQUIRED_NO_TRACES') failures.push({ step: 'l2.webchat_style', error: 'TOOL_REQUIRED_NO_TRACES' });
+    if (Array.isArray(l2Loop?.traces) && l2Loop.traces.some((trace) => String(trace?.error || '').includes('APPROVAL'))) {
+      failures.push({ step: 'l2.webchat_style', error: 'approval_detected' });
+    }
+
+    setAlexAccessState(db, { level: 3, project_root_id: tempRoot.id, ttl_minutes: 30 });
+    const allowedProjectFile = path.join(tempRoot.path, 'selftest.txt');
+    const deniedOutsidePath = path.join('/tmp', `alex-selftest-${Date.now()}.txt`);
+    results.l3 = {};
+    results.l3.projectWrite = await executeRegisteredTool({ toolName: 'workspace.write_file', args: { path: allowedProjectFile, content: 'project-ok' }, workdir: root, db, sessionId });
+    try {
+      await executeRegisteredTool({ toolName: 'workspace.write_file', args: { path: deniedOutsidePath, content: 'blocked' }, workdir: root, db, sessionId });
+      failures.push({ step: 'l3.outside', error: 'outside_write_should_have_been_denied' });
+      results.l3.outside = { ok: false, error: 'outside_write_should_have_been_denied' };
+    } catch (e) {
+      results.l3.outside = { ok: String(e?.code || '') === 'ACCESS_DENIED', error: String(e?.message || e), code: String(e?.code || '') };
+    }
+
+    setAlexAccessState(db, { level: 1, ttl_minutes: 30 });
+    results.memoryWrite = await executeRegisteredTool({ toolName: 'memory.write_scratch', args: { content: memoryContent }, workdir: root, db, sessionId });
+    results.memoryReadDay = await executeRegisteredTool({
+      toolName: 'memory.read_day',
+      args: { day: getLocalDayKey(), kind: 'scratch', max_chars: 200000 },
+      workdir: root,
+      db,
+      sessionId,
+    });
+    const memoryRow = db.prepare(`
+      SELECT id, state, day, content, committed_at
+      FROM memory_entries
+      WHERE content = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(memoryContent);
+    results.memoryVerify = { ok: Boolean(memoryRow), row: memoryRow || null };
+    if (!memoryRow) failures.push({ step: 'memoryWrite', error: 'memory_row_missing' });
+    if (!String(results.memoryReadDay?.result?.content || '').includes(memoryContent)) {
+      failures.push({ step: 'memoryReadDay', error: 'scratch_content_missing' });
+    }
+  } finally {
+    setAlexAccessStateRaw(db, { ...originalAccess, updated_at_ms: nowMs() });
+  }
+
+  return {
+    ok: failures.length === 0,
+    results,
+    failures,
+    environment: {
+      approvals_enabled: approvalsAreEnabled(),
+      alex_approvals_enabled: alexApprovalsEnabled(),
+      access: resolveAlexAccessContext(db),
+      sandbox_root: sandboxRoot,
+      workdir: root,
+      session_id: sessionId,
+      timestamp: ts,
+    },
+  };
 }
 
 const ACCESS_MODES = ['blocked', 'allowed', 'allowed_with_approval'];
@@ -2217,6 +6092,136 @@ function getAllowedRootsReal() {
   };
 }
 
+const SAFE_SANDBOX_FS_TOOLS = new Set([
+  'workspace.list',
+  'workspace.list_dir',
+  'workspace.read_file',
+  'workspace.mkdir',
+  'workspace.write_file',
+]);
+
+function isAlexAutoApproveSandboxFsEnabled() {
+  const raw = String(process.env.ALEX_AUTO_APPROVE_SANDBOX_FS || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+function normalizeSafeFsToolName(toolName) {
+  const t = normalizeToolName(String(toolName || '').trim());
+  if (t === 'workspace.list_dir') return 'workspace.list';
+  return t;
+}
+
+function isWithinRootByRealpath(targetPath, rootPath) {
+  const rootResolved = path.resolve(String(rootPath || '.'));
+  let rootReal = rootResolved;
+  try { rootReal = fs.realpathSync.native(rootResolved); } catch {}
+
+  const targetResolved = path.resolve(String(targetPath || '.'));
+  let checkReal = targetResolved;
+  try {
+    checkReal = fs.realpathSync.native(targetResolved);
+  } catch {
+    const parent = path.dirname(targetResolved);
+    try { checkReal = fs.realpathSync.native(parent); } catch { checkReal = parent; }
+  }
+
+  const rel = path.relative(rootReal, checkReal);
+  if (rel === '' || rel === '.') return true;
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function evaluateSandboxFsAutoApproval({ toolName, args = {}, workdir = null }) {
+  const normalizedTool = normalizeSafeFsToolName(toolName);
+  if (!SAFE_SANDBOX_FS_TOOLS.has(normalizedTool)) {
+    return { enabled: isAlexAutoApproveSandboxFsEnabled(), autoApproved: false, reason: 'tool_not_eligible', toolName: normalizedTool };
+  }
+  if (!isAlexAutoApproveSandboxFsEnabled()) {
+    return { enabled: false, autoApproved: false, reason: 'feature_disabled', toolName: normalizedTool };
+  }
+
+  const baseWorkdir = path.resolve(String(workdir || getWorkdir()));
+  const sandboxRoot = getAlexSandboxRoot(baseWorkdir);
+  const requestedPath = String(
+    args?.path ??
+    args?.file ??
+    args?.directory ??
+    '.'
+  ).trim() || '.';
+
+  let resolved = '';
+  try {
+    resolved = resolveInWorkdir(sandboxRoot, requestedPath, { allowAbsolute: false });
+  } catch (e) {
+    return {
+      enabled: true,
+      autoApproved: false,
+      reason: 'path_blocked',
+      toolName: normalizedTool,
+      sandboxRoot,
+      requestedPath,
+      error: String(e?.message || e),
+    };
+  }
+
+  if (!isWithinRootByRealpath(resolved, sandboxRoot)) {
+    return {
+      enabled: true,
+      autoApproved: false,
+      reason: 'realpath_outside_sandbox',
+      toolName: normalizedTool,
+      sandboxRoot,
+      requestedPath,
+      resolvedPath: resolved,
+    };
+  }
+
+  return {
+    enabled: true,
+    autoApproved: true,
+    reason: 'inside_sandbox',
+    toolName: normalizedTool,
+    sandboxRoot,
+    requestedPath,
+    resolvedPath: resolved,
+  };
+}
+
+function shouldBypassAlexApproval(db, { sessionId, toolName, args = {}, workdir = null } = {}) {
+  if (alexApprovalsEnabled()) return { bypass: false, reason: 'alex_approvals_enabled' };
+  if (!isAlexSession(db, sessionId)) return { bypass: false, reason: 'not_alex_session' };
+  const normalizedTool = normalizeToolName(toolName);
+  const accessContext = buildAlexToolAccessContext(db, sessionId, workdir);
+  if (normalizedTool === 'memory.write_scratch' || normalizedTool === 'memory.append') {
+    return { bypass: true, reason: 'alex_memory_no_approval' };
+  }
+  if (normalizedTool === 'memory.read_day') {
+    return { bypass: true, reason: 'alex_memory_read_no_approval' };
+  }
+  if (normalizedTool === 'workspace.exec_shell') {
+    try {
+      const cwd = resolveAlexPathInAllowedRoots(args?.cwd || '.', { roots: accessContext.allowed_roots, defaultRoot: accessContext.sandbox_root });
+      const verdict = validateAlexExecCommand(args?.command || args?.input || '', { cwd, allowedRoots: accessContext.allowed_roots, level: accessContext.level });
+      if (!verdict.ok) return { bypass: false, reason: verdict.reason, error: verdict.hint, sandboxRoot: accessContext.sandbox_root };
+      return { bypass: true, reason: 'alex_exec_no_approval', sandboxRoot: accessContext.sandbox_root, resolvedPath: cwd };
+    } catch (e) {
+      return { bypass: false, reason: 'alex_exec_path_blocked', error: String(e?.message || e), sandboxRoot: accessContext.sandbox_root };
+    }
+  }
+  try {
+    if (String(normalizedTool || '').startsWith('workspace.')) {
+      if (getAlexFsPermission(accessContext.level, normalizedTool)) {
+        const pathArg = args?.path ?? args?.src ?? args?.dst ?? '.';
+        const resolvedPath = resolveAlexPathInAllowedRoots(pathArg, { roots: accessContext.allowed_roots, defaultRoot: accessContext.sandbox_root });
+        return { bypass: true, reason: 'alex_allowed_root_tool_no_approval', sandboxRoot: accessContext.sandbox_root, resolvedPath };
+      }
+      return { bypass: false, reason: 'alex_level_blocks_tool', level: accessContext.level };
+    }
+  } catch (e) {
+    return { bypass: false, reason: 'alex_path_blocked', error: String(e?.message || e), sandboxRoot: accessContext.sandbox_root };
+  }
+  return { bypass: false, reason: 'not_eligible' };
+}
+
 function resolveTargetPathForPolicy(rawPath, workspaceRoot = null) {
   const root = workspaceRoot ? path.resolve(String(workspaceRoot)) : getWorkspaceRootReal();
   return resolveFilesystemTarget(root, rawPath);
@@ -2380,6 +6385,7 @@ function insertCapabilityGrant(db, grant) {
 }
 
 function insertApprovalRequestRecord(db, rec) {
+  if (!approvalsAreEnabled()) return null;
   if (!hasTable(db, 'approval_requests')) return null;
   const id = newId('areq');
   db.prepare(`
@@ -2413,8 +6419,8 @@ function evaluateTieredAccess(db, { toolDef, toolName, args, sessionId, messageI
   const jobId = proposalJobId(sessionId, messageId);
   const payload = args && typeof args === 'object' ? args : {};
 
-  if (isBareBonesMode()) {
-    return { allowed: true, requiresApproval: false, mode: 'allowed', tier: 'A', reason: 'BARE_BONES_MODE: approvals disabled.', jobId, grant: null };
+  if (isBareBonesMode() || !approvalsAreEnabled()) {
+    return { allowed: true, requiresApproval: false, mode: 'allowed', tier: 'A', reason: 'Approvals disabled.', jobId, grant: null };
   }
 
   const actionFor = (key) => {
@@ -2575,6 +6581,14 @@ function effectiveAccessForTool(policy, toolDef) {
     };
   }
   if (String(toolDef?.id || '') === 'memory.apply_durable_patch') {
+    if (!approvalsAreEnabled()) {
+      return {
+        allowed: true,
+        requiresApproval: false,
+        mode: 'allowed',
+        reason: 'Approvals disabled',
+      };
+    }
     return {
       allowed: true,
       requiresApproval: true,
@@ -2591,7 +6605,7 @@ function effectiveAccessForTool(policy, toolDef) {
   mode = normalizeAccessMode(perTool[toolDef.id]) || mode;
 
   // Certain tools are always approval-gated when allowed.
-  if (mode === 'allowed' && toolDef?.requiresApproval) mode = 'allowed_with_approval';
+  if (approvalsAreEnabled() && mode === 'allowed' && toolDef?.requiresApproval) mode = 'allowed_with_approval';
 
   const requiresApproval = mode === 'allowed_with_approval';
   const allowed = mode === 'allowed' || requiresApproval;
@@ -2600,7 +6614,116 @@ function effectiveAccessForTool(policy, toolDef) {
 }
 
 async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, signal = null }) {
-  const toDisplayPath = (absPath) => (isInsideWorkspaceRoot(absPath) ? (path.relative(workdir, absPath) || '.') : absPath);
+  const accessContext = buildAlexToolAccessContext(db, sessionId, workdir);
+  const alexFsRoot = accessContext.sandbox_root || getAlexSandboxRoot(workdir);
+  const liveToolName = toLiveToolName(toolName);
+  const liveArgs = sanitizeLiveArgs(args);
+  const completeTool = (out) => {
+    ingestAtlasToolResult(sessionId, toolName, args, out, true);
+    publishSessionLiveEvent(sessionId, {
+      type: 'tool.end',
+      tool: liveToolName,
+      args: liveArgs,
+      ...buildLiveToolEndPayload(toolName, out),
+    });
+    return out;
+  };
+  const failTool = (err) => {
+    ingestAtlasToolResult(sessionId, toolName, args, {
+      stdout: '',
+      stderr: String(err?.detail?.stderr || err?.message || err || ''),
+      detail: err?.detail || null,
+      result: null,
+    }, false);
+    const payload = buildLiveToolErrorPayload(err);
+    publishSessionLiveEvent(sessionId, {
+      type: 'error',
+      tool: liveToolName,
+      args: liveArgs,
+      ...payload,
+    });
+    publishSessionLiveEvent(sessionId, {
+      type: 'tool.end',
+      tool: liveToolName,
+      args: liveArgs,
+      ...payload,
+    });
+    throw err;
+  };
+  publishSessionLiveEvent(sessionId, {
+    type: 'status',
+    message: `Calling tool ${liveToolName}`,
+    tool: liveToolName,
+    args: liveArgs,
+  });
+  publishSessionLiveEvent(sessionId, {
+    type: 'tool.start',
+    tool: liveToolName,
+    args: liveArgs,
+    message: `Starting ${liveToolName}`,
+  });
+  const resolveFsPath = (userPath) => {
+    try {
+      const roots = accessContext.allowed_roots || [alexFsRoot];
+      const resolved = accessContext.is_alex
+        ? resolveAlexPathInAllowedRoots(userPath, { roots, defaultRoot: alexFsRoot })
+        : resolveInWorkdir(alexFsRoot, userPath, { allowAbsolute: false });
+      const insideAllowed = accessContext.is_alex
+        ? isPathWithinAnyRoot(resolved, roots)
+        : (() => {
+            const containment = inspectPathContainment(alexFsRoot, resolved);
+            return containment.inside && !containment.escapedBySymlink;
+          })();
+      if (!insideAllowed) {
+        const err = new Error('Resolved path is outside the allowed Alex roots.');
+        err.code = accessContext.is_alex ? 'ACCESS_DENIED' : 'SANDBOX_VIOLATION';
+        err.detail = {
+          ok: false,
+          error: err.code,
+          reason: accessContext.is_alex ? 'path_outside_allowed_roots' : 'sandbox_violation',
+          allowed_roots: roots,
+        };
+        throw err;
+      }
+      return resolved;
+    } catch (err) {
+      if (err && ['WORKSPACE_ABSOLUTE_DISALLOWED', 'WORKSPACE_PATH_TRAVERSAL', 'WORKSPACE_ESCAPE'].includes(String(err.code || ''))) {
+        const wrapped = new Error(String(err.message || 'Path is outside the Alex sandbox.'));
+        wrapped.code = accessContext.is_alex ? 'ACCESS_DENIED' : 'SANDBOX_VIOLATION';
+        wrapped.detail = {
+          ok: false,
+          error: wrapped.code,
+          reason: 'path_outside_allowed_roots',
+          allowed_roots: accessContext.allowed_roots || [alexFsRoot],
+        };
+        throw wrapped;
+      }
+      throw err;
+    }
+  };
+  const toDisplayPath = (absPath) => (isInsideWorkspaceRoot(absPath) ? (path.relative(alexFsRoot, absPath) || '.') : absPath);
+  const fileKind = (stat) => (stat?.isDirectory?.() ? 'dir' : (stat?.isFile?.() ? 'file' : 'other'));
+  const logFsAction = (action, payload) => {
+    console.log(`[alex.fs.${action}] ${JSON.stringify({ ts: new Date().toISOString(), ...payload })}`);
+  };
+  const ensureTargetParent = async (target) => {
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+  };
+  const copyRecursive = async (src, dst, overwrite) => {
+    const srcStat = await fsp.stat(src);
+    if (srcStat.isDirectory()) {
+      await fsp.mkdir(dst, { recursive: true });
+      const entries = await fsp.readdir(src, { withFileTypes: true });
+      for (const entry of entries) {
+        await copyRecursive(path.join(src, entry.name), path.join(dst, entry.name), overwrite);
+      }
+      return srcStat;
+    }
+    await ensureTargetParent(dst);
+    await fsp.copyFile(src, dst, overwrite ? 0 : fs.constants.COPYFILE_EXCL);
+    return srcStat;
+  };
+  try {
   if (toolName === 'system.echo') {
     return {
       stdout: String(args?.text || args?.input || ''),
@@ -2611,52 +6734,64 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
   }
 
   if (toolName === 'workspace.list') {
-    const dir = resolveWorkspacePath(workdir, args?.path || '.');
+    validateWorkspaceToolPathInput(args?.path || '.');
+    ensureAlexFsToolAllowed(accessContext, toolName, args?.path || '.');
+    const dir = resolveFsPath(args?.path || '.');
     const entries = await fsp.readdir(dir, { withFileTypes: true });
     const items = entries.slice(0, 500).map((e) => ({ name: e.name, type: e.isDirectory() ? 'dir' : 'file' }));
-    return {
+    return completeTool({
       stdout: `Listed ${items.length} entries`,
       stderr: '',
       result: { path: toDisplayPath(dir), abs_path: dir, items },
       artifacts: [],
-    };
+    });
   }
 
   if (toolName === 'workspace.read_file') {
-    const file = resolveWorkspacePath(workdir, args?.path);
+    validateWorkspaceToolPathInput(args?.path);
+    ensureAlexFsToolAllowed(accessContext, toolName, args?.path);
+    const file = resolveFsPath(args?.path);
     const maxBytes = Math.max(1024, Math.min(Number(args?.maxBytes || 65536), 1024 * 1024));
     const text = await fsp.readFile(file, 'utf8');
     const sliced = text.length > maxBytes ? `${text.slice(0, maxBytes)}\n...[truncated]` : text;
-    return {
+    return completeTool({
       stdout: `Read ${Math.min(text.length, maxBytes)} bytes`,
       stderr: '',
       result: { path: toDisplayPath(file), abs_path: file, content: sliced, truncated: text.length > maxBytes },
       artifacts: [],
-    };
+    });
   }
 
   if (toolName === 'workspace.write_file') {
-    const file = resolveWorkspacePath(workdir, args?.path);
+    const validatedPath = validateWorkspaceToolPathInput(args?.path);
+    const ext = path.extname(path.basename(validatedPath)).toLowerCase();
+    if (isBinaryWriteExtension(ext) || (ext && !WORKSPACE_TEXT_WRITE_EXT_ALLOWLIST.has(ext))) {
+      throw binaryWriteBlockedError(validatedPath, args?.content);
+    }
+    ensureAlexFsToolAllowed(accessContext, toolName, validatedPath);
+    const file = resolveFsPath(validatedPath);
     const content = String(args?.content ?? '');
     await fsp.mkdir(path.dirname(file), { recursive: true });
     await fsp.writeFile(file, content, 'utf8');
-    return {
+    return completeTool({
       stdout: `Wrote ${Buffer.byteLength(content, 'utf8')} bytes`,
       stderr: '',
       result: { path: toDisplayPath(file), abs_path: file, bytes: Buffer.byteLength(content, 'utf8') },
       artifacts: [{ type: 'file', path: toDisplayPath(file) }],
-    };
+    });
   }
 
   if (toolName === 'workspace.mkdir') {
-    const dir = resolveWorkspacePath(workdir, args?.path || '.');
+    validateWorkspaceToolPathInput(args?.path || '.');
+    ensureAlexFsToolAllowed(accessContext, toolName, args?.path || '.');
+    const dir = resolveFsPath(args?.path || '.');
     await fsp.mkdir(dir, { recursive: true });
-    return {
-      stdout: `Created directory ${path.relative(workdir, dir) || '.'}`,
+    return completeTool({
+      stdout: `Created directory ${path.relative(alexFsRoot, dir) || '.'}`,
       stderr: '',
-      result: { path: path.relative(workdir, dir) || '.', created: true },
-      artifacts: [{ type: 'dir', path: path.relative(workdir, dir) || '.' }],
-    };
+      result: { path: path.relative(alexFsRoot, dir) || '.', abs_path: dir, created: true },
+      artifacts: [{ type: 'dir', path: path.relative(alexFsRoot, dir) || '.' }],
+    });
   }
 
   if (toolName === 'workspace.exec_shell') {
@@ -2666,16 +6801,49 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
       err.code = 'EXEC_COMMAND_REQUIRED';
       throw err;
     }
-    const cwd = resolveWorkspacePath(workdir, args?.cwd || '.');
+    const cwd = accessContext.is_alex
+      ? resolveAlexPathInAllowedRoots(args?.cwd || '.', { roots: accessContext.allowed_roots, defaultRoot: alexFsRoot })
+      : resolveFsPath(args?.cwd || '.');
+    const execMode = accessContext.is_alex ? getAlexExecMode(accessContext.level) : 'argv';
+    let audit = {
+      agent_id: accessContext.is_alex ? 'alex' : 'unknown',
+      level: accessContext.level,
+      exec_mode: execMode,
+      abs_cwd: cwd,
+      raw_command: command,
+      exit_code: null,
+      stdout_preview: '',
+      stderr_preview: '',
+    };
+    if (accessContext.is_alex) {
+      const verdict = validateAlexExecCommand(command, { cwd, allowedRoots: accessContext.allowed_roots, level: accessContext.level, execMode });
+      if (!verdict.ok) {
+        recordEvent(db, 'alex.exec.run', { ...audit, error: verdict.reason, hint: verdict.hint });
+        throw accessDeniedError(verdict.reason, { command, level: accessContext.level, exec_mode: execMode }, verdict.hint);
+      }
+    } else if (/[\n\r;&|><`]/.test(command)) {
+      const err = new Error('Run a single command without shell operators.');
+      err.code = 'ACCESS_DENIED';
+      err.detail = { ok: false, error: 'ACCESS_DENIED', reason: 'shell_operators_blocked' };
+      throw err;
+    } else if (/(^|[\s'"])~\/|(^|[\s'"])\.\.(?:\/|\\|$)|(^|[\s'"])\/(?!home\/jamiegrl100\/\.proworkbench\/workspaces\/alex\/workspaces\/alex(?:\/|$))/i.test(command)) {
+      const err = new Error('Command references a path outside the Alex sandbox.');
+      err.code = 'SANDBOX_VIOLATION';
+      throw err;
+    }
     const timeoutMs = Math.max(1000, Math.min(Number(args?.timeoutMs || 120000) || 120000, 900000));
     const shell = process.env.SHELL || '/bin/bash';
     const started = Date.now();
 
-    const out = await new Promise((resolve, reject) => {
+    try {
+      const out = await new Promise((resolve, reject) => {
       let stdout = '';
       let stderr = '';
       let settled = false;
-      const child = spawn(shell, ['-lc', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      const tokens = tokenizeShellCommand(command).map(stripTokenQuotes).filter(Boolean);
+      const child = accessContext.is_alex && execMode === 'shell'
+        ? spawn(shell, ['-lc', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+        : spawn(String(tokens[0] || command), tokens.slice(1), { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
 
       const done = (fn, val) => {
         if (settled) return;
@@ -2701,8 +6869,28 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
         else signal.addEventListener('abort', onAbort, { once: true });
       }
 
-      child.stdout.on('data', (d) => { stdout += String(d || ''); if (stdout.length > 500000) stdout = stdout.slice(-500000); });
-      child.stderr.on('data', (d) => { stderr += String(d || ''); if (stderr.length > 500000) stderr = stderr.slice(-500000); });
+      child.stdout.on('data', (d) => {
+        const chunk = String(d || '');
+        stdout += chunk;
+        if (stdout.length > 500000) stdout = stdout.slice(-500000);
+        publishSessionLiveEvent(sessionId, {
+          type: 'proc.stdout',
+          tool: liveToolName,
+          args: liveArgs,
+          stdout: chunk,
+        }, { buffer: true });
+      });
+      child.stderr.on('data', (d) => {
+        const chunk = String(d || '');
+        stderr += chunk;
+        if (stderr.length > 500000) stderr = stderr.slice(-500000);
+        publishSessionLiveEvent(sessionId, {
+          type: 'proc.stderr',
+          tool: liveToolName,
+          args: liveArgs,
+          stderr: chunk,
+        }, { buffer: true });
+      });
       child.on('error', (e) => done(reject, e));
       child.on('close', (code, sig) => {
         if (signal) signal.removeEventListener('abort', onAbort);
@@ -2713,26 +6901,46 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
         err.detail = { code, signal: sig, stdout: stdout.slice(-2000), stderr: stderr.slice(-2000) };
         done(reject, err);
       });
-    });
-
-    return {
-      stdout: String(out.stdout || ''),
-      stderr: String(out.stderr || ''),
-      result: {
-        cwd: toDisplayPath(cwd),
-        abs_cwd: cwd,
-        command,
-        duration_ms: Date.now() - started,
+      });
+      audit = {
+        ...audit,
         exit_code: Number(out.code || 0),
-      },
-      artifacts: [],
-    };
+        stdout_preview: previewText(out.stdout || ''),
+        stderr_preview: previewText(out.stderr || ''),
+      };
+      recordEvent(db, 'alex.exec.run', audit);
+      return completeTool({
+        stdout: String(out.stdout || ''),
+        stderr: String(out.stderr || ''),
+        result: {
+          cwd: toDisplayPath(cwd),
+          abs_cwd: cwd,
+          command,
+          exec_mode: execMode,
+          duration_ms: Date.now() - started,
+          exit_code: Number(out.code || 0),
+        },
+        artifacts: [],
+      });
+    } catch (e) {
+      audit = {
+        ...audit,
+        exit_code: Number(e?.detail?.code ?? -1),
+        stdout_preview: previewText(e?.detail?.stdout || ''),
+        stderr_preview: previewText(e?.detail?.stderr || String(e?.message || e)),
+      };
+      recordEvent(db, 'alex.exec.run', { ...audit, error: String(e?.code || e?.message || e) });
+      throw e;
+    }
   }
 
   if (toolName === 'workspace.delete') {
-    const target = resolveWorkspacePath(workdir, args?.path);
+    validateWorkspaceToolPathInput(args?.path);
+    ensureAlexFsToolAllowed(accessContext, toolName, args?.path);
+    const target = resolveFsPath(args?.path);
     const rel = toDisplayPath(target);
-    if (target === getWorkspaceRootReal()) {
+    const recursive = Boolean(args?.recursive);
+    if (target === alexFsRoot) {
       const err = new Error('Deleting workspace root is not allowed.');
       err.code = 'WORKSPACE_DELETE_ROOT';
       throw err;
@@ -2743,11 +6951,149 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
       err.code = 'WORKSPACE_DELETE_MISSING';
       throw err;
     }
-    await fsp.rm(target, { recursive: true, force: false });
+    if (stat.isDirectory() && !recursive) {
+      const err = new Error('Target is a directory; recursive=true is required.');
+      err.code = 'WORKSPACE_DELETE_RECURSIVE_REQUIRED';
+      throw err;
+    }
+    logFsAction('delete', { abs_path: target, kind: fileKind(stat), recursive });
+    await fsp.rm(target, { recursive, force: false });
     return {
       stdout: `Deleted ${stat.isDirectory() ? 'directory' : 'file'} ${rel}`,
       stderr: '',
-      result: { path: rel, abs_path: target, kind: stat.isDirectory() ? 'dir' : 'file', deleted: true },
+      result: { ok: true, path: rel, abs_path: target, kind: stat.isDirectory() ? 'dir' : 'file', deleted: true, recursive },
+      artifacts: [],
+    };
+  }
+
+  if (toolName === 'workspace.copy_path') {
+    const srcInput = validateWorkspaceToolPathInput(args?.src);
+    const dstInput = validateWorkspaceToolPathInput(args?.dst);
+    ensureAlexFsToolAllowed(accessContext, toolName, srcInput);
+    const src = resolveFsPath(srcInput);
+    const dst = resolveFsPath(dstInput);
+    const recursive = Boolean(args?.recursive);
+    const overwrite = Boolean(args?.overwrite);
+    const stat = await fsp.stat(src).catch(() => null);
+    if (!stat) {
+      const err = new Error(`Source not found: ${toDisplayPath(src)}`);
+      err.code = 'WORKSPACE_COPY_MISSING';
+      throw err;
+    }
+    if (stat.isDirectory() && !recursive) {
+      const err = new Error('Source is a directory; recursive=true is required.');
+      err.code = 'WORKSPACE_COPY_RECURSIVE_REQUIRED';
+      throw err;
+    }
+    if (!overwrite) {
+      const existing = await fsp.stat(dst).catch(() => null);
+      if (existing) {
+        const err = new Error(`Destination exists: ${toDisplayPath(dst)}`);
+        err.code = 'WORKSPACE_COPY_EXISTS';
+        throw err;
+      }
+    }
+    logFsAction('copy', { src_abs_path: src, dst_abs_path: dst, kind: fileKind(stat), recursive, overwrite });
+    await copyRecursive(src, dst, overwrite);
+    return {
+      stdout: `Copied ${fileKind(stat)} ${toDisplayPath(src)} -> ${toDisplayPath(dst)}`,
+      stderr: '',
+      result: {
+        ok: true,
+        src_path: toDisplayPath(src),
+        src_abs_path: src,
+        dst_path: toDisplayPath(dst),
+        dst_abs_path: dst,
+        recursive,
+        overwrite,
+        copied: true,
+        type: fileKind(stat),
+      },
+      artifacts: [{ type: fileKind(stat), path: toDisplayPath(dst) }],
+    };
+  }
+
+  if (toolName === 'workspace.move_path') {
+    const srcInput = validateWorkspaceToolPathInput(args?.src);
+    const dstInput = validateWorkspaceToolPathInput(args?.dst);
+    ensureAlexFsToolAllowed(accessContext, toolName, srcInput);
+    const src = resolveFsPath(srcInput);
+    const dst = resolveFsPath(dstInput);
+    const overwrite = Boolean(args?.overwrite);
+    const stat = await fsp.stat(src).catch(() => null);
+    if (!stat) {
+      const err = new Error(`Source not found: ${toDisplayPath(src)}`);
+      err.code = 'WORKSPACE_MOVE_MISSING';
+      throw err;
+    }
+    const existing = await fsp.stat(dst).catch(() => null);
+    if (existing && !overwrite) {
+      const err = new Error(`Destination exists: ${toDisplayPath(dst)}`);
+      err.code = 'WORKSPACE_MOVE_EXISTS';
+      throw err;
+    }
+    await ensureTargetParent(dst);
+    if (existing) await fsp.rm(dst, { recursive: true, force: false });
+    logFsAction('move', { src_abs_path: src, dst_abs_path: dst, kind: fileKind(stat), overwrite });
+    await fsp.rename(src, dst);
+    return {
+      stdout: `Moved ${fileKind(stat)} ${toDisplayPath(src)} -> ${toDisplayPath(dst)}`,
+      stderr: '',
+      result: {
+        ok: true,
+        src_path: toDisplayPath(src),
+        src_abs_path: src,
+        dst_path: toDisplayPath(dst),
+        dst_abs_path: dst,
+        overwrite,
+        moved: true,
+        type: fileKind(stat),
+      },
+      artifacts: [{ type: fileKind(stat), path: toDisplayPath(dst) }],
+    };
+  }
+
+  if (toolName === 'workspace.exists') {
+    ensureAlexFsToolAllowed(accessContext, toolName, args?.path);
+    const target = resolveFsPath(args?.path);
+    const stat = await fsp.stat(target).catch(() => null);
+    return {
+      stdout: stat ? `Path exists: ${toDisplayPath(target)}` : `Path missing: ${toDisplayPath(target)}`,
+      stderr: '',
+      result: {
+        ok: true,
+        path: toDisplayPath(target),
+        abs_path: target,
+        exists: Boolean(stat),
+        type: stat ? fileKind(stat) : null,
+      },
+      artifacts: [],
+    };
+  }
+
+  if (toolName === 'workspace.stat') {
+    ensureAlexFsToolAllowed(accessContext, toolName, args?.path);
+    const target = resolveFsPath(args?.path);
+    const stat = await fsp.stat(target).catch(() => null);
+    if (!stat) {
+      const err = new Error(`Path not found: ${toDisplayPath(target)}`);
+      err.code = 'WORKSPACE_STAT_MISSING';
+      throw err;
+    }
+    return {
+      stdout: `Stat ${toDisplayPath(target)}`,
+      stderr: '',
+      result: {
+        ok: true,
+        path: toDisplayPath(target),
+        abs_path: target,
+        type: fileKind(stat),
+        size_bytes: Number(stat.size || 0),
+        mtime_iso: stat.mtime instanceof Date ? stat.mtime.toISOString() : null,
+        mode: stat.mode,
+        owner: stat.uid,
+        group: stat.gid,
+      },
       artifacts: [],
     };
   }
@@ -2869,6 +7215,56 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
     const day = String(args?.day || getLocalDayKey());
     const text = String(args?.text ?? args?.content ?? '');
     const sid = String(sessionId || args?.session_id || 'webchat-default').trim() || 'webchat-default';
+    await appendScratchSafe(text, { day, root: workdir });
+    if (!alexApprovalsEnabled() && isAlexSession(db, sid)) {
+      const ts = nowIso();
+      const info = db.prepare(`
+        INSERT INTO memory_entries
+          (ts, day, kind, content, meta_json, state, committed_at, title, tags_json, source_session_id, workspace_id)
+        VALUES (?, ?, 'note', ?, ?, 'committed', ?, ?, ?, ?, ?)
+      `).run(
+        ts,
+        day,
+        text,
+        JSON.stringify({ day, via: 'alex_tool', approvals_disabled: true }),
+        ts,
+        String(args?.title || '').trim() || null,
+        JSON.stringify(Array.isArray(args?.tags) ? args.tags : []),
+        sid,
+        workdir,
+      );
+      try {
+        db.prepare(`
+          INSERT OR IGNORE INTO memory_archive
+            (memory_entry_id, ts, day, kind, content, title, tags_json, source_session_id, workspace_id, meta_json, committed_at)
+          VALUES (?, ?, ?, 'note', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          Number(info.lastInsertRowid || 0),
+          ts,
+          day,
+          text,
+          String(args?.title || '').trim() || null,
+          JSON.stringify(Array.isArray(args?.tags) ? args.tags : []),
+          sid,
+          workdir,
+          JSON.stringify({ day, via: 'alex_tool', approvals_disabled: true }),
+          ts,
+        );
+      } catch {}
+      recordEvent(db, 'memory.committed_immediately', { id: Number(info.lastInsertRowid || 0), day, via: 'alex_tool', session_id: sid });
+    return completeTool({
+      stdout: `Committed memory for ${day}.`,
+      stderr: '',
+      result: {
+          verified: true,
+          state: 'committed',
+          memory_entry_id: Number(info.lastInsertRowid || 0),
+          day,
+          message: 'Saved and committed immediately.',
+        },
+        artifacts: [],
+      });
+    }
     const draft = createMemoryDraft(db, {
       content: text,
       kind: 'note',
@@ -2879,7 +7275,7 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
       meta: { day, via: 'tool' },
     });
     recordEvent(db, 'memory.draft_created', { id: draft.id, day, via: 'tool', session_id: sid });
-    return {
+    return completeTool({
       stdout: `Saved as draft memory for ${day}. Commit required before archive/search/context use.`,
       stderr: '',
       result: {
@@ -2888,9 +7284,9 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
         draft_id: draft.id,
         day,
         message: 'Saved as draft. You can commit it from Memory panel or close guard.',
-      },
-      artifacts: [],
-    };
+        },
+        artifacts: [],
+    });
   }
 
   if (toolName === 'memory.update_summary') {
@@ -2960,12 +7356,84 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
     }
     const count = Number(out.total || 0);
     recordEvent(db, 'memory.search', { scope: 'committed', q: '[set]', returned: count, limit, via: 'tool' });
-    return {
+    return completeTool({
       stdout: `Found ${count} committed memory matches`,
       stderr: '',
       result: { q, scope: 'committed', count, groups },
       artifacts: [],
-    };
+    });
+  }
+
+  if (toolName === 'memory.atlas.search') {
+    const q = String(args?.q || '').trim();
+    const limit = Math.max(1, Math.min(Number(args?.limit || 6) || 6, 25));
+    const sid = String(args?.session_id || sessionId || 'webchat-default').trim() || 'webchat-default';
+    const out = getAtlasEngine().search({ sessionId: sid, q, limit });
+    return completeTool({
+      stdout: `Found ${(out.messages?.length || 0) + (out.summaries?.length || 0)} Atlas memory matches`,
+      stderr: '',
+      result: {
+        session_id: sid,
+        q,
+        messages: out.messages || [],
+        summaries: out.summaries || [],
+      },
+      artifacts: [],
+    });
+  }
+
+  if (toolName === 'memory.atlas.dump') {
+    const sid = String(args?.session_id || args?.conversation_id || sessionId || 'webchat-default').trim() || 'webchat-default';
+    const out = getAtlasEngine().dump({
+      sessionId: sid,
+      start: Number(args?.start || 0) || 0,
+      end: args?.end == null ? null : Number(args.end),
+      limit: Number(args?.limit || 100) || 100,
+    });
+    return completeTool({
+      stdout: `Dumped ${Array.isArray(out.items) ? out.items.length : 0} Atlas conversation entries`,
+      stderr: '',
+      result: {
+        session_id: sid,
+        conversation: out.conversation,
+        items: out.items,
+      },
+      artifacts: [],
+    });
+  }
+
+  if (toolName === 'memory.atlas.get_mission') {
+    const sid = String(args?.session_id || sessionId || 'webchat-default').trim() || 'webchat-default';
+    const missionPath = getAtlasMissionPath(db, sid);
+    const missionText = await readAlexMissionFile(missionPath);
+    if (missionText) {
+      getAtlasEngine().rememberMission({ sessionId: sid, missionText, missionPath });
+    }
+    return completeTool({
+      stdout: missionText ? `Read mission from ${path.relative(getAlexSandboxRoot(), missionPath) || missionPath}` : 'Mission file is empty',
+      stderr: '',
+      result: {
+        session_id: sid,
+        mission_path: missionPath,
+        content: missionText,
+      },
+      artifacts: missionText ? [{ type: 'file', path: path.relative(getAlexSandboxRoot(), missionPath) || missionPath }] : [],
+    });
+  }
+
+  if (toolName === 'memory.read_day') {
+    const out = await readMemoryDayFile({
+      workspaceRoot: workdir,
+      day: args?.day,
+      kind: args?.kind,
+      maxChars: args?.max_chars,
+    });
+    return completeTool({
+      stdout: `Read ${out.kind} memory for ${out.day}`,
+      stderr: '',
+      result: out,
+      artifacts: [],
+    });
   }
 
 
@@ -3127,6 +7595,9 @@ async function executeRegisteredTool({ toolName, args, workdir, db, sessionId, s
   const err = new Error('Unknown tool');
   err.code = 'TOOL_UNKNOWN';
   throw err;
+  } catch (e) {
+    return failTool(e);
+  }
 }
 
 function insertWebToolAudit(db, action, adminToken, extra = {}) {
@@ -3210,11 +7681,65 @@ function createProposal(db, { sessionId, messageId, toolName, args, summary, mcp
   const createdAt = nowIso();
   const policy = getPolicyV2(db);
   const eff = effectiveAccessForTool(policy, def);
-  const requiresApproval = eff.requiresApproval ? 1 : 0;
+  const evalOut = evaluateTieredAccess(db, {
+    toolDef: def,
+    toolName,
+    args: args || {},
+    sessionId,
+    messageId,
+  });
+  const autoApprove = evaluateSandboxFsAutoApproval({
+    toolName,
+    args: args || {},
+    workdir: getWorkdir(),
+  });
+  const alexBypass = shouldBypassAlexApproval(db, {
+    sessionId,
+    toolName,
+    args: args || {},
+    workdir: getWorkdir(),
+  });
+
+  let effectiveMode = eff.mode;
+  let requiresApproval = eff.requiresApproval ? 1 : 0;
+  let effectiveReason = eff.reason;
+  if (!approvalsAreEnabled()) {
+    effectiveMode = effectiveMode === 'blocked' ? 'blocked' : 'allowed';
+    requiresApproval = 0;
+    effectiveReason = 'Approvals disabled';
+  }
+  if (!evalOut.allowed) {
+    effectiveMode = 'blocked';
+    requiresApproval = 0;
+    effectiveReason = evalOut.reason || 'Blocked by tiered access policy';
+  } else if (evalOut.requiresApproval) {
+    effectiveMode = 'allowed_with_approval';
+    requiresApproval = 1;
+    effectiveReason = evalOut.reason || eff.reason;
+  }
+  if (autoApprove.autoApproved) {
+    effectiveMode = 'allowed';
+    requiresApproval = 0;
+    effectiveReason = `Auto-approved inside Alex sandbox: ${autoApprove.resolvedPath}`;
+    console.log(`[alex.approval.auto-approved] tool=${autoApprove.toolName} path=${autoApprove.resolvedPath} sandbox=${autoApprove.sandboxRoot}`);
+  }
+  if (alexBypass.bypass) {
+    effectiveMode = 'allowed';
+    requiresApproval = 0;
+    effectiveReason = `Alex approvals bypassed: ${alexBypass.reason}`;
+    console.log(`[alex.approval.bypass] tool=${String(toolName || '')} reason=${alexBypass.reason} sandbox=${String(alexBypass.sandboxRoot || '')}`);
+  }
+  if (isAlexNoApprovalMcpContext(db, { sessionId, mcpServerId, routeId: String(toolName || '') })) {
+    effectiveMode = 'allowed';
+    requiresApproval = 0;
+    effectiveReason = `Alex MCP no-approval allowlist: ${String(mcpServerId || toolName || 'mcp_browse')}`;
+    console.log(`[alex.approval.auto-approved] tool=${String(toolName || 'mcp_browse')} mcp=${String(mcpServerId || 'mcp_browse')} route=${String(toolName || '')}`);
+  }
+
   const riskLevel = def.risk;
 
   const status =
-    eff.mode === 'blocked' ? 'blocked' :
+    effectiveMode === 'blocked' ? 'blocked' :
       (requiresApproval ? 'awaiting_approval' : 'ready');
 
   db.prepare(`
@@ -3237,7 +7762,7 @@ function createProposal(db, { sessionId, messageId, toolName, args, summary, mcp
   );
 
   let approvalId = null;
-  if (requiresApproval && status !== 'blocked') {
+  if (approvalsAreEnabled() && requiresApproval && status !== 'blocked') {
     const info = db.prepare(`
       INSERT INTO approvals
         (kind, status, risk_level, tool_name, proposal_id, server_id, payload_json, session_id, message_id, reason, created_at, resolved_at, resolved_by_token_fingerprint)
@@ -3291,7 +7816,7 @@ function createProposal(db, { sessionId, messageId, toolName, args, summary, mcp
       tier: evalOut.tier,
       requested_action_summary: `${toolName} (${evalOut.tier})`,
       proposed_grant: proposedGrant,
-      why: evalOut.reason || null,
+      why: effectiveReason || evalOut.reason || null,
       status: 'pending',
       created_at: createdAt,
     });
@@ -3365,7 +7890,7 @@ async function runWatchtowerOnce({ db, trigger = 'timer', force = false }) {
     });
   }
 
-  const pendingApprovals = Number(db.prepare("SELECT COUNT(1) AS c FROM approvals WHERE status = 'pending'").get()?.c || 0);
+  const pendingApprovals = pendingApprovalsCount(db);
   const recentErrors = hasTable(db, 'events')
     ? db.prepare("SELECT ts, type, details_json FROM events WHERE type LIKE '%error%' ORDER BY id DESC LIMIT 5").all()
     : [];
@@ -3494,7 +8019,7 @@ async function wakeWatchtower({ db, trigger = 'timer', force = false }) {
   }
 }
 
-export function createAdminRouter({ db, telegram, slack, dataDir }) {
+export function createAdminRouter({ db, telegram, slack, dataDir, getToolsHealth = null, rerunToolsHealth = null, scheduleFactoryResetRestart = null }) {
   const r = express.Router();
   r.use(requireAuth(db));
 
@@ -3507,6 +8032,50 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
 
   r.get('/me', (req, res) => {
     res.json({ ok: true, token_fingerprint: tokenFingerprint(req.adminToken) });
+  });
+
+  r.get('/chat/:sessionId/events', (req, res) => {
+    const sessionId = String(req.params.sessionId || '').trim() || 'webchat-default';
+    if (String(req.query?.probe || '').trim() === '1') {
+      return res.json({ ok: true, session_id: sessionId });
+    }
+    try {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+      const writeEvent = (event) => {
+        try {
+          res.write(`id: ${String(event?.id || '')}\n`);
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        } catch {}
+      };
+
+      res.write(`retry: 2000\n\n`);
+      const unsubscribe = subscribeLiveEvents(sessionId, writeEvent, { replay: true });
+      const keepAlive = setInterval(() => {
+        try {
+          res.write(`: ping ${Date.now()}\n\n`);
+        } catch {}
+      }, 20000);
+      if (typeof keepAlive.unref === 'function') keepAlive.unref();
+      req.on('close', () => {
+        clearInterval(keepAlive);
+        unsubscribe();
+      });
+    } catch (e) {
+      const message = String(e?.message || e || 'Live activity stream failed.');
+      console.error(`[webchat.events] session=${sessionId} ${message}`);
+      if (!res.headersSent) {
+        return res.status(500).json({ ok: false, error: 'LIVE_EVENTS_FAILED', message, session_id: sessionId });
+      }
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'error', message, sessionId, ts: Date.now() })}\n\n`);
+      } catch {}
+      try { res.end(); } catch {}
+    }
   });
 
   r.get('/system/state', async (_req, res) => {
@@ -3524,11 +8093,10 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     if (!assertWebchatOnly(req, res)) return;
     try {
       const sys = await getPbSystemState(db, { probeTimeoutMs: 1200 });
-      const pendingApprovals = Number(
-        db.prepare("SELECT COUNT(1) AS c FROM approvals WHERE status = 'pending'").get()?.c || 0
-      );
+      const pendingApprovals = pendingApprovalsCount(db);
       const modelId = sys?.selectedModelId || kvGet(db, 'llm.selectedModel', null);
       const modelsCount = Number(sys?.textWebui?.modelsCount || sys?.modelsCount || 0);
+      const toolSupport = detectToolCallingSupport(db);
 
       // Helper swarm summary: only show recent activity.
       const helper = hasTable(db, 'agent_runs')
@@ -3550,6 +8118,9 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         if (pendingApprovals > 0) return 'waiting_approval';
         return 'idle';
       })();
+      const toolsHealth = typeof getToolsHealth === 'function'
+        ? (getToolsHealth() || { ok: true, healthy: true, checked_at: null, checks: [] })
+        : { ok: true, healthy: true, checked_at: null, checks: [] };
 
       res.json({
         ok: true,
@@ -3562,10 +8133,23 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         llmStatus: RUNTIME_STATE.llmStatus,
         activeToolRuns: RUNTIME_STATE.activeToolRuns.size,
         pendingApprovals,
+        approvals_enabled: approvalsAreEnabled(),
         lastError: RUNTIME_STATE.lastError ? { message: RUNTIME_STATE.lastError, at: RUNTIME_STATE.lastErrorAt } : null,
         updatedAt: RUNTIME_STATE.lastUpdated,
         lastUpdated: RUNTIME_STATE.lastUpdated,
         helpers: helper,
+        tools_disabled: Boolean(toolsHealth?.tools_disabled),
+        tools_disabled_reason: toolsHealth?.reason || null,
+        failing_check_id: toolsHealth?.failing_check_id || null,
+        failing_path: toolsHealth?.failing_path || null,
+        last_error: toolsHealth?.last_error || null,
+        last_stdout: toolsHealth?.last_stdout || null,
+        last_stderr: toolsHealth?.last_stderr || null,
+        tools_health: toolsHealth,
+        supports_tool_calls: Boolean(toolSupport?.supports_tool_calls),
+        fallback_enabled: true,
+        tools_self_test_ok: Boolean(toolsHealth?.healthy),
+        tool_support: toolSupport,
       });
     } catch (e) {
       res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -3574,6 +8158,18 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
 
   r.get('/health/auth', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  r.post('/tools/self_test', async (_req, res) => {
+    if (typeof rerunToolsHealth !== 'function') {
+      return res.status(503).json({ ok: false, error: 'TOOLS_SELF_TEST_UNAVAILABLE' });
+    }
+    try {
+      const state = await rerunToolsHealth();
+      return res.json({ ok: true, ...state });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
   });
 
   r.get('/telegram/users', (_req, res) => {
@@ -3745,6 +8341,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/approvals', (req, res) => {
+    if (!approvalsAreEnabled()) return res.json([]);
     const status = String(req.query.status || 'pending');
     const rows = status === 'all'
       ? db.prepare(`
@@ -3798,6 +8395,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/approvals/:id', (req, res) => {
+    if (!approvalsAreEnabled()) return res.status(404).json({ ok: false, error: 'APPROVALS_DISABLED' });
     const parsed = parseApprovalId(req.params.id);
     if (!parsed) return res.status(400).json({ ok: false, error: 'Invalid approval id.' });
     const row = db.prepare(`
@@ -3838,6 +8436,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/approvals/pending', (_req, res) => {
+    if (!approvalsAreEnabled()) return res.json([]);
     const tgPending = db.prepare('SELECT chat_id AS id, username, first_seen_at, last_seen_at, count FROM telegram_pending ORDER BY last_seen_at DESC').all();
     const slPending = db.prepare('SELECT user_id AS id, username, first_seen_at, last_seen_at, count FROM slack_pending ORDER BY last_seen_at DESC').all();
     const pending = db.prepare(`
@@ -3865,6 +8464,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/approvals/active', (_req, res) => {
+    if (!approvalsAreEnabled()) return res.json([]);
     const tgAllowed = db.prepare('SELECT chat_id AS id, label, added_at, last_seen_at FROM telegram_allowed ORDER BY added_at DESC').all();
     const slAllowed = db.prepare('SELECT user_id AS id, label, added_at, last_seen_at FROM slack_allowed ORDER BY added_at DESC').all();
     const approved = db.prepare(`
@@ -3890,6 +8490,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/approvals/history', (_req, res) => {
+    if (!approvalsAreEnabled()) return res.json([]);
     const tgBlocked = db.prepare('SELECT chat_id AS id, reason, blocked_at FROM telegram_blocked ORDER BY blocked_at DESC').all();
     const slBlocked = db.prepare('SELECT user_id AS id, reason, blocked_at FROM slack_blocked ORDER BY blocked_at DESC').all();
     const history = db.prepare(`
@@ -3913,6 +8514,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.post('/approvals/:id/approve', async (req, res) => {
+    if (!approvalsAreEnabled()) return res.status(400).json(approvalsDisabledError());
     if (!assertWebchatOnly(req, res)) return;
     const parsed = parseApprovalId(req.params.id);
     if (!parsed) return res.status(400).json({ ok: false, error: 'Invalid approval id.' });
@@ -4085,6 +8687,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.post('/approvals/:id/reject', async (req, res) => {
+    if (!approvalsAreEnabled()) return res.status(400).json(approvalsDisabledError());
     if (!assertWebchatOnly(req, res)) return;
     const parsed = parseApprovalId(req.params.id);
     if (!parsed) return res.status(400).json({ ok: false, error: 'Invalid approval id.' });
@@ -4152,22 +8755,68 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   r.get('/tools/registry', (_req, res) => {
-    const policy = getPolicyV2(db);
-    const rows = Object.values(TOOL_REGISTRY).map((t) => {
-      const eff = effectiveAccessForTool(policy, t);
-      return {
-        id: t.id,
-        label: t.label,
-        risk: t.risk,
-        requiresApproval: t.requiresApproval,
-        description: t.description,
-        effective_access: eff.mode,
-        effective_reason: eff.reason,
-        allowed: eff.allowed,
-        requires_approval: eff.requiresApproval,
-      };
-    });
-    res.json(rows);
+    const agentId = String(_req.query.agent_id || 'alex').trim() || 'alex';
+    const message = String(_req.query.message || '').trim();
+    const route = String(_req.query.route || '').trim();
+    const mcpServerId = normalizeMcpServerId(_req.query.mcp_server_id || '') || null;
+    const includeMcp = String(_req.query.include_mcp || '').trim().toLowerCase() === 'true';
+    return res.json(getAlexToolRegistryInfo(db, { agentId, message, route, includeMcp, mcpServerId }));
+  });
+
+  r.get('/alex/project-roots', (_req, res) => {
+    return res.json({ ok: true, items: getAlexProjectRoots(db) });
+  });
+
+  r.post('/alex/project-roots', (req, res) => {
+    try {
+      const row = createAlexProjectRoot(db, {
+        label: req.body?.label,
+        path: req.body?.path,
+        enabled: req.body?.enabled,
+        isFavorite: req.body?.is_favorite,
+      });
+      return res.json({ ok: true, item: row });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: String(e?.code || 'INVALID_PROJECT_ROOT'), message: String(e?.message || e) });
+    }
+  });
+
+  r.patch('/alex/project-roots/:id', (req, res) => {
+    try {
+      const row = updateAlexProjectRoot(db, Number(req.params.id), req.body || {});
+      return res.json({ ok: true, item: row });
+    } catch (e) {
+      return res.status(String(e?.code || '') === 'PROJECT_ROOT_NOT_FOUND' ? 404 : 400).json({ ok: false, error: String(e?.code || 'INVALID_PROJECT_ROOT'), message: String(e?.message || e) });
+    }
+  });
+
+  r.delete('/alex/project-roots/:id', (req, res) => {
+    try {
+      const row = deleteAlexProjectRoot(db, Number(req.params.id));
+      return res.json({ ok: true, item: row });
+    } catch (e) {
+      return res.status(String(e?.code || '') === 'PROJECT_ROOT_NOT_FOUND' ? 404 : 400).json({ ok: false, error: String(e?.code || 'PROJECT_ROOT_DELETE_FAILED'), message: String(e?.message || e) });
+    }
+  });
+
+  r.get('/agents/alex/access', (_req, res) => {
+    return res.json({ ok: true, access: resolveAlexAccessContext(db), project_roots: getAlexProjectRoots(db, { enabledOnly: true }) });
+  });
+
+  r.post('/agents/alex/access', (req, res) => {
+    try {
+      const parsedLevel = parseAlexLevelInput(req.body?.level);
+      setAlexAccessState(db, {
+        level: parsedLevel,
+        project_root_id: req.body?.project_root_id,
+        ttl_minutes: req.body?.ttl_minutes,
+        confirm_dangerous: Boolean(req.body?.confirm_dangerous),
+        extra_roots: req.body?.extra_roots,
+      });
+      return res.json({ ok: true, access: resolveAlexAccessContext(db), project_roots: getAlexProjectRoots(db, { enabledOnly: true }) });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: String(e?.code || 'ALEX_ACCESS_UPDATE_FAILED'), message: String(e?.message || e) });
+    }
   });
 
   r.get('/retention', (_req, res) => {
@@ -4509,6 +9158,12 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       const runOut = await executeRegisteredTool({ toolName, args, workdir: getWorkdir(), db, sessionId });
       return res.json({ ok: true, tool_name: toolName, result: runOut?.result || {}, stdout: runOut?.stdout || '', stderr: runOut?.stderr || '', artifacts: runOut?.artifacts || [] });
     } catch (e) {
+      if (String(e?.code || '') === 'ACCESS_DENIED') {
+        return res.status(403).json({ ok: false, error: 'ACCESS_DENIED', message: String(e?.message || e), detail: e?.detail || null });
+      }
+      if (String(e?.code || '') === 'SANDBOX_VIOLATION') {
+        return res.status(403).json({ ok: false, error: 'SANDBOX_VIOLATION', message: String(e?.message || e) });
+      }
       return res.status(500).json({ ok: false, error: 'TOOL_RUN_FAILED', message: String(e?.message || e) });
     }
   });
@@ -4533,6 +9188,16 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       return res.json({ ok: true, checks });
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'TOOLS_DIAGNOSTICS_FAILED', message: String(e?.message || e) });
+    }
+  });
+
+  r.post('/test-alex-tools', async (req, res) => {
+    try {
+      const sessionId = String(req.body?.session_id || 'alex-self-test').trim() || 'alex-self-test';
+      const report = await runAlexToolsSelfTest(db, { sessionId, workdir: getWorkdir() });
+      return res.status(report.ok ? 200 : 500).json(report);
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'ALEX_TOOLS_SELF_TEST_FAILED', message: String(e?.message || e) });
     }
   });
 
@@ -4742,13 +9407,51 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       });
     }
 
-    // Enforce scan-first governance before write/delete operations.
-    // Session must have at least one successful workspace.list and workspace.read_file.
+    let scanPreflight = null;
     if (proposal.tool_name === 'workspace.write_file' || proposal.tool_name === 'workspace.mkdir' || proposal.tool_name === 'workspace.delete') {
-      const inAlexSandbox = isPathInsideAlexSandbox(safeJsonParse(proposal.args_json || '{}', {}));
-      if (inAlexSandbox) {
-        // Alex sandbox operations are Tier A and do not require scan-first gate.
-      } else
+      const workdir = getWorkdir();
+      const alexRoot = ensureAlexWorkdir(workdir);
+      scanPreflight = await runAlexFsPreflight({
+        toolName: proposal.tool_name,
+        args: proposal.args_json || {},
+        workdir,
+        alexRoot,
+        sessionId: proposal.session_id || null,
+        correlationId,
+        executeTool: async (toolName, args) => executeRegisteredTool({
+          toolName,
+          args,
+          workdir,
+          db,
+          sessionId: proposal.session_id || 'webchat-default',
+        }),
+        markScanState: (patch) => markScanState(db, proposal.session_id, patch),
+        logger: console,
+      });
+
+      if (scanPreflight?.blocked) {
+        return res.status(403).json({
+          ok: false,
+          code: scanPreflight.code || 'ALEX_SANDBOX_OUTSIDE',
+          error: scanPreflight.error || 'Target is outside Alex sandbox.',
+          session_id: proposal.session_id || null,
+          correlation_id: correlationId,
+        });
+      }
+
+      if (scanPreflight?.applied) {
+        insertWebToolAudit(db, 'SCAN_PREFLIGHT', req.adminToken, {
+          proposal_id: proposal.id,
+          notes: {
+            correlation_id: correlationId,
+            tool_name: proposal.tool_name,
+            steps: Array.isArray(scanPreflight.steps)
+              ? scanPreflight.steps.map((s) => ({ tool: s?.tool, args: s?.args || {} }))
+              : [],
+          },
+        });
+      }
+
       if (!isScanSatisfied(db, proposal.session_id)) {
         return res.status(403).json({
           ok: false,
@@ -4756,6 +9459,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           error: 'Scan Protocol violation: you must list and read before writing/deleting.',
           session_id: proposal.session_id || null,
           correlation_id: correlationId,
+          preflight: scanPreflight || null,
         });
       }
     }
@@ -4979,7 +9683,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         markScanState(db, proposal.session_id, { read: true });
       }
       const run = db.prepare('SELECT * FROM web_tool_runs WHERE id = ?').get(runId);
-      return res.json({ ok: true, run_id: runId, run: toRunResponse(run) });
+      return res.json({ ok: true, run_id: runId, run: toRunResponse(run), preflight: scanPreflight || null });
     } catch (e) {
       runtimeSetError(e?.message || e);
       const finishedAt = nowIso();
@@ -5026,6 +9730,7 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
         correlation_id: correlationId,
         run_id: runId,
         run: toRunResponse(run),
+        preflight: scanPreflight || null,
       });
     } finally {
       runtimeEndToolRun(runId);
@@ -5076,21 +9781,247 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
   });
 
   const handleWebchatSend = async (req, res) => {
-    const message = String(req.body?.message || '').trim();
+    const rawMessage = String(req.body?.message || '').trim();
     const sessionId = String(req.body?.session_id || req.get('X-PB-Session') || 'webchat-default').trim() || 'webchat-default';
     const messageId = String(req.body?.message_id || newId('msg'));
-    const sessionMeta = getWebchatSessionMeta(db, sessionId);
-    const requestMcpServerId = String(req.body?.mcp_server_id || sessionMeta?.mcp_server_id || '').trim() || null;
-    let mcpTemplateId = String(req.body?.mcp_template_id || sessionMeta?.mcp_template_id || '').trim() || null;
-    const wantsBrowse = shouldUseMcpBrowse(message);
-    if (mcpTemplateId && !isTemplateEnabledInWebchat(db, mcpTemplateId)) {
-      if (wantsBrowse) {
-        return res.status(400).json({ ok: false, error: 'MCP_TEMPLATE_DISABLED', message: 'Selected MCP template is disabled. Enable it in MCP Servers.' });
+    publishSessionLiveEvent(sessionId, {
+      type: 'status',
+      message: 'Starting request',
+      messageId,
+    });
+    const command = parseWebchatControlCommand(rawMessage);
+    if (command.kind === 'run_session_on') {
+      const meta = setWebchatSessionMeta(db, sessionId, { webchat_tools_mode: 'session', webchat_text_only: false });
+      recordEvent(db, 'webchat.tools_mode.toggled', {
+        session_id: sessionId,
+        webchat_tools_mode: meta.webchat_tools_mode,
+        via: 'command',
+      });
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: meta,
+        reply: 'Tools are ON for this chat session.',
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'run_session_off') {
+      const meta = setWebchatSessionMeta(db, sessionId, { webchat_tools_mode: 'off' });
+      recordEvent(db, 'webchat.tools_mode.toggled', {
+        session_id: sessionId,
+        webchat_tools_mode: meta.webchat_tools_mode,
+        via: 'command',
+      });
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: meta,
+        reply: 'Tools are OFF for this chat session.',
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'mission_on' || command.kind === 'mission_off') {
+      const nextTextOnly = command.kind === 'mission_on';
+      const meta = setWebchatSessionMeta(db, sessionId, { webchat_text_only: nextTextOnly });
+      recordEvent(db, 'webchat.text_only.toggled', {
+        session_id: sessionId,
+        webchat_text_only: nextTextOnly,
+        via: 'command',
+      });
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: meta,
+        reply: nextTextOnly ? 'Text-only mode is ON for this chat.' : 'Text-only mode is OFF for this chat.',
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'skills_list') {
+      const skills = await loadAlexSkills();
+      const reply = skills.length
+        ? skills.map((skill) => `- ${skill.id}: ${skill.enabled ? 'enabled' : 'disabled'} (${path.posix.join(ALEX_SKILLS_DIRNAME, skill.filename)})`).join('\n')
+        : 'No Alex skills found.';
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: getWebchatSessionMeta(db, sessionId),
+        reply,
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'skills_print') {
+      const skill = await getAlexSkillById(command.skill_id);
+      if (!skill) {
+        return res.status(404).json({
+          ok: false,
+          session_id: sessionId,
+          message_id: messageId,
+          error: 'SKILL_NOT_FOUND',
+          message: `Alex skill not found: ${String(command.skill_id || '').trim() || '(missing id)'}`,
+        });
       }
+      if (skill.missing) {
+        return res.status(500).json({
+          ok: false,
+          session_id: sessionId,
+          message_id: messageId,
+          error: 'SKILL_FILE_MISSING',
+          message: `Skill file missing at: ${skill.path}`,
+        });
+      }
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: getWebchatSessionMeta(db, sessionId),
+        reply: skill.content,
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'skills_edit') {
+      const skill = await getAlexSkillById(command.skill_id || ALEX_BUILD_LOOP_SKILL_ID);
+      const skillPath = skill?.path || getAlexBuildLoopSkillPath();
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: getWebchatSessionMeta(db, sessionId),
+        reply: `Edit the file at: ${skillPath}`,
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'build_status') {
+      const state = await readBuildLoopState();
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: getWebchatSessionMeta(db, sessionId),
+        build_loop: state,
+        reply: `Build loop is ${state.running ? 'running' : 'stopped'}.\nStage: ${state.stage}\nCompleted jobs: ${Number(state.completed_jobs_count || 0)}\nStop requested: ${state.stop_requested ? 'yes' : 'no'}${state.current_job_id ? `\nCurrent job: ${state.current_job_id}` : ''}${state.last_error ? `\nLast error: ${state.last_error}` : ''}`,
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'build_start') {
+      const skill = await getAlexSkillById(ALEX_BUILD_LOOP_SKILL_ID);
+      if (!skill || skill.missing || !String(skill.content || '').trim()) {
+        return res.status(500).json({
+          ok: false,
+          session_id: sessionId,
+          message_id: messageId,
+          error: 'BUILD_SKILL_MISSING',
+          message: `Build loop skill file is missing. Expected path: ${getAlexBuildLoopSkillPath()}`,
+        });
+      }
+      const state = await writeBuildLoopState({
+        ...(await readBuildLoopState()),
+        running: true,
+        stop_requested: false,
+        started_at: nowIso(),
+        current_job_id: null,
+        last_error: null,
+        stage: 'awaiting_brief',
+        session_id: sessionId,
+      });
+      publishSessionLiveEvent(sessionId, {
+        type: 'status',
+        message: 'Build loop started. Waiting for intake.',
+        messageId,
+      });
+      const memory = loadMemory({ db, agentId: MEMORY_AGENT_ID, chatId: sessionId });
+      const buildReply = buildBuildLoopIntakeReply({ state, memory, skillText: skill.content });
+      await persistAtlasMission({
+        db,
+        sessionId,
+        missionText: buildReply,
+      }).catch(() => {});
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: getWebchatSessionMeta(db, sessionId),
+        build_loop: state,
+        reply: buildReply,
+        mission_path: getAtlasMissionPath(db, sessionId),
+        mission_preview: buildReply.slice(0, 1200),
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    if (command.kind === 'build_stop') {
+      const prev = await readBuildLoopState();
+      const state = await updateBuildLoopState({
+        stop_requested: true,
+        running: prev.running,
+        session_id: sessionId,
+      });
+      publishSessionLiveEvent(sessionId, {
+        type: 'status',
+        message: state.running
+          ? 'Graceful stop requested. Alex will finish the current build, then stop.'
+          : 'Build loop stop requested. The loop is already idle.',
+        messageId,
+      });
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: getWebchatSessionMeta(db, sessionId),
+        build_loop: state,
+        reply: state.running
+          ? 'Graceful stop requested. Alex will finish the current build, then stop.'
+          : 'Build loop is already idle. Stop request recorded.',
+        source_type: 'builtin',
+        proposal: null,
+      });
+    }
+    const message = command.kind === 'run_override' ? command.message : rawMessage;
+    const sessionMeta = getWebchatSessionMeta(db, sessionId);
+    const textOnlyMode = Boolean(sessionMeta.webchat_text_only);
+    const toolsMode = normalizeWebchatToolsMode(sessionMeta.webchat_tools_mode);
+    const allowToolsOverride = Boolean(req.body?.allow_tools_override || command.allow_tools_override);
+    const sessionToolsEnabled = toolsMode === 'session';
+    const requestedAgentId = String(req.body?.agent_id || req.get('X-PB-Agent') || MEMORY_AGENT_ID).trim() || MEMORY_AGENT_ID;
+    const alexAutoToolsEnabled = requestedAgentId.toLowerCase() === 'alex';
+    const toolsEnabled = Boolean(sessionToolsEnabled || allowToolsOverride || alexAutoToolsEnabled);
+    const requestMcpServerIdRaw = String(req.body?.mcp_server_id || sessionMeta?.mcp_server_id || '').trim() || null;
+    const requestMcpServerId = requestMcpServerIdRaw ? (resolveMcpServerIdentifier(db, requestMcpServerIdRaw) || requestMcpServerIdRaw) : null;
+    let mcpTemplateId = String(req.body?.mcp_template_id || sessionMeta?.mcp_template_id || '').trim() || null;
+    const toolPolicyConfig = getToolRouterConfig();
+    const intentInfo = classifyIntent(message);
+    const intent = intentInfo.intent;
+    const toolRequirement = detectToolRequirement(message);
+    const mcpBrowseDirective = isMcpBrowseDirective(message);
+  const directUrlIntent = detectDirectUrlBrowseIntent(message);
+  const exportIntent = detectExportReportIntent(message);
+  const mcpDirective = Boolean(toolRequirement?.categories?.mcp);
+  const missionTextMode = shouldForceMissionTextMode(message) || Boolean(req.body?.text_only);
+    const wantsBrowse = toolPolicyConfig.webEnabled
+      && (intent === 'web_research' || intent === 'mixed' || mcpBrowseDirective || directUrlIntent.wantsDirectBrowse);
+    const effectiveTextOnlyMode = textOnlyMode && !allowToolsOverride;
+    const toolUseAllowed = toolsEnabled && !effectiveTextOnlyMode;
+    if (mcpTemplateId && !isTemplateEnabledInWebchat(db, mcpTemplateId)) {
+      return res.status(400).json({ ok: false, error: 'MCP_TEMPLATE_DISABLED', message: 'Selected MCP template is disabled. Enable it in MCP Servers.' });
     }
     let chosenTemplateId = null, chosenTemplateName = null, chosenTemplateReason = null;
-    if (wantsBrowse && !mcpTemplateId && !requestMcpServerId) {
-      const autoTpl = resolveDefaultBrowserTemplate(db);
+    if (toolUseAllowed && (wantsBrowse || mcpDirective) && !mcpTemplateId && !requestMcpServerId) {
+      const preferredTemplate = exportIntent
+        ? 'export_reports'
+        : (directUrlIntent.wantsDirectBrowse ? 'basic_browser' : 'search_browser');
+      const autoTpl = resolveDefaultBrowserTemplate(db, {
+        prefer: preferredTemplate,
+      });
       if (autoTpl) {
         mcpTemplateId = autoTpl.id;
         chosenTemplateId = autoTpl.id;
@@ -5101,10 +10032,37 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       // else: no templates found — fall through to server-level auto-selection below
     }
     let mcpServerId = requestMcpServerId || resolveMcpServerFromTemplate(db, mcpTemplateId);
+    if (toolUseAllowed && (wantsBrowse || mcpDirective) && exportIntent) {
+      const exportSrv = resolveMcpServerFromTemplate(db, 'export_reports')
+        || resolveAnyEnabledBrowserServer(db, {
+          preferTemplate: 'export_reports',
+          requireCapabilities: ['export.write_markdown'],
+        });
+      if (exportSrv) {
+        mcpServerId = exportSrv;
+        if (!mcpTemplateId) mcpTemplateId = 'export_reports';
+      }
+    }
+    if (toolUseAllowed && wantsBrowse && directUrlIntent.wantsDirectBrowse) {
+      const basicSrv = resolveMcpServerFromTemplate(db, 'basic_browser')
+        || resolveAnyEnabledBrowserServer(db, {
+          preferTemplate: 'basic_browser',
+          requireCapabilities: ['browser.open_url', 'browser.extract_text'],
+        });
+      if (basicSrv) {
+        mcpServerId = basicSrv;
+        if (!mcpTemplateId) mcpTemplateId = 'basic_browser';
+      }
+    }
     if (requestMcpServerId && !isServerEnabledInWebchat(db, requestMcpServerId)) {
       if (wantsBrowse) {
         const fallbackByTemplate = mcpTemplateId ? resolveMcpServerFromTemplate(db, mcpTemplateId) : null;
-        const fallbackAny = fallbackByTemplate || resolveAnyEnabledBrowserServer(db);
+        const fallbackAny = fallbackByTemplate || resolveAnyEnabledBrowserServer(db, {
+          preferTemplate: directUrlIntent.wantsDirectBrowse ? 'basic_browser' : 'search_browser',
+          requireCapabilities: directUrlIntent.wantsDirectBrowse
+            ? ['browser.open_url', 'browser.extract_text']
+            : [],
+        });
         if (fallbackAny) {
           mcpServerId = fallbackAny;
         } else {
@@ -5122,8 +10080,17 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       chosenMcpServerReason = req.body?.mcp_server_id
         ? 'client_selected'
         : (sessionMeta?.mcp_server_id ? 'session_meta' : 'template_resolved');
-    } else if (wantsBrowse) {
-      const autoSrv = resolveAnyEnabledBrowserServer(db) || resolveAnyRunningMcpServer(db);
+    } else if (toolUseAllowed && (wantsBrowse || mcpDirective)) {
+      const autoSrv = resolveAnyEnabledBrowserServer(db, {
+        preferTemplate: exportIntent
+          ? 'export_reports'
+          : (directUrlIntent.wantsDirectBrowse ? 'basic_browser' : 'search_browser'),
+        requireCapabilities: exportIntent
+          ? ['export.write_markdown']
+          : (directUrlIntent.wantsDirectBrowse
+          ? ['browser.open_url', 'browser.extract_text']
+          : []),
+      }) || resolveAnyRunningMcpServer(db);
       if (autoSrv) {
         mcpServerId = autoSrv;
         chosenMcpServerId = autoSrv;
@@ -5134,15 +10101,150 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
     }
     if (!message) return res.status(400).json({ ok: false, error: 'message required' });
 
-    const agentId = String(req.body?.agent_id || req.get('X-PB-Agent') || MEMORY_AGENT_ID).trim() || MEMORY_AGENT_ID;
+    const buildLoopState = await readBuildLoopState();
+    if (buildLoopState?.running && buildLoopState.stage === 'awaiting_brief' && String(buildLoopState.session_id || '').trim() === sessionId && !rawMessage.startsWith('/')) {
+      try {
+        await persistAtlasMission({
+          db,
+          sessionId,
+          missionText: String(message || '').trim(),
+        }).catch(() => {});
+        await updateBuildLoopState({
+          current_job_id: null,
+          last_error: null,
+          stage: 'building',
+        });
+        const buildResult = await createBuildLoopJobFromReply({
+          db,
+          sessionId,
+          message,
+          mode: 'build',
+        });
+        const beforeFinalize = await readBuildLoopState();
+        const completedJobs = Number(beforeFinalize.completed_jobs_count || 0) + 1;
+        const shouldStop = Boolean(beforeFinalize.stop_requested);
+        const nextState = await writeBuildLoopState({
+          ...beforeFinalize,
+          running: !shouldStop,
+          stop_requested: shouldStop ? false : beforeFinalize.stop_requested,
+          current_job_id: null,
+          completed_jobs_count: completedJobs,
+          stage: shouldStop ? 'idle' : 'awaiting_brief',
+          last_error: null,
+          session_id: shouldStop ? null : sessionId,
+        });
+        const skill = await getAlexSkillById(ALEX_BUILD_LOOP_SKILL_ID);
+        const memory = loadMemory({ db, agentId: MEMORY_AGENT_ID, chatId: sessionId });
+        const followUp = shouldStop
+          ? `Build loop stopped after finishing ${buildResult.job_rel}.\nCompleted jobs: ${completedJobs}.`
+          : `Build saved. Created ${buildResult.job_rel} and scaffold files.\n\n${buildBuildLoopIntakeReply({ state: nextState, memory, skillText: skill?.content || '' })}`;
+        publishSessionLiveEvent(sessionId, {
+          type: 'status',
+          message: shouldStop
+            ? `Finished ${buildResult.job_rel}. Build loop stopping gracefully.`
+            : `Finished ${buildResult.job_rel}. Waiting for the next intake.`,
+          messageId,
+        });
+        return res.json({
+          ok: true,
+          session_id: sessionId,
+          message_id: messageId,
+          session_meta: sessionMeta,
+          build_loop: nextState,
+          mission_path: getAtlasMissionPath(db, sessionId),
+          mission_preview: String(message || '').slice(0, 1200),
+          reply: followUp,
+          source_type: 'builtin',
+          browse_trace: {
+            route: 'direct',
+            mcp_server_id: null,
+            urls_visited: [],
+            chars_extracted: 0,
+            durations: {},
+            total_duration_ms: 0,
+            stages: [{ stage: 'BUILD_LOOP_SETUP', ok: true, tool_traces: buildResult.traces }],
+          },
+          proposal: null,
+        });
+      } catch (e) {
+        await updateBuildLoopState({
+          running: false,
+          stage: 'idle',
+          current_job_id: null,
+          last_error: String(e?.message || e),
+          session_id: null,
+        });
+        return res.status(500).json({
+          ok: false,
+          error: 'BUILD_LOOP_SETUP_FAILED',
+          message: String(e?.message || e),
+        });
+      }
+    }
+
+    const recallQuery = detectMemoryRecallQuery(message);
+    if (recallQuery) {
+      const atlasRecall = getAtlasEngine().search({ sessionId, q: recallQuery, limit: 3 });
+      const atlasTop = atlasRecall.messages?.[0] || atlasRecall.summaries?.[0] || null;
+      if (atlasTop?.content) {
+        return res.json({
+          ok: true,
+          session_id: sessionId,
+          message_id: messageId,
+          session_meta: sessionMeta,
+          reply: `You said: "${String(atlasTop.content).trim()}"`,
+          source_type: 'builtin',
+          sources: [`atlas:${atlasTop.id}`],
+          proposal: null,
+        });
+      }
+      const recall = searchMemoryEntries(db, { q: recallQuery, limit: 3, state: 'committed' });
+      const first = Array.isArray(recall?.groups) ? recall.groups[0]?.entries?.[0] : null;
+      const grouped = recall && typeof recall.groups === 'object' && !Array.isArray(recall.groups)
+        ? Object.values(recall.groups).flatMap((group) => Array.isArray(group?.entries) ? group.entries : [])
+        : [];
+      const top = first || grouped[0] || null;
+      if (top?.content || top?.snippet) {
+        const remembered = String(top.content || top.snippet || '').trim();
+        return res.json({
+          ok: true,
+          session_id: sessionId,
+          message_id: messageId,
+          session_meta: sessionMeta,
+          reply: `You said: "${remembered}"`,
+          source_type: 'builtin',
+          sources: [`memory_entries:${top.id}`],
+          proposal: null,
+        });
+      }
+    }
+
+    const agentId = requestedAgentId;
     const chatId = sessionId;
     const injectedMemory = loadMemory({ db, agentId, chatId });
+    const atlasMission = await loadAtlasMission({ db, sessionId }).catch(() => ({ mission_path: getAtlasMissionPath(db, sessionId), mission_text: '' }));
+    const atlasContext = getAtlasEngine().buildContext({
+      sessionId,
+      query: recallQuery || message,
+      missionText: atlasMission.mission_text,
+    });
+    ingestAtlasTurn(sessionId, 'user', message, {
+      message_id: messageId,
+      agent_id: agentId,
+      mission_path: atlasMission.mission_path,
+    });
     console.log(`MEMORY_LOAD agent=${agentId} chat=${chatId} profile_chars=${injectedMemory.chars.profile} summary_chars=${injectedMemory.chars.summary}`);
 
     const requestId = newId('rid');
     const reqAbort = new AbortController();
     req.on('aborted', () => reqAbort.abort());
     console.log(`[webchat.send] rid=${requestId} session=${sessionId} agent=${agentId} mcpTemplateId=${mcpTemplateId || '-'} mcpServerId=${mcpServerId || '-'} messageId=${messageId}`);
+    publishSessionLiveEvent(sessionId, {
+      type: 'status',
+      message: 'Running request',
+      requestId,
+      messageId,
+    });
 
     let reply = '';
     let model = null;
@@ -5161,11 +10263,98 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       total_duration_ms: 0,
       stages: [],
     };
+    const textOnlyInterception = evaluateWebchatTextOnlyInterception({
+      messageText: message,
+      textOnlyMode: effectiveTextOnlyMode,
+      allowToolsOverride,
+      toolRequirement,
+    });
+      if (textOnlyInterception.blocked) {
+      publishSessionLiveEvent(sessionId, {
+        type: 'status',
+        message: 'Text-only mode blocked tool execution',
+        requestId,
+        messageId,
+      });
+      recordEvent(db, 'webchat.text_only.blocked', {
+        session_id: sessionId,
+        agent_id: agentId,
+        tool_categories: toolRequirement.categories,
+      });
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        message_id: messageId,
+        session_meta: sessionMeta,
+        reply: textOnlyInterception.reply,
+        model: null,
+        provider: null,
+        source_type: 'builtin',
+        mcp_server_id: null,
+        sources: [],
+        browse_trace: {
+          ...browseTrace,
+          total_duration_ms: 0,
+          stages: [{ stage: 'TEXT_ONLY_MODE', ok: true, blocked_tools: true }],
+        },
+        proposal: null,
+      });
+    }
     let candidate = parseToolCommand(message);
-    if (!candidate) candidate = detectDirectFileIntent(message);
+    if (!candidate && toolUseAllowed && !missionTextMode) candidate = parseStructuredToolInstruction(message);
+    if (!candidate && toolUseAllowed && !missionTextMode) candidate = detectDirectFileIntent(message);
+    if (!candidate && toolUseAllowed && !missionTextMode && intent === 'local_action') {
+      const inferred = inferRequestedArtifact(message);
+      if (inferred?.path) {
+        const content = inferred.expectedContent || 'Created by Alex';
+        candidate = { toolName: 'workspace.write_file', args: { path: inferred.path, content } };
+      }
+    }
+    let deterministicLocalAction = null;
+    if (toolUseAllowed && !missionTextMode && intent === 'local_action' && !directUrlIntent.wantsDirectBrowse) {
+      const alexSandboxRoot = getAlexSandboxRoot();
+      deterministicLocalAction = await executeDeterministicLocalAction({
+        message,
+        workdir: alexSandboxRoot,
+        executeTool: async (toolName, args) => executeRegisteredTool({
+          toolName,
+          args,
+          workdir: alexSandboxRoot,
+          db,
+          sessionId,
+        }),
+        logger: console,
+      });
+      if (deterministicLocalAction?.handled) {
+        browseTrace.stages.push(deterministicLocalAction.trace || {
+          stage: 'DETERMINISTIC_LOCAL_ACTION',
+          ok: Boolean(deterministicLocalAction.ok),
+        });
+        if (deterministicLocalAction.ok) {
+          reply = String(deterministicLocalAction.reply || '').trim();
+          candidate = null;
+        } else {
+          reply = String(deterministicLocalAction.error || 'Local action failed');
+          candidate = null;
+        }
+      }
+      console.log('[alex.intent.router]', {
+        intent,
+        confidence: intentInfo?.confidence,
+        reasons: intentInfo?.reasons || [],
+        deterministic_handled: Boolean(deterministicLocalAction?.handled),
+        deterministic_ok: Boolean(deterministicLocalAction?.ok),
+      });
+    }
 
-    if (!candidate) {
-      if (shouldUseMcpBrowse(message) && !mcpServerId) {
+    if (!candidate && !deterministicLocalAction?.handled) {
+      if (wantsBrowse && !mcpServerId) {
+        publishSessionLiveEvent(sessionId, {
+          type: 'error',
+          message: 'Browsing requires an MCP browser server.',
+          requestId,
+          messageId,
+        });
         const friendly = mcpTemplateId
           ? `No running MCP server found for template ${mcpTemplateId}. Open MCP Servers, start one, then retry.`
           : 'Browsing requires an MCP browser server. Create/enable one in MCP Servers.';
@@ -5207,6 +10396,12 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
       }
       runtimeClearError();
       runtimeThinkingStart();
+      publishSessionLiveEvent(sessionId, {
+        type: 'status',
+        message: toolUseAllowed && !missionTextMode ? 'Thinking and planning tool usage' : 'Thinking',
+        requestId,
+        messageId,
+      });
       try {
         const sys = await getPbSystemState(db, { probeTimeoutMs: 1500 });
         const preamble = getAgentPreamble(db);
@@ -5221,11 +10416,15 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
             `).all(sessionId)
           : [];
         const { ts: _ts, stateHash: _h, ...safe } = sys || {};
-        const systemText =
+        const alexSkills = String(agentId || '').trim().toLowerCase() === 'alex' ? await loadAlexSkills() : null;
+        const alexSkillsPrompt = alexSkills ? `${buildAlexSkillsPrompt(alexSkills)}\n\n` : '';
+        let systemText =
           `${preamble}\n\n` +
           `Preferred name: ${sessionMeta.assistant_name}\n\n` +
-          'You are Alex. Use memory context when relevant.\n\n' +
+          'You are Alex. Use memory context when relevant. If the user asks what they said before, what was decided earlier, or what the overnight/build plan was, consult the injected memory first and answer from it before saying you do not know.\n\n' +
+          `${alexSkillsPrompt}` +
           `${injectedMemory.injectedPreface}\n\n` +
+          (atlasContext ? `Atlas recall context:\n${atlasContext}\n\n` : '') +
           'PB System State (source of truth; do not guess values):\n' +
           JSON.stringify(safe, null, 2) +
           '\n\nCurrent scan state:\n' +
@@ -5244,6 +10443,9 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           "- uploads.read_file\n" +
           "- memory.write_scratch (append daily scratch note)\n" +
           "- memory.search (query memory files)\n" +
+          "- memory.atlas.search (query stored prior turns and tool outputs)\n" +
+          "- memory.atlas.dump (dump stored conversation entries)\n" +
+          "- memory.atlas.get_mission (read the current canonical mission text)\n" +
           "- memory.finalize_day (prepare durable redacted patch; invoke applies)\n" +
           "- memory.apply_durable_patch (approval required; invoke-only)\n" +
           "- memory.delete_day (approval required; confirm must be: DELETE YYYY-MM-DD)\n" +
@@ -5255,15 +10457,21 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
           'If a file tool fails, return one concise error with failing tool and path.\n' +
           '\nAttached uploads for this session (reference files):\n' +
           JSON.stringify(uploads, null, 2) + '\n';
+        if (effectiveTextOnlyMode) {
+          systemText = `${systemText}\n\nTOOLS ARE DISABLED. Do not attempt tool calls or MCP calls. Respond in plain text only.`;
+        } else if (missionTextMode) {
+          systemText = buildMissionModeSystemText(systemText);
+        }
         let out = null;
-        if (mcpServerId && shouldUseMcpBrowse(message)) {
+        if (toolUseAllowed && mcpServerId && wantsBrowse) {
           browseTrace.route = 'mcp';
           browseTrace.mcp_server_id = mcpServerId;
         }
         if (!out) {
           const tDirect = Date.now();
-          const wantsContext7 = Boolean(mcpServerId && shouldUseContext7(message));
-          const wantsBrowseCtrl = Boolean(mcpServerId && shouldUseMcpBrowse(message));
+          const wantsContext7 = Boolean(toolUseAllowed && mcpServerId && shouldUseContext7(message));
+          const includeMcpToolsInLoop = Boolean(toolUseAllowed && mcpServerId);
+          const wantsBrowseCtrl = Boolean(toolUseAllowed && mcpServerId && wantsBrowse);
 
           if (wantsBrowseCtrl) {
             // ── Controller path: PB drives MCP search+extract, then asks LLM to summarize ──
@@ -5279,7 +10487,18 @@ export function createAdminRouter({ db, telegram, slack, dataDir }) {
               ctrl_traces: ctrlOut.traces || [],
               error: ctrlOut.error || null,
             });
-            if (ctrlOut.ok && ctrlOut.context) {
+            if (ctrlOut.ok && ctrlOut.direct_text) {
+              out = {
+                ok: true,
+                text: ctrlOut.direct_text,
+                model: null,
+                profile: null,
+                source_type: 'mcp',
+              };
+              routeSources = ctrlOut.sources || [];
+              browseTrace.route = 'mcp';
+              browseTrace.stages.push({ stage: 'MCP_DIRECT_TEXT', ok: true, duration_ms: Date.now() - tDirect });
+            } else if (ctrlOut.ok && ctrlOut.context) {
               const summarizePrompt =
                 `The user asked: "${message}"\n\n` +
                 `Use ONLY the following live web search results to answer. ` +
@@ -5317,25 +10536,44 @@ Code1 usage policy:
 - Return only minimal relevant snippets. Avoid large dumps.
 - Include used libraryId and source URLs in final answer.`
               : systemText;
-            const loopOut = await runOpenAiToolLoop({
+            const loopOut = missionTextMode
+              ? null
+              : await runOpenAiToolLoop({
               db,
               message,
               systemText: loopSystemText,
               sessionId,
+              agentId,
               reqSignal: reqAbort.signal,
               workdir: getWorkdir(),
-              mcpServerId: wantsContext7 ? mcpServerId : null,
-              includeMcpTools: wantsContext7,
+              mcpServerId: includeMcpToolsInLoop ? mcpServerId : null,
+              includeMcpTools: includeMcpToolsInLoop,
               rid: requestId,
+              intent,
+              toolPolicyConfig,
             });
-            if (loopOut?.ok) {
-              out = { ok: true, text: loopOut.text, model: loopOut.model, profile: loopOut.profile, context7: loopOut.context7 || null, source_type: 'builtin' };
+            const guardedLoopOut = ensureToolTracePresence(toolRequirement, loopOut);
+            if (guardedLoopOut?.ok) {
+              out = { ok: true, text: guardedLoopOut.text, model: guardedLoopOut.model, profile: guardedLoopOut.profile, context7: guardedLoopOut.context7 || null, source_type: 'builtin' };
               browseTrace.route = 'direct';
-              browseTrace.stages.push({ stage: 'CALL_LLM_TOOLS', ok: true, duration_ms: Date.now() - tDirect, tool_traces: loopOut.traces || [] });
+              browseTrace.stages.push({ stage: 'CALL_LLM_TOOLS', ok: true, duration_ms: Date.now() - tDirect, tool_traces: guardedLoopOut.traces || [] });
             } else {
-              out = await llmChatOnce({ db, messageText: message, systemText, sessionId, agentId, chatId, timeoutMs: webchatTimeoutMs(), signal: reqAbort.signal });
-              browseTrace.route = 'direct';
-              browseTrace.stages.push({ stage: 'CALL_LLM', ok: Boolean(out?.ok), duration_ms: Date.now() - tDirect, fallback_from: 'tool_loop', fallback_error: loopOut?.error || null });
+              if (!missionTextMode && toolRequirement.required) {
+                out = { ok: false, error: String(guardedLoopOut?.error || 'TOOL_REQUIRED_NO_TRACES'), detail: guardedLoopOut?.detail || null };
+                browseTrace.route = 'direct';
+                browseTrace.stages.push({
+                  stage: 'CALL_LLM_TOOLS',
+                  ok: false,
+                  duration_ms: Date.now() - tDirect,
+                  tool_traces: guardedLoopOut?.traces || [],
+                  error: String(guardedLoopOut?.error || 'TOOL_REQUIRED_NO_TRACES'),
+                  no_direct_finalize: true,
+                });
+              } else {
+                out = await llmChatOnce({ db, messageText: message, systemText, sessionId, agentId, chatId, timeoutMs: webchatTimeoutMs(), signal: reqAbort.signal });
+                browseTrace.route = 'direct';
+                browseTrace.stages.push({ stage: 'CALL_LLM', ok: Boolean(out?.ok), duration_ms: Date.now() - tDirect, fallback_from: missionTextMode ? 'mission_text_mode' : 'tool_loop', fallback_error: guardedLoopOut?.error || null });
+              }
             }
           }
           browseTrace.total_duration_ms = Date.now() - routeStartMs;
@@ -5349,24 +10587,82 @@ Code1 usage policy:
           } catch {}
         }
         if (!out.ok) {
+          publishSessionLiveEvent(sessionId, {
+            type: 'error',
+            message: String(out.error || 'WebChat failed'),
+            requestId,
+            messageId,
+            stderr: previewText(out?.detail?.cause || out?.detail?.message || out?.error || 'WebChat failed', 2000),
+          });
           const errText = String(out.error || 'WebChat failed');
           if (errText.toLowerCase().includes('aborted') || errText.toLowerCase().includes('client disconnected')) {
             return res.status(499).json({ ok: false, error: 'CLIENT_ABORTED', message: 'Client disconnected', browse_trace: browseTrace });
           }
           const detail = out?.detail && typeof out.detail === 'object' ? out.detail : null;
+          if (errText === 'TOOL_CALL_REJECTED') {
+            return res.status(502).json({
+              ok: false,
+              error: 'TOOL_CALL_REJECTED',
+              reason: detail?.reason || 'tool_call_rejected',
+              allowed_tools: Array.isArray(detail?.allowed_tools) ? detail.allowed_tools : [],
+              hint: String(detail?.hint || 'Return a valid tool call using the attached tool schema.'),
+              message: 'TOOL_CALL_REJECTED',
+              detail,
+              browse_trace: browseTrace,
+            });
+          }
           return res.status(502).json({ ok: false, error: errText, message: errText, detail, browse_trace: browseTrace });
         }
         reply = String(out.text || '').trim();
-        // Guard: strip any <tools> blocks or mcp.browser.* syntax that a local LLM hallucinated.
-        if (/<tools>|mcp\.browser\./i.test(reply)) {
+        publishSessionLiveEvent(sessionId, {
+          type: 'status',
+          message: 'Assistant reply ready',
+          requestId,
+          messageId,
+        });
+        const hasToolBlock = /<tools>/i.test(reply);
+        const claimsMcpTool = /mcp\.browser\./i.test(reply);
+        const replyToolProposal = parseToolProposalFromReply(reply);
+        const mcpExecuted = Array.isArray(browseTrace.stages) && browseTrace.stages.some((st) => {
+          if (String(st?.stage || '') === 'MCP_CONTROLLER') {
+            const ct = Array.isArray(st?.ctrl_traces) ? st.ctrl_traces : [];
+            return ct.some((x) => Boolean(x?.ok));
+          }
+          if (String(st?.stage || '') === 'CALL_LLM_TOOLS') {
+            const tt = Array.isArray(st?.tool_traces) ? st.tool_traces : [];
+            return tt.some((x) => String(x?.tool || '').startsWith('mcp.'));
+          }
+          return false;
+        });
+        const localToolTraces = Array.isArray(browseTrace.stages)
+          ? browseTrace.stages.flatMap((st) => Array.isArray(st?.tool_traces) ? st.tool_traces : [])
+          : [];
+        const localToolsExecuted = localToolTraces.some((trace) => {
+          const tool = String(trace?.tool || '');
+          return trace?.ok && (
+            tool.startsWith('workspace.')
+            || tool.startsWith('tools.fs.')
+            || tool === 'tools.proc.exec'
+            || tool === 'memory.write_scratch'
+          );
+        });
+        // Guard: strip explicit tool call payloads, and only strip mcp.browser claims when no MCP execution actually occurred.
+        if (hasToolBlock || (claimsMcpTool && !mcpExecuted)) {
           console.warn(`[webchat.guardrail] Tool-hallucination detected. rid=${requestId}`);
           reply = reply.replace(/<tools>[\s\S]*?<\/tools>/gi, '').replace(/<tools>[\s\S]*/gi, '').trim();
-          if (/mcp\.browser\./i.test(reply) || !reply) {
+          if ((claimsMcpTool && !mcpExecuted) || !reply) {
             reply = routeSources.length > 0
               ? `I found some sources but had trouble formatting the answer:\n${routeSources.slice(0, 3).map((u) => `- ${u}`).join('\n')}`
               : 'I encountered an issue processing the response. Please try again.';
           }
-          browseTrace.stages.push({ stage: 'GUARDRAIL', ok: false, error: 'TOOL_HALLUCINATION', stripped: true });
+          browseTrace.stages.push({
+            stage: 'GUARDRAIL',
+            ok: false,
+            error: 'TOOL_HALLUCINATION',
+            stripped: true,
+            claims_mcp_tool: claimsMcpTool,
+            mcp_executed: mcpExecuted,
+          });
         }
         const isUrlOnly = /^https?:\/\/[^\s]+$/.test(reply.trim());
         if (looksLikeRawBrowserDump(reply) || isUrlOnly) {
@@ -5379,6 +10675,33 @@ Code1 usage policy:
           }
           browseTrace.stages.push({ stage: 'GUARDRAIL', ok: false, error: 'LLM_OUTPUT_RAW', original_reply_preview: String(out.text || '').slice(0, 100) });
         }
+        if (replyToolProposal && localToolsExecuted) {
+          reply = summarizeExecutedToolReply(localToolTraces);
+          browseTrace.stages.push({
+            stage: 'GUARDRAIL',
+            ok: true,
+            error: 'INLINE_TOOL_REPLY_SUPPRESSED',
+            original_reply_preview: String(out.text || '').slice(0, 100),
+          });
+        } else if (replyToolProposal && !localToolsExecuted && !mcpExecuted) {
+          // Model emitted raw JSON tool call but nothing was executed — strip it
+          // and explain why instead of showing raw JSON to user.
+          const toolName = replyToolProposal.toolName || replyToolProposal.rawToolName || 'unknown';
+          console.warn(`[webchat.guardrail] Raw JSON tool-call reply stripped. rid=${requestId} tool=${toolName}`);
+          if (toolUseAllowed) {
+            reply = `I tried to use tool \`${toolName}\` but could not execute it. Please try rephrasing your request, or use /tools on to ensure tools are enabled.`;
+          } else {
+            reply = `I wanted to use tool \`${toolName}\` to complete your request, but tools are currently disabled. Use /run or /tools on to enable tools.`;
+          }
+          browseTrace.stages.push({
+            stage: 'GUARDRAIL',
+            ok: false,
+            error: 'RAW_JSON_TOOL_CALL_STRIPPED',
+            original_reply_preview: String(out.text || '').slice(0, 100),
+            tool_name: toolName,
+            tools_enabled: toolUseAllowed,
+          });
+        }
         model = out.model || null;
         provider = out.profile || null;
         routeSourceType = String(out?.source_type || 'builtin');
@@ -5388,20 +10711,78 @@ Code1 usage policy:
           routeSources = Array.isArray(out?.sources) ? out.sources.map((x) => String(x || '')).filter(Boolean) : [];
         }
         routeContext7 = out?.context7 || null;
-        if (shouldUseMcpBrowse(message) && routeSourceType !== 'mcp') {
+        const mcpControllerAttempted = Array.isArray(browseTrace.stages)
+          && browseTrace.stages.some((st) => String(st?.stage || '') === 'MCP_CONTROLLER');
+        if (wantsBrowse && routeSourceType !== 'mcp' && !mcpControllerAttempted) {
           // Never hard-fail: fall through with the LLM reply rather than returning an error.
           console.warn(`[webchat.guardrail] Browse needed but MCP route not used. rid=${requestId} srv=${mcpServerId || '-'} routeType=${routeSourceType}`);
           browseTrace.stages.push({ stage: 'GUARDRAIL', ok: false, error: 'ROUTE_NOT_MCP', remediation: 'check MCP server config' });
         }
-        candidate = parseToolProposalFromReply(reply) || candidate;
+        // If MCP tools already executed in this turn, do not re-parse assistant text
+        // into a new proposal candidate. That can incorrectly reclassify executed
+        // mcp.* tool names as unknown local proposals.
+        if (mcpExecuted || (replyToolProposal && localToolsExecuted)) {
+          candidate = null;
+        } else {
+          candidate = replyToolProposal || candidate;
+        }
+        ingestAtlasTurn(sessionId, 'assistant', reply, {
+          request_id: requestId,
+          model,
+          provider,
+          source_type: routeSourceType,
+        });
+        await getAtlasEngine().maybeCompact({
+          sessionId,
+          summarize: async (prompt) => {
+            const compactOut = await llmChatOnce({
+              db,
+              messageText: prompt,
+              systemText: 'Summarize for future recall; preserve tasks, decisions, file paths, commands, constraints.',
+              sessionId,
+              agentId: ATLAS_AGENT_ID,
+              chatId,
+              timeoutMs: webchatTimeoutMs(),
+              signal: reqAbort.signal,
+            });
+            return String(compactOut?.text || '').trim();
+          },
+        }).catch(() => ({ compacted: false }));
       } catch (e) {
+        publishSessionLiveEvent(sessionId, {
+          type: 'error',
+          message: String(e?.message || e),
+          requestId,
+          messageId,
+          stderr: previewText(e?.detail?.stderr || e?.detail?.cause || e?.message || e, 2000),
+        });
         runtimeSetError(e?.message || e);
         return res.status(502).json({ ok: false, error: String(e?.message || e), message: String(e?.message || e), detail: { stage: 'CALL_MCP', cause: String(e?.message || e), remediation: 'Retry request and verify MCP/WebUI health.' }, browse_trace: browseTrace });
       } finally {
         runtimeThinkingEnd();
       }
-    } else {
-      reply = `Drafted tool proposal for \`${candidate.toolName}\`. Review the card below and click Invoke tool to run it on server.`;
+    } else if (!deterministicLocalAction?.handled) {
+      if (intent === 'local_action' || intent === 'mixed') {
+        const alexSandboxRoot = getAlexSandboxRoot();
+        const localRun = await runLocalActionWithRetry({
+          db,
+          sessionId,
+          workdir: alexSandboxRoot,
+          candidate,
+          message,
+          maxRetries: 1,
+        });
+        if (localRun.ok) {
+          reply = formatLocalActionReply(candidate.toolName, localRun.runOut);
+          candidate = null;
+        } else {
+          const friendlyError = formatLocalActionError(db, sessionId, localRun.err, localRun.error);
+          reply = `Local action failed after ${localRun.attempts} attempt(s): ${friendlyError}`;
+          candidate = null;
+        }
+      } else {
+        reply = `Drafted tool proposal for \`${candidate.toolName}\`. Review the card below and click Invoke tool to run it on server.`;
+      }
     }
 
     let proposal = null;
@@ -5461,9 +10842,73 @@ Code1 usage policy:
           : undefined,
       });
     }
+    if (candidate && (
+      candidate.toolName === 'mcp.browser.search'
+      || candidate.toolName === 'mcp.browser.extract_text'
+      || candidate.toolName === 'mcp.browser.open_url'
+      || candidate.toolName === 'mcp.export.write_markdown'
+      || candidate.toolName === 'mcp.export.write_csv'
+    )) {
+      // Web browsing should run through MCP controller/runtime routes, not proposal tools.
+      candidate = null;
+    }
+    if (candidate && String(candidate.toolName || '').startsWith('mcp.')) {
+      // MCP tools execute via MCP runtime/controller paths, not TOOL_REGISTRY.
+      candidate = null;
+    }
     if (candidate && !TOOL_REGISTRY[candidate.toolName]) {
       reply = `Tool error: unknown tool '${candidate.toolName}'. Available file tools are list_dir/read_file/write_file/mkdir.`;
       candidate = null;
+    }
+
+    // Local action completion guard: if user asked for a filesystem artifact, verify it exists.
+    // Retry one direct write if missing, then return actionable diagnostics.
+    if (intent === 'local_action' || intent === 'mixed') {
+      const alexSandboxRoot = getAlexSandboxRoot();
+      const inferred = inferRequestedArtifact(message);
+      if (inferred?.path && !shouldSkipArtifactVerification({ messageText: message, missionTextMode, inferred })) {
+        let verify = await verifyLocalActionOutcome({ workdir: alexSandboxRoot, userText: message });
+        if (!verify.ok) {
+          const inferredExt = path.extname(path.basename(String(inferred.path || ''))).toLowerCase();
+          const binaryRetryBlocked = Boolean(inferred.binary || isBinaryWriteExtension(inferredExt));
+          if (binaryRetryBlocked) {
+            verify = {
+              required: true,
+              ok: false,
+              path: inferred.path,
+              reason: 'writefile_binary_blocked',
+              error: 'Binary outputs cannot be created with writeFile. Use proc.exec + copyPath/movePath.',
+            };
+          } else {
+          const content = inferred.expectedContent || (intent === 'mixed' ? reply : 'Created by Alex');
+          try {
+            await executeRegisteredTool({
+              toolName: 'workspace.write_file',
+              args: { path: inferred.path, content: String(content || 'Created by Alex') },
+              workdir: alexSandboxRoot,
+              db,
+              sessionId,
+            });
+            verify = await verifyLocalActionOutcome({ workdir: alexSandboxRoot, userText: message });
+          } catch (e) {
+            verify = {
+              required: true,
+              ok: false,
+              path: inferred.path,
+              reason: 'retry_failed',
+              error: String(e?.message || e),
+            };
+          }
+          }
+        }
+        if (verify.ok) {
+          const success = `Created ${verify.path} (${Number(verify.bytes || 0)} bytes).`;
+          if (intent === 'mixed') reply = `${reply}\n\nSaved notes to file: ${success}`;
+          else reply = success;
+        } else {
+          reply = `Local action could not be verified: ${verify.reason || 'verification_failed'}${verify.path ? ` (${verify.path})` : ''}${verify.error ? ` - ${verify.error}` : ''}`;
+        }
+      }
     }
 
     if (reply) {
@@ -5504,11 +10949,21 @@ Code1 usage policy:
       }
     }
 
+    publishSessionLiveEvent(sessionId, {
+      type: 'done',
+      message: 'Request complete',
+      requestId,
+      messageId,
+      ok: true,
+    });
+
     return res.json({
       ok: true,
       session_id: sessionId,
       message_id: messageId,
       session_meta: sessionMeta,
+      mission_path: atlasMission.mission_path,
+      mission_preview: String(atlasMission.mission_text || '').slice(0, 1200),
       reply,
       model,
       provider,
@@ -5534,6 +10989,20 @@ Code1 usage policy:
       chosenTemplateReason,
       chosen_mcp_server_id: chosenMcpServerId,
       chosen_mcp_server_reason: chosenMcpServerReason,
+      intent_classification: intentInfo,
+      policy: {
+        strict: Boolean(toolPolicyConfig.strict),
+        web_enabled: Boolean(toolPolicyConfig.webEnabled),
+        web_allowed_intents: Array.isArray(toolPolicyConfig.webAllowedIntents) ? toolPolicyConfig.webAllowedIntents : [],
+      },
+      deterministic_local_action: deterministicLocalAction
+        ? {
+          handled: Boolean(deterministicLocalAction.handled),
+          ok: Boolean(deterministicLocalAction.ok),
+          tool: deterministicLocalAction?.parsed?.toolName || deterministicLocalAction?.trace?.tool || null,
+          verification: deterministicLocalAction?.verification || deterministicLocalAction?.diagnostics || null,
+        }
+        : null,
       browse_intent: wantsBrowse,
       route_selected: browseTrace.route || 'direct',
       mcp_server_selected: chosenMcpServerId,
@@ -6130,30 +11599,64 @@ Code1 usage policy:
     res.json({ ok: true, session_id: sessionId, state: getScanStateForSession(db, sessionId) });
   });
 
-  r.get('/webchat/session-meta', (req, res) => {
+  r.get('/webchat/session-meta', async (req, res) => {
     const sessionId = String(req.query.session_id || 'webchat-default').trim() || 'webchat-default';
-    return res.json({ ok: true, meta: getWebchatSessionMeta(db, sessionId) });
+    const meta = getWebchatSessionMeta(db, sessionId);
+    const buildLoop = await readBuildLoopState().catch(() => ({ ...DEFAULT_BUILD_LOOP_STATE }));
+    const skills = await loadAlexSkills().catch(() => []);
+    const mission = await loadAtlasMission({ db, sessionId }).catch(() => ({ mission_path: getAtlasMissionPath(db, sessionId), mission_text: '' }));
+    return res.json({
+      ok: true,
+      meta,
+      tools_enabled: meta.webchat_tools_mode === 'session' || meta.assistant_name.toLowerCase() === 'alex',
+      overnight: getOvernightState(db, sessionId),
+      build_loop: buildLoop,
+      mission_path: mission.mission_path,
+      mission_preview: String(mission.mission_text || '').slice(0, 1200),
+      skills_loaded: skills.filter((skill) => skill.enabled).map((skill) => ({ id: skill.id, filename: skill.filename, missing: Boolean(skill.missing) })),
+    });
   });
 
-  r.post('/webchat/session-meta', (req, res) => {
+  r.post('/webchat/session-meta', async (req, res) => {
     const sessionId = String(req.body?.session_id || 'webchat-default').trim() || 'webchat-default';
     const assistantName = String(req.body?.assistant_name || '').trim();
     const mcpServerId = String(req.body?.mcp_server_id || '').trim();
     const mcpTemplateId = String(req.body?.mcp_template_id || '').trim();
-    const meta = setWebchatSessionMeta(db, sessionId, { assistant_name: assistantName, mcp_server_id: mcpServerId, mcp_template_id: mcpTemplateId });
+    const meta = setWebchatSessionMeta(db, sessionId, {
+      assistant_name: assistantName,
+      mcp_server_id: mcpServerId,
+      mcp_template_id: mcpTemplateId,
+      webchat_text_only: req.body?.webchat_text_only,
+      webchat_tools_mode: req.body?.webchat_tools_mode,
+    });
     recordEvent(db, 'webchat.session_meta.updated', {
       session_id: sessionId,
       assistant_name: meta.assistant_name,
       mcp_server_id: meta.mcp_server_id || null,
       mcp_template_id: meta.mcp_template_id || null,
+      webchat_text_only: Boolean(meta.webchat_text_only),
+      webchat_tools_mode: meta.webchat_tools_mode,
     });
-    return res.json({ ok: true, meta });
+    const buildLoop = await readBuildLoopState().catch(() => ({ ...DEFAULT_BUILD_LOOP_STATE }));
+    const skills = await loadAlexSkills().catch(() => []);
+    const mission = await loadAtlasMission({ db, sessionId }).catch(() => ({ mission_path: getAtlasMissionPath(db, sessionId), mission_text: '' }));
+    return res.json({
+      ok: true,
+      meta,
+      tools_enabled: meta.webchat_tools_mode === 'session' || meta.assistant_name.toLowerCase() === 'alex',
+      overnight: getOvernightState(db, sessionId),
+      build_loop: buildLoop,
+      mission_path: mission.mission_path,
+      mission_preview: String(mission.mission_text || '').slice(0, 1200),
+      skills_loaded: skills.filter((skill) => skill.enabled).map((skill) => ({ id: skill.id, filename: skill.filename, missing: Boolean(skill.missing) })),
+    });
   });
 
   r.get('/webchat/memory', (req, res) => {
     const sessionId = String(req.query?.session_id || 'webchat-default');
     const agentId = String(req.query?.agent_id || MEMORY_AGENT_ID);
     const injected = loadMemory({ db, agentId, chatId: sessionId });
+    const missionPath = getAtlasMissionPath(db, sessionId);
     return res.json({
       ok: true,
       agent_id: agentId,
@@ -6164,7 +11667,68 @@ Code1 usage policy:
       summary_chars: injected.chars.summary,
       updated_at: injected.updatedAt,
       injected_preview: injected.injectedPreface.slice(0, 1200),
+      mission_path: missionPath,
     });
+  });
+
+  r.get('/atlas/status', (_req, res) => {
+    try {
+      return res.json({ ok: true, ...getAtlasEngine().status() });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'ATLAS_STATUS_FAILED', message: String(e?.message || e) });
+    }
+  });
+
+  r.post('/atlas/reindex_session', async (req, res) => {
+    const sessionId = String(req.body?.session_id || '').trim();
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: 'SESSION_ID_REQUIRED', message: 'session_id is required.' });
+    }
+    try {
+      const engine = getAtlasEngine();
+      let replayed = 0;
+      if (hasTable(db, 'memory_entries')) {
+        const rows = db.prepare(`
+          SELECT id, kind, title, content, meta_json, ts
+          FROM memory_entries
+          WHERE source_session_id = ?
+          ORDER BY datetime(ts) ASC, id ASC
+        `).all(sessionId);
+        for (const row of rows) {
+          engine.ingestMessage({
+            sessionId,
+            role: 'system',
+            kind: row.kind || 'memory_entry',
+            content: String(row.content || ''),
+            messageId: `memory_entry_${row.id}`,
+            createdAt: row.ts || nowIso(),
+            meta: {
+              title: row.title || null,
+              source: 'memory_entries',
+              meta_json: safeJsonParse(row.meta_json || '{}', {}),
+            },
+          });
+          replayed += 1;
+        }
+      }
+      const mission = await loadAtlasMission({ db, sessionId });
+      if (mission.mission_text) {
+        engine.rememberMission({
+          sessionId,
+          missionText: mission.mission_text,
+          missionPath: mission.mission_path,
+        });
+      }
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        replayed_messages: replayed,
+        mission_path: mission.mission_path,
+        mission_bytes: Buffer.byteLength(String(mission.mission_text || ''), 'utf8'),
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'ATLAS_REINDEX_FAILED', message: String(e?.message || e) });
+    }
   });
 
 
@@ -6301,30 +11865,20 @@ Code1 usage policy:
       });
     }
 
-    const workspaceRoot = getWorkspaceRoot();
-    const pbDir = path.join(workspaceRoot, '.pb');
-    const envPath = path.join(dataDir, '.env');
-    const dbPath = path.join(dataDir, 'proworkbench.db');
-
-    async function rmrf(p) {
-      try { await fsp.rm(p, { recursive: true, force: true }); return true; } catch { return false; }
+    try {
+      const report = await executeFactoryReset({ db, dataDir });
+      res.json({
+        ok: true,
+        report,
+        requires_restart: false,
+        message: 'Factory reset complete. Conversations, memory, and temporary user state were cleared while tools, MCP, and core config were preserved.',
+      });
+      if (typeof scheduleFactoryResetRestart === 'function') {
+        scheduleFactoryResetRestart({ report });
+      }
+    } catch (e) {
+      res.status(500).json({ ok: false, error: 'FACTORY_RESET_FAILED', message: String(e?.message || e) });
     }
-
-    // Close the DB before deleting it so SQLite flushes WAL.
-    try { if (db && typeof db.close === 'function') db.close(); } catch {}
-
-    const removed = {
-      pbDir: await rmrf(pbDir),
-      env: await rmrf(envPath),
-      db: await rmrf(dbPath),
-      dbWal: await rmrf(`${dbPath}-wal`),
-      dbShm: await rmrf(`${dbPath}-shm`),
-    };
-
-    res.json({ ok: true, removed, requires_restart: true, message: 'Factory reset complete. Server will restart.' });
-
-    // Exit so node --watch / dev runner restarts with a clean slate.
-    setTimeout(() => process.exit(0), 200);
   });
 
   return r;

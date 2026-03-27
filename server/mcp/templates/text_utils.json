@@ -8,10 +8,19 @@
   "requiresApprovalByDefault": false,
   "fields": [],
   "securityDefaults": {
+    "testPlan": [
+      "text.slugify",
+      "text.word_count",
+      "text.extract_urls"
+    ],
     "workdirOnly": true,
     "pathAllowlist": ["{PB_WORKDIR}"],
     "domainAllowlist": [],
     "commandAllowlist": []
-  }
+  },
+  "defaultCapabilities": [
+    "text.slugify",
+    "text.word_count",
+    "text.extract_urls"
+  ]
 }
-

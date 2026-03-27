@@ -6,6 +6,8 @@ import path from 'node:path';
 import net from 'node:net';
 import http from 'node:http';
 import https from 'node:https';
+import BetterSqlite3 from 'better-sqlite3';
+import { fileURLToPath } from 'node:url';
 import { requireAuth } from './middleware.js';
 import { hasMcpSecretKey, encryptSecret, isEncryptedSecret } from '../mcp/secrets.js';
 import { recordEvent } from '../util/events.js';
@@ -13,6 +15,9 @@ import { assertNotHelperOrigin, assertWebchatOnly } from './channel.js';
 import { canvasItemForMcpAction } from '../canvas/canvas.js';
 import { assertNavigationAllowed, getBrowserAllowlist, getSessionApprovedDomains, normalizeDomainRules } from '../browser/allowlist.js';
 import { normalizeMcpResult, parseSerpResultsFromHtml } from '../mcp/extract.js';
+import { getWorkspaceRoot } from '../util/workspace.js';
+import { approvalsEnabled } from '../util/approvals.js';
+import { getPbRoot } from '../util/dataDir.js';
 
 const CANVAS_MCP_ID = 'mcp_EF881B855521';
 
@@ -37,7 +42,61 @@ const ALLOWED_MCP_CAPABILITIES = new Set([
   'chat_media.read_messages',
   'resolve-library-id',
   'query-docs',
+  'json.format',
+  'json.validate',
+  'http.fetch',
+  'sqlite.exec',
+  'sqlite.query',
+  'export.write_markdown',
+  'export.write_csv',
+  'text.slugify',
+  'text.word_count',
+  'text.extract_urls',
+  'pb_files.list',
+  'pb_files.read',
+  'pb_files.write',
+  'pb_files.mkdir',
+  'pb_files.delete',
+  'kdenlive.make_aligned_project',
 ]);
+
+const CANONICAL_CAPABILITY_ALIASES = new Map([
+  ['pb.files.list', 'pb_files.list'],
+  ['pb.files.list_dir', 'pb_files.list'],
+  ['pb.files.read', 'pb_files.read'],
+  ['pb.files.read_file', 'pb_files.read'],
+  ['pb.files.write', 'pb_files.write'],
+  ['pb.files.write_file', 'pb_files.write'],
+  ['pb.files.mkdir', 'pb_files.mkdir'],
+  ['pb.files.delete', 'pb_files.delete'],
+  ['pb.kdenlive.make_aligned_project', 'kdenlive.make_aligned_project'],
+  ['pb.reports.write_markdown', 'export.write_markdown'],
+  ['pb.reports.write_csv', 'export.write_csv'],
+  ['pb.sqlite.exec', 'sqlite.exec'],
+  ['pb.sqlite.query', 'sqlite.query'],
+]);
+
+const RUNTIME_TO_CANONICAL_CAPABILITY = new Map([
+  ['pb_files.list', 'pb.files.list'],
+  ['pb_files.read', 'pb.files.read'],
+  ['pb_files.write', 'pb.files.write'],
+  ['pb_files.mkdir', 'pb.files.mkdir'],
+  ['pb_files.delete', 'pb.files.delete'],
+  ['kdenlive.make_aligned_project', 'pb.kdenlive.make_aligned_project'],
+  ['export.write_markdown', 'pb.reports.write_markdown'],
+  ['export.write_csv', 'pb.reports.write_csv'],
+  ['sqlite.exec', 'pb.sqlite.exec'],
+  ['sqlite.query', 'pb.sqlite.query'],
+]);
+
+const SIMPLE_CAPABILITY_GROUPS = {
+  pb_files_rw: ['pb_files.list', 'pb_files.read', 'pb_files.write', 'pb_files.mkdir', 'pb_files.delete'],
+  pb_files_safe_rw: ['pb_files.list', 'pb_files.read', 'pb_files.write', 'pb_files.mkdir'],
+  kdenlive_aligned: ['kdenlive.make_aligned_project'],
+  reports_markdown: ['export.write_markdown'],
+  reports_csv: ['export.write_csv'],
+  sqlite_rw: ['sqlite.exec', 'sqlite.query'],
+};
 
 const DEFAULT_FORBIDDEN_CAPABILITY_PREFIXES = [
   'filesystem.',
@@ -74,6 +133,43 @@ function safeJsonParse(text, fallback) {
 function shortId(prefix = 'mcp') {
   const raw = crypto.randomBytes(6).toString('hex').toUpperCase();
   return `${prefix}_${raw}`;
+}
+
+function slugifyLabel(value, fallback = 'server') {
+  const slug = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 48);
+  return slug || fallback;
+}
+
+function normalizeCapabilityAlias(capability) {
+  const raw = String(capability || '').trim();
+  if (!raw) return '';
+  return CANONICAL_CAPABILITY_ALIASES.get(raw) || raw;
+}
+
+function canonicalCapabilityName(capability) {
+  const runtime = normalizeCapabilityAlias(capability);
+  return RUNTIME_TO_CANONICAL_CAPABILITY.get(runtime) || runtime;
+}
+
+function toolNameForCapability(capability) {
+  const runtime = normalizeCapabilityAlias(capability);
+  if (!runtime) return '';
+  if (runtime === 'resolve-library-id' || runtime === 'query-docs') return runtime;
+  return runtime.startsWith('mcp.') ? runtime : `mcp.${runtime}`;
+}
+
+function buildServerId(displayName) {
+  return `mcp_${slugifyLabel(displayName, 'custom')}_${crypto.randomBytes(3).toString('hex')}`;
+}
+
+function buildDisplayName(input, fallback = 'Custom MCP Server') {
+  const txt = String(input || '').trim();
+  return txt || fallback;
 }
 
 
@@ -134,7 +230,148 @@ function getRuntimeBaseUrlFromRow(row) {
 }
 
 function getPbWorkdir() {
-  return String(process.env.PB_WORKDIR || path.join(os.homedir(), '.proworkbench')).trim();
+  return String(process.env.PB_WORKDIR || process.env.PROWORKBENCH_WORKDIR || getWorkspaceRoot() || path.join(os.homedir(), '.proworkbench')).trim();
+}
+
+const HTTP_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PB_FILES_RUNTIME_PATH = path.resolve(HTTP_DIR, '..', '..', 'mcp', 'runtimes', 'pb-files-mcp.js');
+const KDENLIVE_ALIGNED_RUNTIME_PATH = path.resolve(HTTP_DIR, '..', '..', 'mcp', 'runtimes', 'kdenlive-aligned-mcp.js');
+
+function inferPbFilesEntryCmd({ templateId, configObj }) {
+  const tid = String(templateId || '').trim();
+  if (tid !== 'fs_readonly' && tid !== 'fs_readwrite') return '';
+  const mode = tid === 'fs_readwrite' ? 'rw' : 'ro';
+  const root = String(configObj?.rootPath || configObj?.root_path || getPbWorkdir()).trim() || getPbWorkdir();
+  return `${process.execPath} ${PB_FILES_RUNTIME_PATH} --mode=${mode} --root=${root}`;
+}
+
+function inferKdenliveAlignedEntryCmd({ templateId, configObj }) {
+  const tid = String(templateId || '').trim();
+  if (tid !== 'kdenlive_aligned_5s_scene_builder') return '';
+  const root = String(configObj?.rootPath || configObj?.root_path || getPbWorkdir()).trim() || getPbWorkdir();
+  return `${process.execPath} ${KDENLIVE_ALIGNED_RUNTIME_PATH} --root=${root}`;
+}
+
+function resolveInsideWorkdir(rawPath, { allowMissing = true } = {}) {
+  const input = String(rawPath || '').trim();
+  if (!input) {
+    const err = new Error('path required');
+    err.code = 'BAD_REQUEST';
+    throw err;
+  }
+  const root = path.resolve(getPbWorkdir());
+  const candidate = path.isAbsolute(input) ? path.resolve(input) : path.resolve(root, input);
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+    const err = new Error('Path escapes PB_WORKDIR');
+    err.code = 'PATH_OUTSIDE_WORKDIR';
+    throw err;
+  }
+  if (!allowMissing && !fs.existsSync(candidate)) {
+    const err = new Error('Path not found');
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  return candidate;
+}
+
+function slugifyText(input) {
+  return String(input || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function parseDomainAllowlist(config = {}) {
+  const csv = String(config.domainAllowlistCsv || config.domain_allowlist_csv || '').trim();
+  const fromCsv = csv ? csv.split(',').map((x) => String(x || '').trim().toLowerCase()).filter(Boolean) : [];
+  const fromArray = Array.isArray(config.domainAllowlist) ? config.domainAllowlist.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean) : [];
+  return Array.from(new Set([...fromCsv, ...fromArray]));
+}
+
+function isHostAllowed(hostname, allowlist) {
+  const host = String(hostname || '').trim().toLowerCase();
+  if (!host) return false;
+  return allowlist.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+}
+
+function inferInternalCapsFromTemplate(templateId) {
+  const id = String(templateId || '').trim();
+  if (id === 'json_utils') return ['json.format', 'json.validate'];
+  if (id === 'http_fetch') return ['http.fetch'];
+  if (id === 'sqlite_local') return ['sqlite.exec', 'sqlite.query'];
+  if (id === 'export_reports') return ['export.write_markdown', 'export.write_csv'];
+  if (id === 'text_utils') return ['text.slugify', 'text.word_count', 'text.extract_urls'];
+  if (id === 'code1' || id === 'code1_docs_default') return ['resolve-library-id', 'query-docs'];
+  if (id === 'kdenlive_aligned_5s_scene_builder') return ['kdenlive.make_aligned_project'];
+  return [];
+}
+
+function hasFallbackCapability(capabilities = []) {
+  const caps = Array.isArray(capabilities) ? capabilities : [];
+  return caps.some((cap) => [
+    'browser.search',
+    'browser.open_url',
+    'browser.extract_text',
+    'json.format',
+    'json.validate',
+    'http.fetch',
+    'sqlite.exec',
+    'sqlite.query',
+    'export.write_markdown',
+    'export.write_csv',
+    'text.slugify',
+    'text.word_count',
+    'text.extract_urls',
+    'resolve-library-id',
+    'query-docs',
+    'pb_files.list',
+    'pb_files.read',
+    'pb_files.write',
+    'pb_files.mkdir',
+    'pb_files.delete',
+    'kdenlive.make_aligned_project',
+  ].includes(String(cap)));
+}
+
+function sampleArgsForCapability(capability, serverRow) {
+  const cap = String(capability || '').trim();
+  if (cap === 'browser.search') return { q: 'example domain', limit: 3 };
+  if (cap === 'browser.open_url' || cap === 'browser.extract_text') return { url: 'https://example.com' };
+  if (cap === 'json.format') return { text: '{"b":2,"a":1}' };
+  if (cap === 'json.validate') return { text: '{"ok":true}' };
+  if (cap === 'http.fetch') return { url: 'https://example.com' };
+  if (cap === 'sqlite.exec') {
+    const cfg = safeJsonParse(serverRow?.config_json || '{}', {});
+    return { db_path: String(cfg.dbPath || 'mcp_audit/test.sqlite'), sql: 'CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)' };
+  }
+  if (cap === 'sqlite.query') {
+    const cfg = safeJsonParse(serverRow?.config_json || '{}', {});
+    return { db_path: String(cfg.dbPath || 'mcp_audit/test.sqlite'), sql: 'SELECT 1 AS ok' };
+  }
+  if (cap === 'export.write_markdown') return { path: 'mcp_audit/test.md', content: '# audit' };
+  if (cap === 'export.write_csv') return { path: 'mcp_audit/test.csv', content: 'a,b\n1,2\n' };
+  if (cap === 'text.slugify') return { text: 'Hello World' };
+  if (cap === 'text.word_count') return { text: 'one two three' };
+  if (cap === 'text.extract_urls') return { text: 'https://example.com and https://example.org' };
+  if (cap === 'resolve-library-id') return { query: 'react' };
+  if (cap === 'query-docs') return { libraryId: 'react', query: 'hooks' };
+  if (cap === 'pb_files.list') return { path: '.' };
+  if (cap === 'pb_files.read') return { path: 'mcp_audit/pb_files_probe.txt' };
+  if (cap === 'pb_files.write') return { path: 'mcp_audit/pb_files_probe.txt', content: 'ok' };
+  if (cap === 'pb_files.mkdir') return { path: 'mcp_audit' };
+  if (cap === 'pb_files.delete') return { path: 'mcp_audit/pb_files_probe.txt' };
+  if (cap === 'kdenlive.make_aligned_project') {
+    return {
+      project_name: 'probe',
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      scene_duration_s: 5,
+      scenes: [{ video: 'videos/probe.mp4', voice: '', music: '', sfx: '' }],
+      output_project_path: 'kdenlive_probe/probe.mlt',
+    };
+  }
+  return {};
 }
 
 function hasTable(db, name) {
@@ -183,7 +420,60 @@ function getTemplate(db, templateId) {
   return db.prepare('SELECT * FROM mcp_templates WHERE id = ?').get(templateId);
 }
 
+function hasColumn(db, tableName, columnName) {
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
+    return rows.some((r) => String(r?.name || '') === String(columnName || ''));
+  } catch {
+    return false;
+  }
+}
+
+function normalizeAliasList(input) {
+  const arr = Array.isArray(input) ? input : [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of arr) {
+    const v = String(raw || '').trim();
+    if (!v) continue;
+    const key = v.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+  }
+  return out;
+}
+
+function resolveServerRowByIdentifier(db, identifier) {
+  const needle = String(identifier || '').trim();
+  if (!needle) return null;
+
+  let row = db.prepare('SELECT * FROM mcp_servers WHERE id = ?').get(needle);
+  if (row) return { row, by: 'id' };
+
+  if (hasColumn(db, 'mcp_servers', 'spec_id')) {
+    row = db.prepare('SELECT * FROM mcp_servers WHERE spec_id = ? ORDER BY updated_at DESC LIMIT 1').get(needle);
+    if (row) return { row, by: 'spec_id' };
+  }
+
+  if (hasColumn(db, 'mcp_servers', 'aliases_json')) {
+    const candidates = db.prepare('SELECT * FROM mcp_servers WHERE aliases_json IS NOT NULL AND aliases_json != \'\'').all();
+    const want = needle.toLowerCase();
+    for (const c of candidates) {
+      const aliases = normalizeAliasList(safeJsonParse(c.aliases_json || '[]', []));
+      if (aliases.some((a) => String(a || '').toLowerCase() === want)) {
+        return { row: c, by: 'alias' };
+      }
+    }
+  }
+
+  row = db.prepare('SELECT * FROM mcp_servers WHERE lower(name) = lower(?) ORDER BY updated_at DESC LIMIT 1').get(needle);
+  if (row) return { row, by: 'name' };
+  return null;
+}
+
 const MCP_BUILD_STATE_KEY = 'mcp.build_state';
+const MCP_PROPOSALS_STATE_KEY = 'mcp.proposals';
 
 function getBuildState(db) {
   const raw = kvGet(db, MCP_BUILD_STATE_KEY, {});
@@ -218,6 +508,31 @@ function clearBuildForServer(db, serverId) {
     delete cur[id];
     kvSet(db, MCP_BUILD_STATE_KEY, cur);
   }
+}
+
+function getProposalState(db) {
+  const raw = kvGet(db, MCP_PROPOSALS_STATE_KEY, {});
+  return raw && typeof raw === 'object' ? raw : {};
+}
+
+function setProposalState(db, proposalId, payload) {
+  const id = String(proposalId || '').trim();
+  if (!id) return;
+  const cur = getProposalState(db);
+  cur[id] = {
+    ...(cur[id] && typeof cur[id] === 'object' ? cur[id] : {}),
+    ...(payload && typeof payload === 'object' ? payload : {}),
+    updated_at: nowIso(),
+  };
+  kvSet(db, MCP_PROPOSALS_STATE_KEY, cur);
+}
+
+function getProposalById(db, proposalId) {
+  const id = String(proposalId || '').trim();
+  if (!id) return null;
+  const cur = getProposalState(db);
+  const row = cur[id];
+  return row && typeof row === 'object' ? row : null;
 }
 
 function getTemplateFields(tmpl) {
@@ -270,7 +585,17 @@ async function loadTemplateSpecFromDisk(tmpl) {
   };
 }
 
-const MCP_MEDIA_TEMPLATE_IDS = new Set(['basic_browser', 'search_browser', 'youtube_media', 'music_media', 'code1', 'code1_docs_default']);
+const MCP_INTERNAL_TEMPLATE_IDS = new Set(['json_utils', 'http_fetch', 'sqlite_local', 'export_reports', 'text_utils', 'code1', 'code1_docs_default']);
+const MCP_SCAFFOLD_TEMPLATE_IDS = new Set(['basic_browser', 'search_browser', 'youtube_media', 'music_media', 'code1', 'code1_docs_default']);
+const MCP_INSTALLABLE_TEMPLATE_IDS = new Set([
+  ...MCP_SCAFFOLD_TEMPLATE_IDS,
+  'custom_media',
+  'fs_readonly',
+  'fs_readwrite',
+  'kdenlive_aligned_5s_scene_builder',
+  'sqlite_local',
+  'export_reports',
+]);
 const MCP_WEBCHAT_ENABLED_KEY = 'mcp.webchat.enabled';
 
 function getMcpWebchatEnabledState(db) {
@@ -306,7 +631,7 @@ function serverEnabledInWebchat(db, row) {
   const st = getMcpWebchatEnabledState(db);
   const id = String(row?.id || '');
   if (Object.prototype.hasOwnProperty.call(st.servers, id)) return Boolean(st.servers[id]);
-  return Boolean(row?.approved_for_use) || String(id) !== String(CANVAS_MCP_ID);
+  return (approvalsEnabled() ? Boolean(row?.approved_for_use) : true) || String(id) !== String(CANVAS_MCP_ID);
 }
 
 function migrateLegacyContext7Ids(db) {
@@ -378,7 +703,7 @@ function listTemplates(db) {
     defaultCapabilities: safeJsonParse(r.default_capabilities_json, []),
     risk: r.risk,
     allowedChannels: safeJsonParse(r.allowed_channels_json, []),
-    requiresApprovalByDefault: Boolean(r.requires_approval_by_default),
+    requiresApprovalByDefault: approvalsEnabled() ? Boolean(r.requires_approval_by_default) : false,
     fields: safeJsonParse(r.fields_json, []),
     securityDefaults: safeJsonParse(r.security_defaults_json, {}),
     testPlan: safeJsonParse(r.security_defaults_json, {})?.testPlan || null,
@@ -392,11 +717,30 @@ function listServers(db) {
   const rows = db.prepare('SELECT * FROM mcp_servers ORDER BY updated_at DESC LIMIT 200').all();
   return rows.map((r) => {
     const cfg = safeJsonParse(r.config_json, {});
-    const capabilities = getServerCapabilities(db, r.id);
-    const enabled = Boolean(r.approved_for_use) && String(r.status || '') !== 'stopped';
+    if (!String(r.entry_cmd || '').trim()) {
+      const inferredEntry = inferPbFilesEntryCmd({ templateId: r.template_id, configObj: cfg })
+        || inferKdenliveAlignedEntryCmd({ templateId: r.template_id, configObj: cfg });
+      if (inferredEntry) {
+        try {
+          db.prepare('UPDATE mcp_servers SET entry_cmd = ?, updated_at = ? WHERE id = ?').run(inferredEntry, nowIso(), String(r.id));
+          r.entry_cmd = inferredEntry;
+        } catch {}
+      }
+    }
+    let capabilities = getServerCapabilities(db, r.id);
+    if (!capabilities.length) {
+      const tmpl = getTemplate(db, r.template_id);
+      const defaults = normalizeCapabilities(safeJsonParse(tmpl?.default_capabilities_json || '[]', []));
+      if (defaults.length) {
+        try { setServerCapabilities(db, r.id, defaults); } catch {}
+        capabilities = getServerCapabilities(db, r.id);
+      }
+    }
+    const approvedForUse = approvalsEnabled() ? Boolean(r.approved_for_use) : true;
+    const enabled = approvedForUse && String(r.status || '') !== 'stopped';
     const enabledInWebChat = serverEnabledInWebchat(db, r);
     const health = {
-      ok: Boolean(r.approved_for_use) && String(r.status || '') === 'running',
+      ok: approvedForUse && String(r.status || '') === 'running',
       status: String(r.status || ''),
       last_error: r.last_error || null,
     };
@@ -404,6 +748,9 @@ function listServers(db) {
     const baseUrl = isApiPortBaseUrl(baseUrlRaw) ? '' : baseUrlRaw;
     return ({
     id: r.id,
+    specId: hasColumn(db, 'mcp_servers', 'spec_id') ? (r.spec_id || null) : null,
+    aliases: hasColumn(db, 'mcp_servers', 'aliases_json') ? normalizeAliasList(safeJsonParse(r.aliases_json || '[]', [])) : [],
+    displayName: r.name,
     templateId: r.template_id,
     name: r.name,
     version: r.version || '0.1.0',
@@ -411,13 +758,15 @@ function listServers(db) {
     status: r.status,
     enabled,
     enabledInWebChat,
-    approvedForUse: Boolean(r.approved_for_use),
+    approvedForUse,
     baseUrl,
     health,
     installPath: r.install_path || null,
     entryCmd: r.entry_cmd || null,
     healthUrl: r.health_url || null,
     capabilities,
+    schemas: hasColumn(db, 'mcp_servers', 'schemas_json') ? safeJsonParse(r.schemas_json || '{}', {}) : {},
+    toolNames: capabilities.map((cap) => toolNameForCapability(cap)).filter(Boolean),
     config: cfg,
     security: safeJsonParse(r.security_json, {}),
     lastError: r.last_error || null,
@@ -536,26 +885,249 @@ const MCP_RUNTIME = {
 
 function normalizeCapabilities(input) {
   const caps = Array.isArray(input) ? input : [];
-  return Array.from(new Set(caps.map((c) => String(c || '').trim()).filter(Boolean)));
+  return Array.from(new Set(caps.map((c) => normalizeCapabilityAlias(c)).filter(Boolean)));
 }
 
 function validateCapabilities(db, caps) {
   const out = normalizeCapabilities(caps);
   const policy = getCapabilityPolicy(db);
+  const capabilityPattern = /^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$/;
   for (const cap of out) {
     const lower = cap.toLowerCase();
-    if (policy.effectiveForbidden.some((p) => lower.startsWith(p))) {
-      const err = new Error(`Forbidden capability: ${cap}`);
+    if (!capabilityPattern.test(cap)) {
+      const err = new Error(`Capability "${cap}" is not valid. Use dot-separated lowercase names like pb.files.read.`);
       err.code = 'INVALID_CAPABILITY';
       throw err;
     }
-    if (!ALLOWED_MCP_CAPABILITIES.has(cap)) {
-      const err = new Error(`Invalid capability: ${cap}`);
+    if (policy.effectiveForbidden.some((p) => lower.startsWith(p))) {
+      const err = new Error(`Capability "${cap}" is blocked by PB safety policy. Choose a safer namespace or remove that action.`);
       err.code = 'INVALID_CAPABILITY';
       throw err;
     }
   }
   return out;
+}
+
+function inferSimpleCapabilities(description, constraints = '') {
+  const text = `${String(description || '')} ${String(constraints || '')}`.toLowerCase();
+  const out = new Set();
+
+  const fileIntent = /\b(files?|workspace|folder|directory|mkdir|list|read|write|delete)\b/.test(text);
+  if (fileIntent) {
+    out.add('pb_files.list');
+    if (/\bread\b/.test(text)) out.add('pb_files.read');
+    if (/\bwrite\b/.test(text)) out.add('pb_files.write');
+    if (/\bmkdir\b|\bdirectory\b|\bfolder\b/.test(text)) out.add('pb_files.mkdir');
+    if (/\bdelete\b|\bremove\b/.test(text) && !/\bno\s+delete\b|\bwithout\s+delete\b|\bmanual render\b/.test(text)) out.add('pb_files.delete');
+    if (![...out].some((c) => c === 'pb_files.read' || c === 'pb_files.write' || c === 'pb_files.mkdir')) {
+      for (const cap of SIMPLE_CAPABILITY_GROUPS.pb_files_safe_rw) out.add(cap);
+    }
+  }
+
+  if (/\bkdenlive\b|\bmlt\b|\bscene\b|\bmanual render\b/.test(text)) {
+    out.add('kdenlive.make_aligned_project');
+  }
+
+  if (/\breport\b|\bmarkdown\b/.test(text)) out.add('export.write_markdown');
+  if (/\bcsv\b/.test(text)) out.add('export.write_csv');
+  if (/\bsqlite\b|\bsql\b|\bdatabase\b/.test(text) && !/\bforbid\b|\bexclude\b/.test(text)) {
+    out.add('sqlite.exec');
+    out.add('sqlite.query');
+  }
+
+  if (/\bno\s+delete\b|\bwithout\s+delete\b|\bexclude\s+delete\b/.test(text)) out.delete('pb_files.delete');
+
+  return Array.from(out);
+}
+
+function inferTemplateIdFromCapabilities(capabilities = []) {
+  const caps = normalizeCapabilities(capabilities);
+  if (caps.includes('kdenlive.make_aligned_project')) return 'kdenlive_aligned_5s_scene_builder';
+  if (caps.some((c) => c.startsWith('pb_files.'))) {
+    const writable = caps.some((c) => c === 'pb_files.write' || c === 'pb_files.mkdir' || c === 'pb_files.delete');
+    return writable ? 'fs_readwrite' : 'fs_readonly';
+  }
+  if (caps.includes('export.write_markdown') || caps.includes('export.write_csv')) return 'export_reports';
+  if (caps.includes('sqlite.exec') || caps.includes('sqlite.query')) return 'sqlite_local';
+  return 'custom_media';
+}
+
+function inferInputsForTemplate(templateId) {
+  if (templateId === 'fs_readonly' || templateId === 'fs_readwrite' || templateId === 'kdenlive_aligned_5s_scene_builder') {
+    return { root_path: getPbWorkdir() };
+  }
+  return {};
+}
+
+function capabilitySchemas(capability) {
+  const cap = normalizeCapabilityAlias(capability);
+  if (cap === 'pb_files.list') {
+    return {
+      input: { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: false },
+      output: { type: 'object', properties: { path: { type: 'string' }, entries: { type: 'array' } }, additionalProperties: true },
+    };
+  }
+  if (cap === 'pb_files.read') {
+    return {
+      input: { type: 'object', properties: { path: { type: 'string' }, max_bytes: { type: 'number' } }, required: ['path'], additionalProperties: false },
+      output: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, bytes: { type: 'number' } }, additionalProperties: true },
+    };
+  }
+  if (cap === 'pb_files.write') {
+    return {
+      input: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'], additionalProperties: false },
+      output: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' } }, additionalProperties: true },
+    };
+  }
+  if (cap === 'pb_files.mkdir' || cap === 'pb_files.delete') {
+    return {
+      input: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
+      output: { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: true },
+    };
+  }
+  if (cap === 'kdenlive.make_aligned_project') {
+    return {
+      input: {
+        type: 'object',
+        properties: {
+          project_name: { type: 'string' },
+          fps: { type: 'number' },
+          width: { type: 'number' },
+          height: { type: 'number' },
+          scene_duration_s: { type: 'number' },
+          scenes: { type: 'array' },
+          output_project_path: { type: 'string' },
+        },
+        required: ['project_name', 'fps', 'width', 'height', 'scene_duration_s', 'scenes', 'output_project_path'],
+        additionalProperties: false,
+      },
+      output: { type: 'object', properties: { project_path: { type: 'string' }, scene_count: { type: 'number' }, duration_s_total: { type: 'number' } }, additionalProperties: true },
+    };
+  }
+  if (cap === 'export.write_markdown' || cap === 'export.write_csv') {
+    return {
+      input: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'], additionalProperties: false },
+      output: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' } }, additionalProperties: true },
+    };
+  }
+  if (cap === 'sqlite.exec' || cap === 'sqlite.query') {
+    return {
+      input: { type: 'object', properties: { db_path: { type: 'string' }, sql: { type: 'string' } }, required: ['db_path', 'sql'], additionalProperties: false },
+      output: { type: 'object', properties: { result: {} }, additionalProperties: true },
+    };
+  }
+  return {
+    input: { type: 'object', properties: {}, additionalProperties: true },
+    output: { type: 'object', properties: {}, additionalProperties: true },
+  };
+}
+
+function buildSchemasForCapabilities(capabilities = []) {
+  const out = {};
+  for (const runtime of normalizeCapabilities(capabilities)) {
+    const canonical = canonicalCapabilityName(runtime);
+    out[canonical] = {
+      capability: runtime,
+      tool_name: toolNameForCapability(runtime),
+      ...capabilitySchemas(runtime),
+    };
+  }
+  return out;
+}
+
+function buildTestPlanForCapabilities(capabilities = []) {
+  return normalizeCapabilities(capabilities).map((cap) => {
+    if (cap === 'kdenlive.make_aligned_project') return 'Create a probe MLT project and verify the output contains the expected playlists/tracks.';
+    if (cap.startsWith('pb_files.')) return `Invoke ${toolNameForCapability(cap)} with a workspace-relative path and verify the file-system side effect.`;
+    return `Invoke ${toolNameForCapability(cap)} with sample args and verify the response shape.`;
+  });
+}
+
+function buildSimpleProposalSpec({ proposalId, name, description, constraints }) {
+  const inferredCapabilities = inferSimpleCapabilities(description, constraints);
+  if (!inferredCapabilities.length) {
+    const err = new Error('I could not infer any safe MCP capabilities from that description. Be more specific about the actions you want.');
+    err.code = 'INVALID_CAPABILITY';
+    throw err;
+  }
+  const displayName = buildDisplayName(name, description.split(/[.!?]/)[0].trim() || 'Custom MCP Server');
+  const templateId = inferTemplateIdFromCapabilities(inferredCapabilities);
+  const serverId = buildServerId(displayName);
+  const schemas = buildSchemasForCapabilities(inferredCapabilities);
+  return {
+    spec_id: proposalId,
+    server_id: serverId,
+    id: serverId,
+    name: displayName,
+    display_name: displayName,
+    version: '0.1.0',
+    runtime: 'node',
+    entry: 'server.js',
+    mode: 'simple',
+    description: String(description || '').trim(),
+    safety_constraints: String(constraints || '').trim(),
+    canonical_capabilities: inferredCapabilities.map((cap) => canonicalCapabilityName(cap)),
+    capabilities: inferredCapabilities,
+    schemas,
+    test_plan: buildTestPlanForCapabilities(inferredCapabilities),
+    webchat_test_prompt: buildWebchatTestPrompt({ name: displayName, capabilities: inferredCapabilities }),
+    template_id: templateId,
+    inputs: inferInputsForTemplate(templateId),
+    created_at: nowIso(),
+  };
+}
+
+function buildAdvancedProposalSpec({ proposalId, name, prompt, capabilities }) {
+  const displayName = buildDisplayName(name, 'Custom MCP Server');
+  const runtimeCapabilities = normalizeCapabilities(capabilities);
+  const templateId = inferTemplateIdFromCapabilities(runtimeCapabilities);
+  const serverId = buildServerId(displayName);
+  return {
+    spec_id: proposalId,
+    server_id: serverId,
+    id: serverId,
+    name: displayName,
+    display_name: displayName,
+    version: '0.1.0',
+    runtime: 'node',
+    entry: 'server.js',
+    mode: 'advanced',
+    prompt: String(prompt || '').trim(),
+    canonical_capabilities: runtimeCapabilities.map((cap) => canonicalCapabilityName(cap)),
+    capabilities: runtimeCapabilities,
+    schemas: buildSchemasForCapabilities(runtimeCapabilities),
+    test_plan: buildTestPlanForCapabilities(runtimeCapabilities),
+    webchat_test_prompt: buildWebchatTestPrompt({ name: displayName, capabilities: runtimeCapabilities }),
+    template_id: templateId,
+    inputs: inferInputsForTemplate(templateId),
+    created_at: nowIso(),
+  };
+}
+
+function buildWebchatTestPrompt({ capabilities = [] }) {
+  const caps = normalizeCapabilities(capabilities);
+  if (caps.includes('kdenlive.make_aligned_project')) {
+    return [
+      'Use kdenlive make_aligned_project to create a probe project.',
+      '```json',
+      JSON.stringify(sampleArgsForCapability('kdenlive.make_aligned_project', null)),
+      '```',
+    ].join('\n');
+  }
+  if (caps.some((cap) => cap.startsWith('pb_files.'))) {
+    return 'Test PB Files (R/W) MCP. Create folder: research-lab/mcp_probe. Write file: research-lab/mcp_probe/files_probe.txt "ok". Read file back.';
+  }
+  return `Invoke ${toolNameForCapability(caps[0] || 'browser.search')} with a minimal probe payload.`;
+}
+
+function capabilityTestPriority(capability) {
+  const cap = String(capability || '').trim();
+  if (cap === 'pb_files.mkdir') return 1;
+  if (cap === 'pb_files.write') return 2;
+  if (cap === 'pb_files.read') return 3;
+  if (cap === 'pb_files.list') return 4;
+  if (cap === 'pb_files.delete') return 5;
+  return 50;
 }
 
 function getMcpRoot() {
@@ -573,6 +1145,104 @@ async function ensureMcpDirs() {
   await fs.promises.mkdir(dirs.staging, { recursive: true });
   await fs.promises.mkdir(dirs.installed, { recursive: true });
   return dirs;
+}
+
+export async function reconcileInstalledServers(db) {
+  if (!hasTable(db, 'mcp_servers')) return { restored: 0, found: 0 };
+  const dirs = await ensureMcpDirs();
+  const installedRoots = [dirs.installed, path.join(getPbRoot(), 'mcp_servers', 'installed')]
+    .map((dir) => path.resolve(String(dir || '').trim()))
+    .filter((dir, index, all) => dir && all.indexOf(dir) === index);
+
+  const upsertServer = db.prepare(`
+    INSERT INTO mcp_servers (id, template_id, name, version, risk, status, approved_for_use, install_path, entry_cmd, health_url, config_json, security_json, last_error, spec_id, aliases_json, schemas_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'stopped', 1, ?, ?, ?, ?, '{}', NULL, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      template_id = excluded.template_id,
+      name = excluded.name,
+      version = excluded.version,
+      risk = excluded.risk,
+      install_path = excluded.install_path,
+      entry_cmd = excluded.entry_cmd,
+      health_url = excluded.health_url,
+      config_json = excluded.config_json,
+      spec_id = excluded.spec_id,
+      aliases_json = excluded.aliases_json,
+      schemas_json = excluded.schemas_json,
+      updated_at = excluded.updated_at
+  `);
+
+  let restored = 0;
+  let found = 0;
+  for (const installedRoot of installedRoots) {
+    let entries = [];
+    try {
+      entries = await fs.promises.readdir(installedRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry?.isDirectory?.()) continue;
+      const installPath = path.join(installedRoot, entry.name);
+      const specPath = path.join(installPath, 'mcp-server.spec.json');
+      if (!fs.existsSync(specPath)) continue;
+      found += 1;
+      try {
+        const raw = await fs.promises.readFile(specPath, 'utf8');
+        const spec = safeJsonParse(raw, null);
+        if (!spec || typeof spec !== 'object') continue;
+
+        const id = String(spec.server_id || spec.id || entry.name || '').trim();
+        if (!id || id === CANVAS_MCP_ID) continue;
+        const exists = db.prepare('SELECT id FROM mcp_servers WHERE id = ?').get(id);
+        if (exists) continue;
+
+        const templateId = String(spec.template_id || inferTemplateIdFromCapabilities(spec.capabilities || []) || 'custom_media').trim();
+        const caps = normalizeCapabilities(spec.capabilities || []);
+        const inputs = spec.inputs && typeof spec.inputs === 'object' ? spec.inputs : inferInputsForTemplate(templateId);
+        const entryCmd = caps.includes('kdenlive.make_aligned_project')
+          ? inferKdenliveAlignedEntryCmd({ templateId, configObj: inputs }) || `node ${path.join(installPath, 'server.js')} --root=${getPbWorkdir()}`
+          : (caps.some((cap) => cap.startsWith('pb_files.'))
+            ? inferPbFilesEntryCmd({ templateId, configObj: inputs }) || `node ${path.join(installPath, 'server.js')} --mode=rw --root=${getPbWorkdir()}`
+            : `node ${path.join(installPath, 'server.js')}`);
+        const ts = String(spec.created_at || nowIso());
+        const displayName = String(spec.display_name || spec.name || id).trim() || id;
+        const version = String(spec.version || '0.1.0').trim() || '0.1.0';
+        const risk = String(spec.risk || 'medium').trim() || 'medium';
+        const specId = String(spec.spec_id || spec.id || id).trim();
+        const aliases = normalizeAliasList([displayName, spec.name, spec.display_name, id]);
+        const schemas = buildSchemasForCapabilities(caps);
+
+        upsertServer.run(
+          id,
+          templateId,
+          displayName,
+          version,
+          risk,
+          installPath,
+          entryCmd,
+          '',
+          JSON.stringify(inputs || {}),
+          specId,
+          JSON.stringify(aliases),
+          JSON.stringify(schemas),
+          ts,
+          nowIso(),
+        );
+        setServerCapabilities(db, id, caps);
+        const webchatState = getMcpWebchatEnabledState(db);
+        if (!Object.prototype.hasOwnProperty.call(webchatState.servers || {}, id)) {
+          webchatState.servers[id] = true;
+          setMcpWebchatEnabledState(db, webchatState);
+        }
+        insertLog(db, id, 'INFO', `restored from installed mcp-server.spec.json (${installedRoot})`);
+        restored += 1;
+      } catch (e) {
+        console.log(`[mcp] failed to restore installed server ${entry.name}: ${String(e?.message || e)}`);
+      }
+    }
+  }
+  return { restored, found };
 }
 
 function parseEntryCmd(entryCmd) {
@@ -597,11 +1267,19 @@ function getServerCapabilities(db, serverId) {
 }
 
 async function startInstalledServer(db, row) {
-  const entry = parseEntryCmd(row?.entry_cmd);
+  const cfg0 = safeJsonParse(row?.config_json || '{}', {});
+  const inferredCmd = inferPbFilesEntryCmd({ templateId: row?.template_id, configObj: cfg0 })
+    || inferKdenliveAlignedEntryCmd({ templateId: row?.template_id, configObj: cfg0 });
+  const effectiveCmd = String(inferredCmd || row?.entry_cmd || '').trim();
+  if (effectiveCmd && effectiveCmd !== String(row?.entry_cmd || '').trim()) {
+    db.prepare('UPDATE mcp_servers SET entry_cmd = ?, updated_at = ? WHERE id = ?')
+      .run(effectiveCmd, nowIso(), String(row.id));
+  }
+  const entry = parseEntryCmd(effectiveCmd);
   if (!entry) throw new Error('entry_cmd missing');
   if (MCP_RUNTIME.processes.has(String(row.id))) return;
 
-  const cfg = safeJsonParse(row?.config_json || '{}', {});
+  const cfg = cfg0;
   const port = Number(await getFreePort('127.0.0.1'));
   const baseUrl = `http://127.0.0.1:${port}`;
   if (isApiPortBaseUrl(baseUrl)) {
@@ -613,8 +1291,11 @@ async function startInstalledServer(db, row) {
     .run(JSON.stringify(nextCfg), `${baseUrl}/health`, nowIso(), String(row.id));
 
   const { spawn } = await import('node:child_process');
+  const dirs = await ensureMcpDirs();
+  const cwd = String(row.install_path || dirs.installed);
+  await fs.promises.mkdir(cwd, { recursive: true });
   const child = spawn(entry.cmd, entry.args, {
-    cwd: String(row.install_path || getMcpRoot().installed),
+    cwd,
     env: { ...process.env, PORT: String(port), MCP_BASE_URL: baseUrl, NODE_TLS_REJECT_UNAUTHORIZED: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -726,6 +1407,7 @@ function getLatestApproval(db, serverId, kind) {
 }
 
 function ensureApproval(_db, _server, _kind, _payload) {
+  if (!approvalsEnabled()) return { ok: true, requiresApproval: false, approvalId: null };
   return { ok: true, requiresApproval: false };
 }
 
@@ -844,32 +1526,56 @@ function parseDdgLiteResults(html, limit = 5) {
   const out = [];
   const seen = new Set();
   const max = Math.max(1, Math.min(Number(limit) || 5, 10));
-  const re = /<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const re = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let m;
   while ((m = re.exec(raw)) && out.length < max) {
     const rawUrl = String(m[1] || '').trim();
-    if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) continue;
+    if (!rawUrl) continue;
     try {
-      const hu = new URL(rawUrl);
-      const host = hu.hostname.toLowerCase();
-      if (
-        host.endsWith('duckduckgo.com') ||
-        host.endsWith('google.com') ||
-        host.endsWith('bing.com') ||
-        host === 't.co'
-      ) continue;
-      const url = `${hu.protocol}//${hu.host}${hu.pathname}${hu.search}`.replace(/\?$/, '');
+      let parsedUrl = '';
+      if (/^https?:\/\//i.test(rawUrl)) parsedUrl = rawUrl;
+      else if (/^\//.test(rawUrl)) parsedUrl = `https://duckduckgo.com${rawUrl}`;
+      if (!parsedUrl) continue;
+      const hu = new URL(parsedUrl);
+      const uddg = hu.searchParams.get('uddg');
+      const target = uddg ? decodeURIComponent(String(uddg || '')) : parsedUrl;
+      const tu = new URL(target);
+      const host = tu.hostname.toLowerCase();
+      if (!host) continue;
+      if (host.endsWith('duckduckgo.com') || host === 't.co') continue;
+      const url = `${tu.protocol}//${tu.host}${tu.pathname}${tu.search}`.replace(/\?$/, '');
+      if (!/^https?:\/\//i.test(url)) continue;
       if (seen.has(url)) continue;
       seen.add(url);
-      const title = String(m[2] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 200) || host;
+      const title = String(m[2] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 200) || tu.hostname;
       out.push({ url, title, snippet: '' });
     } catch {}
   }
   return out;
 }
 
+function parseBingHtmlResults(html, limit = 5) {
+  const raw = String(html || '');
+  const out = [];
+  const seen = new Set();
+  const max = Math.max(1, Math.min(Number(limit) || 5, 10));
+  const re = /<li[^>]*\bclass=["'][^"']*\bb_algo\b[^"']*["'][^>]*>[\s\S]*?<h2[^>]*>\s*<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>\s*<\/h2>[\s\S]*?(?:<p[^>]*>([\s\S]*?)<\/p>)?/gi;
+  let m;
+  while ((m = re.exec(raw)) && out.length < max) {
+    const url = String(m[1] || '').trim();
+    if (!/^https?:\/\//i.test(url)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const title = String(m[2] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    const snippet = String(m[3] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 260);
+    if (!title) continue;
+    out.push({ url, title, snippet });
+  }
+  return out;
+}
+
 // Returns { results: Array<{url,title,snippet}>, search_debug: Array<Object> }.
-async function searchWebResults(q, limit = 5, signal = null) {
+async function searchWebResults(q, limit = 5, signal = null, fetcher = fetchTextWithTlsFallback) {
   const query = String(q || '').trim();
   if (!query) return { results: [], search_debug: [] };
   const max = Math.max(1, Math.min(limit, 10));
@@ -878,7 +1584,7 @@ async function searchWebResults(q, limit = 5, signal = null) {
   // ── 1. DuckDuckGo HTML ─────────────────────────────────────────────────────
   const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
   try {
-    const rr = await fetchTextWithTlsFallback(ddgUrl, { signal, timeoutMs: 25000 });
+    const rr = await fetcher(ddgUrl, { signal, timeoutMs: 25000 });
     const html = String(rr.text || '');
     const bodyBytes = Buffer.byteLength(html, 'utf8');
     const preview = html.slice(0, 200).replace(/[\r\n\t]+/g, ' ');
@@ -897,7 +1603,7 @@ async function searchWebResults(q, limit = 5, signal = null) {
   // ── 2. DuckDuckGo Lite ─────────────────────────────────────────────────────
   const liteUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
   try {
-    const rr = await fetchTextWithTlsFallback(liteUrl, { signal, timeoutMs: 20000 });
+    const rr = await fetcher(liteUrl, { signal, timeoutMs: 20000 });
     const html = String(rr.text || '');
     const bodyBytes = Buffer.byteLength(html, 'utf8');
     const preview = html.slice(0, 200).replace(/[\r\n\t]+/g, ' ');
@@ -918,7 +1624,7 @@ async function searchWebResults(q, limit = 5, signal = null) {
     if (variant === query) continue;
     const varUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(variant)}`;
     try {
-      const rr = await fetchTextWithTlsFallback(varUrl, { signal, timeoutMs: 20000 });
+      const rr = await fetcher(varUrl, { signal, timeoutMs: 20000 });
       const html = String(rr.text || '');
       const bodyBytes = Buffer.byteLength(html, 'utf8');
       const parsed = parseSerpResultsFromHtml(html, { limit: max });
@@ -930,10 +1636,28 @@ async function searchWebResults(q, limit = 5, signal = null) {
     }
   }
 
-  // ── 4. Yahoo fallback ──────────────────────────────────────────────────────
+  // ── 4. Bing HTML fallback ──────────────────────────────────────────────────
+  const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+  try {
+    const rr = await fetcher(bingUrl, { signal, timeoutMs: 25000 });
+    const html = String(rr.text || '');
+    const bodyBytes = Buffer.byteLength(html, 'utf8');
+    const preview = html.slice(0, 200).replace(/[\r\n\t]+/g, ' ');
+    let parsed = parseSerpResultsFromHtml(html, { limit: max });
+    if (!parsed.length) parsed = parseBingHtmlResults(html, max);
+    debug.push({ engine: 'bing_html', url: bingUrl, status: rr.status, body_bytes: bodyBytes, preview, count: parsed.length });
+    console.log(`[searchWebResults] bing_html status=${rr.status} bytes=${bodyBytes} count=${parsed.length}`);
+    if (parsed.length > 0) return { results: parsed, search_debug: debug };
+  } catch (e) {
+    const msg = String(e?.message || e);
+    debug.push({ engine: 'bing_html', url: bingUrl, error: msg });
+    console.log(`[searchWebResults] bing_html error=${msg}`);
+  }
+
+  // ── 5. Yahoo fallback ──────────────────────────────────────────────────────
   const yahooUrl = `https://search.yahoo.com/search?p=${encodeURIComponent(query)}`;
   try {
-    const rr = await fetchTextWithTlsFallback(yahooUrl, { signal, timeoutMs: 25000 });
+    const rr = await fetcher(yahooUrl, { signal, timeoutMs: 25000 });
     const html = String(rr.text || '');
     const bodyBytes = Buffer.byteLength(html, 'utf8');
     const out = [];
@@ -966,21 +1690,30 @@ async function searchWebResults(q, limit = 5, signal = null) {
 }
 
 export async function executeMcpRpc({ db, serverId, capability, args = {}, signal = null, rid = null }) {
-  const sid = String(serverId || '').trim();
+  const requestedSid = String(serverId || '').trim();
   const cap = String(capability || '').trim();
   const reqId = rid || String(args?._rid || '');
-  console.log(`[executeMcpRpc.start] rid=${reqId || '-'} server=${sid || '-'} capability=${cap || '-'} args_keys=${Object.keys(args || {}).slice(0, 8).join(',')}`);
+  console.log(`[executeMcpRpc.start] rid=${reqId || '-'} server=${requestedSid || '-'} capability=${cap || '-'} args_keys=${Object.keys(args || {}).slice(0, 8).join(',')}`);
   const argObj = args && typeof args === 'object' ? args : {};
   validateCapabilities(db, [cap]);
 
-  const row = db.prepare('SELECT * FROM mcp_servers WHERE id = ?').get(sid);
+  const resolved = resolveServerRowByIdentifier(db, requestedSid);
+  const row = resolved?.row || null;
   if (!row) {
     const err = new Error('SERVER_NOT_FOUND');
     err.code = 'SERVER_NOT_FOUND';
     throw err;
   }
+  const sid = String(row.id || '').trim();
 
-  const allowedForServer = getServerCapabilities(db, sid);
+  let allowedForServer = getServerCapabilities(db, sid);
+  if (!allowedForServer.length) {
+    const inferred = inferInternalCapsFromTemplate(row.template_id);
+    if (inferred.length) {
+      try { setServerCapabilities(db, sid, inferred); } catch {}
+      allowedForServer = getServerCapabilities(db, sid);
+    }
+  }
   if (allowedForServer.length > 0 && !allowedForServer.includes(cap)) {
     const searchFallbackAllowed = cap === 'browser.search'
       && (allowedForServer.includes('browser.extract_text') || allowedForServer.includes('browser.open_url'));
@@ -991,7 +1724,23 @@ export async function executeMcpRpc({ db, serverId, capability, args = {}, signa
     }
   }
 
-  const isFallbackable = cap === 'browser.search' || cap === 'browser.extract_text' || cap === 'browser.open_url';
+  const isFallbackable = new Set([
+    'browser.search',
+    'browser.extract_text',
+    'browser.open_url',
+    'json.format',
+    'json.validate',
+    'http.fetch',
+    'sqlite.exec',
+    'sqlite.query',
+    'export.write_markdown',
+    'export.write_csv',
+    'text.slugify',
+    'text.word_count',
+    'text.extract_urls',
+    'resolve-library-id',
+    'query-docs',
+  ]).has(cap);
   if (String(row.status || '') !== 'running') {
     if (!isFallbackable) {
       const err = new Error('SERVER_NOT_RUNNING');
@@ -1152,7 +1901,176 @@ export async function executeMcpRpc({ db, serverId, capability, args = {}, signa
     };
   }
 
+  if (cap === 'json.format') {
+    const source = argObj.json !== undefined ? JSON.stringify(argObj.json) : String(argObj.text || argObj.input || '').trim();
+    if (!source) {
+      const err = new Error('text required');
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    let parsed;
+    try { parsed = JSON.parse(source); } catch (e) {
+      const err = new Error(`Invalid JSON: ${String(e?.message || e)}`);
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    const pretty = JSON.stringify(parsed, null, Number(argObj.indent || 2));
+    return { ok: true, server_id: sid, capability: cap, formatted: pretty, valid: true, fallback: true };
+  }
+
+  if (cap === 'json.validate') {
+    const source = argObj.json !== undefined ? JSON.stringify(argObj.json) : String(argObj.text || argObj.input || '').trim();
+    if (!source) {
+      const err = new Error('text required');
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    try {
+      JSON.parse(source);
+      return { ok: true, server_id: sid, capability: cap, valid: true, error: null, fallback: true };
+    } catch (e) {
+      return { ok: true, server_id: sid, capability: cap, valid: false, error: String(e?.message || e), fallback: true };
+    }
+  }
+
+  if (cap === 'http.fetch') {
+    const urlRaw = String(argObj.url || '').trim();
+    if (!urlRaw) {
+      const err = new Error('url required');
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    const u = new URL(urlRaw);
+    const cfg = safeJsonParse(row.config_json || '{}', {});
+    const allowlist = parseDomainAllowlist(cfg);
+    if (allowlist.length && !isHostAllowed(u.hostname, allowlist)) {
+      const err = new Error(`Domain not allowlisted: ${u.hostname}`);
+      err.code = 'FORBIDDEN_DOMAIN';
+      throw err;
+    }
+    const rr = await fetchTextWithTlsFallback(urlRaw, { signal, timeoutMs: Number(argObj.timeout_ms || 15000) });
+    return {
+      ok: rr.ok,
+      server_id: sid,
+      capability: cap,
+      url: urlRaw,
+      status: rr.status,
+      content: String(rr.text || ''),
+      content_preview: String(rr.text || '').slice(0, 1200),
+      fallback: true,
+    };
+  }
+
+  if (cap === 'sqlite.exec' || cap === 'sqlite.query') {
+    const cfg = safeJsonParse(row.config_json || '{}', {});
+    const dbPathRaw = String(argObj.db_path || argObj.path || cfg.dbPath || cfg.db_path || 'mcp_audit/sqlite_local.db').trim();
+    const sql = String(argObj.sql || '').trim();
+    if (!sql) {
+      const err = new Error('sql required');
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    const fullPath = resolveInsideWorkdir(dbPathRaw, { allowMissing: true });
+    await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+    const sqlite = new BetterSqlite3(fullPath);
+    try {
+      if (cap === 'sqlite.exec') {
+        const info = sqlite.prepare(sql).run(...(Array.isArray(argObj.params) ? argObj.params : []));
+        return {
+          ok: true,
+          server_id: sid,
+          capability: cap,
+          db_path: fullPath,
+          changes: Number(info?.changes || 0),
+          last_insert_rowid: Number(info?.lastInsertRowid || 0),
+          fallback: true,
+        };
+      }
+      const rows = sqlite.prepare(sql).all(...(Array.isArray(argObj.params) ? argObj.params : []));
+      return {
+        ok: true,
+        server_id: sid,
+        capability: cap,
+        db_path: fullPath,
+        rows,
+        row_count: Array.isArray(rows) ? rows.length : 0,
+        fallback: true,
+      };
+    } finally {
+      sqlite.close();
+    }
+  }
+
+  if (cap === 'export.write_markdown' || cap === 'export.write_csv') {
+    const cfg = safeJsonParse(row.config_json || '{}', {});
+    const base = String(cfg.outputPath || cfg.output_path || 'mcp_audit/exports').trim();
+    const relPath = String(argObj.path || argObj.file || '').trim() || (cap === 'export.write_markdown' ? 'report.md' : 'report.csv');
+    const fullPath = resolveInsideWorkdir(path.join(base, relPath), { allowMissing: true });
+    await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+    const content = cap === 'export.write_markdown'
+      ? String(argObj.content || argObj.markdown || '').trim()
+      : String(argObj.content || argObj.csv || '').trim();
+    if (!content) {
+      const err = new Error('content required');
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    await fs.promises.writeFile(fullPath, content, 'utf8');
+    return { ok: true, server_id: sid, capability: cap, path: fullPath, bytes: Buffer.byteLength(content, 'utf8'), fallback: true };
+  }
+
+  if (cap === 'text.slugify') {
+    const input = String(argObj.text || argObj.input || '').trim();
+    return { ok: true, server_id: sid, capability: cap, input, output: slugifyText(input), fallback: true };
+  }
+
+  if (cap === 'text.word_count') {
+    const input = String(argObj.text || argObj.input || '');
+    const words = input.trim() ? input.trim().split(/\s+/).length : 0;
+    return { ok: true, server_id: sid, capability: cap, words, chars: input.length, fallback: true };
+  }
+
+  if (cap === 'text.extract_urls') {
+    const input = String(argObj.text || argObj.input || '');
+    const matches = input.match(/https?:\/\/[^\s)]+/g) || [];
+    return { ok: true, server_id: sid, capability: cap, urls: Array.from(new Set(matches)), count: Array.from(new Set(matches)).length, fallback: true };
+  }
+
+  if (cap === 'resolve-library-id') {
+    const q = String(argObj.query || argObj.name || '').trim().toLowerCase();
+    if (!q) {
+      const err = new Error('query required');
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    const canonical = q.includes('react') ? 'react'
+      : q.includes('vue') ? 'vue'
+      : q.includes('next') ? 'next.js'
+      : slugifyText(q).replace(/-/g, '/');
+    return { ok: true, server_id: sid, capability: cap, query: q, libraryId: canonical, fallback: true };
+  }
+
+  if (cap === 'query-docs') {
+    const libraryId = String(argObj.libraryId || argObj.library_id || '').trim();
+    const query = String(argObj.query || argObj.question || '').trim();
+    if (!libraryId || !query) {
+      const err = new Error('libraryId and query required');
+      err.code = 'BAD_REQUEST';
+      throw err;
+    }
+    const answer = `Fallback docs response for ${libraryId}: ${query}. Configure a live Code1 endpoint for full documentation results.`;
+    return { ok: true, server_id: sid, capability: cap, libraryId, query, result: answer, fallback: true };
+  }
+
   throw new Error('MCP_RPC_FAILED');
+}
+
+export function __test_parseDdgLiteResults(html, limit = 5) {
+  return parseDdgLiteResults(html, limit);
+}
+
+export async function __test_searchWebResults(query, limit = 5, fetcher = null) {
+  return searchWebResults(query, limit, null, fetcher || fetchTextWithTlsFallback);
 }
 
 
@@ -1320,9 +2238,6 @@ export function createMcpRouter({ db }) {
       const templateId = String(req.params.id || '').trim();
       const tmpl = getTemplate(db, templateId);
       if (!tmpl) return res.status(404).json({ ok: false, error: 'TEMPLATE_NOT_FOUND' });
-      if (!MCP_MEDIA_TEMPLATE_IDS.has(templateId)) {
-        return res.status(400).json({ ok: false, error: 'INVALID_CAPABILITY', message: 'MCP is media-only. Unsupported template.' });
-      }
       const spec = await loadTemplateSpecFromDisk(tmpl);
       return res.json({ ok: true, template_id: templateId, spec });
     } catch (e) {
@@ -1379,9 +2294,6 @@ export function createMcpRouter({ db }) {
       if (!name) return res.status(400).json({ ok: false, error: 'name required' });
       const tmpl = getTemplate(db, templateId);
       if (!tmpl) return res.status(404).json({ ok: false, error: 'Template not found' });
-      if (!MCP_MEDIA_TEMPLATE_IDS.has(String(templateId))) {
-        return res.status(400).json({ ok: false, error: 'INVALID_CAPABILITY', message: 'MCP is media-only. Use media gallery templates only.' });
-      }
 
       let config = {};
       // Encrypt secret fields on create.
@@ -1423,14 +2335,22 @@ export function createMcpRouter({ db }) {
       const id = shortId('mcp');
       const ts = nowIso();
       const risk = String(tmpl.risk || 'low');
-      const approvedForUse = risk === 'high' || risk === 'critical' ? 0 : 1;
-      const derivedEntryCmd = String(req.body?.entry_cmd || config?.entryCmd || config?.entry_cmd || '').trim();
+      const approvedForUse = approvalsEnabled() ? (risk === 'high' || risk === 'critical' ? 0 : 1) : 1;
+      const derivedEntryCmd = String(
+        req.body?.entry_cmd
+        || config?.entryCmd
+        || config?.entry_cmd
+        || inferPbFilesEntryCmd({ templateId, configObj: config })
+        || inferKdenliveAlignedEntryCmd({ templateId, configObj: config })
+        || ''
+      ).trim();
       db.prepare(
         `INSERT INTO mcp_servers (id, template_id, name, version, risk, status, approved_for_use, install_path, entry_cmd, health_url, config_json, security_json, last_error, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
       ).run(id, templateId, name, String(req.body?.version || '0.1.0'), risk, approvedForUse, String(req.body?.install_path || ''), derivedEntryCmd, String(req.body?.health_url || ''), JSON.stringify(config), JSON.stringify(security), ts, ts);
       insertLog(db, id, 'INFO', `created server from template ${templateId}`);
-      setServerCapabilities(db, id, req.body?.capabilities || []);
+      const defaultCaps = normalizeCapabilities(safeJsonParse(tmpl.default_capabilities_json || '[]', []));
+      setServerCapabilities(db, id, req.body?.capabilities || defaultCaps);
       return res.json({ ok: true, server: listServers(db).find((s) => s.id === id) });
     } catch (e) {
       return res.status(400).json({ ok: false, error: String(e?.message || e) });
@@ -1463,7 +2383,18 @@ export function createMcpRouter({ db }) {
       validateRequiredFields(tmpl, nextConfig);
       const security = mergeSecurity(tmpl, nextConfig);
 
-      const nextEntryCmd = String(req.body?.entry_cmd || nextConfig?.entryCmd || nextConfig?.entry_cmd || row.entry_cmd || '').trim();
+      const explicitEntryCmd = String(req.body?.entry_cmd || '').trim();
+      const inferredPbFilesCmd = inferPbFilesEntryCmd({ templateId: row.template_id, configObj: nextConfig });
+      const inferredKdenliveCmd = inferKdenliveAlignedEntryCmd({ templateId: row.template_id, configObj: nextConfig });
+      const nextEntryCmd = String(
+        explicitEntryCmd
+        || nextConfig?.entryCmd
+        || nextConfig?.entry_cmd
+        || inferredPbFilesCmd
+        || inferredKdenliveCmd
+        || row.entry_cmd
+        || ''
+      ).trim();
       db.prepare(
         `UPDATE mcp_servers
          SET name = ?, approved_for_use = ?, config_json = ?, security_json = ?, entry_cmd = ?, updated_at = ?
@@ -1584,8 +2515,8 @@ export function createMcpRouter({ db }) {
       });
     }
 
-    db.prepare('UPDATE mcp_servers SET status = ?, last_error = NULL, updated_at = ? WHERE id = ?')
-      .run('running', nowIso(), id);
+    db.prepare('UPDATE mcp_servers SET status = ?, approved_for_use = ?, last_error = NULL, updated_at = ? WHERE id = ?')
+      .run('running', approvalsEnabled() ? Number(row.approved_for_use || 0) : 1, nowIso(), id);
     let startErr = null;
     try {
       await startInstalledServer(db, row);
@@ -1594,7 +2525,7 @@ export function createMcpRouter({ db }) {
       insertLog(db, id, 'WARN', `process start failed: ${startErr}`);
       const refreshed = db.prepare('SELECT * FROM mcp_servers WHERE id = ?').get(id);
       const fallbackCaps = getServerCapabilities(db, id);
-      const fallbackable = fallbackCaps.includes('browser.search') || fallbackCaps.includes('browser.open_url') || fallbackCaps.includes('browser.extract_text');
+      const fallbackable = hasFallbackCapability(fallbackCaps);
       const base = getRuntimeBaseUrlFromRow(refreshed || row);
       if (!fallbackable && !base) {
         db.prepare('UPDATE mcp_servers SET status = ?, last_error = ?, updated_at = ? WHERE id = ?')
@@ -1679,11 +2610,32 @@ export function createMcpRouter({ db }) {
       });
     }
 
-    const healthy = String(row.status) === 'running' && Boolean(row.approved_for_use);
+    let capabilities = getServerCapabilities(db, id);
+    if (!capabilities.length) {
+      const inferred = inferInternalCapsFromTemplate(row.template_id);
+      if (inferred.length) {
+        try { setServerCapabilities(db, id, inferred); } catch {}
+        capabilities = getServerCapabilities(db, id);
+      }
+    }
+    let healthy = String(row.status) === 'running' && (approvalsEnabled() ? Boolean(row.approved_for_use) : true);
     const action = String(req.body?.action || '').trim().toLowerCase();
     const ts = nowIso();
+    let message = healthy ? 'OK' : 'Not ready (start server and ensure it is approved for use).';
+    if (!healthy && (approvalsEnabled() ? Boolean(row.approved_for_use) : true) && hasFallbackCapability(capabilities)) {
+      const probeCap = capabilities.find((c) => hasFallbackCapability([c])) || null;
+      if (probeCap) {
+        try {
+          const probeArgs = sampleArgsForCapability(probeCap, row);
+          await executeMcpRpc({ db, serverId: id, capability: probeCap, args: probeArgs, rid: `test:${id}` });
+          healthy = true;
+          message = `OK (fallback via ${probeCap})`;
+        } catch (e) {
+          message = `Fallback probe failed (${probeCap}): ${String(e?.message || e)}`;
+        }
+      }
+    }
     const status = healthy ? 'pass' : 'fail';
-    const message = healthy ? 'OK' : 'Not ready (start server and ensure it is approved for use).';
     db.prepare(
       'UPDATE mcp_servers SET last_test_at = ?, last_test_status = ?, last_test_message = ?, updated_at = ? WHERE id = ?'
     ).run(ts, status, message, ts, id);
@@ -1781,7 +2733,7 @@ export function createMcpRouter({ db }) {
     if (id === CANVAS_MCP_ID) return res.status(404).json({ ok: false, error: 'Server not found' });
     const row = db.prepare('SELECT * FROM mcp_servers WHERE id = ?').get(id);
     if (!row) return res.status(404).json({ ok: false, error: 'Server not found' });
-    const healthy = String(row.status) === 'running' && Boolean(row.approved_for_use);
+    const healthy = String(row.status) === 'running' && (approvalsEnabled() ? Boolean(row.approved_for_use) : true);
     return res.json({ ok: true, server_id: id, status: row.status, healthy, last_error: row.last_error || null });
   });
 
@@ -1801,7 +2753,7 @@ export function createMcpRouter({ db }) {
     }
     if (!baseUrl) {
       const caps = getServerCapabilities(db, id);
-      const fallbackable = caps.includes('browser.search') || caps.includes('browser.open_url') || caps.includes('browser.extract_text');
+      const fallbackable = hasFallbackCapability(caps);
       if (fallbackable) {
         return res.json({
           ok: true,
@@ -1823,6 +2775,20 @@ export function createMcpRouter({ db }) {
     try {
       const r0 = await fetch(endpoint, { signal: ctrl.signal });
       const txt = await r0.text();
+      const caps = getServerCapabilities(db, id);
+      const fallbackable = hasFallbackCapability(caps);
+      if (!r0.ok && fallbackable) {
+        return res.json({
+          ok: true,
+          server_id: id,
+          status: row.status,
+          fallback_mode: true,
+          message: `Health endpoint returned ${r0.status}; fallback mode is available.`,
+          base_url: baseUrl,
+          endpoint,
+          preview: String(txt || '').slice(0, 500),
+        });
+      }
       return res.status(r0.ok ? 200 : 502).json({
         ok: r0.ok,
         server_id: id,
@@ -1832,6 +2798,19 @@ export function createMcpRouter({ db }) {
         preview: String(txt || '').slice(0, 500),
       });
     } catch (e) {
+      const caps = getServerCapabilities(db, id);
+      const fallbackable = hasFallbackCapability(caps);
+      if (fallbackable) {
+        return res.json({
+          ok: true,
+          server_id: id,
+          status: row.status,
+          fallback_mode: true,
+          message: `Health ping failed (${String(e?.message || e)}); fallback mode is available.`,
+          base_url: baseUrl,
+          endpoint,
+        });
+      }
       return res.status(502).json({
         ok: false,
         error: 'PING_FAILED',
@@ -1858,31 +2837,95 @@ export function createMcpRouter({ db }) {
     return res.json({ ok: true, server_id: id, logs: rows });
   });
 
+  r.get('/servers/:id/webchat-diagnostics', (req, res) => {
+    if (!assertWebchatOnly(req, res)) return;
+    const id = String(req.params.id || '').trim();
+    const row = db.prepare('SELECT * FROM mcp_servers WHERE id = ?').get(id);
+    if (!row) return res.status(404).json({ ok: false, error: 'Server not found' });
+    const capabilities = getServerCapabilities(db, id);
+    const enabledInWebChat = serverEnabledInWebchat(db, row);
+    const tools = capabilities.map((capability) => {
+      const toolName = toolNameForCapability(capability);
+      const schemaPresent = Boolean(toolName);
+      const visible = enabledInWebChat && schemaPresent;
+      let reason = 'ok';
+      if (!enabledInWebChat) reason = 'disabled';
+      else if (!schemaPresent) reason = 'schema_missing';
+      return {
+        capability,
+        tool_name: toolName || null,
+        visible_in_webchat: visible,
+        reason,
+      };
+    });
+    return res.json({
+      ok: true,
+      server_id: id,
+      enabled_in_webchat: enabledInWebChat,
+      approved_for_use: Boolean(row.approved_for_use),
+      status: String(row.status || ''),
+      tools,
+    });
+  });
+
   r.post('/proposals', async (req, res) => {
     if (!assertWebchatOnly(req, res)) return;
     try {
+      const mode = String(req.body?.mode || (Array.isArray(req.body?.capabilities) ? 'advanced' : 'simple')).trim().toLowerCase();
       const prompt = String(req.body?.prompt || req.body?.description || '').trim();
-      if (!prompt) return res.status(400).json({ ok: false, error: 'prompt required' });
-      const id = shortId('mcp_spec');
-      const spec = {
-        id: String(req.body?.id || id).replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase(),
-        name: String(req.body?.name || 'Custom MCP Server').trim() || 'Custom MCP Server',
-        version: String(req.body?.version || '0.1.0'),
-        runtime: String(req.body?.runtime || 'node').toLowerCase() === 'python' ? 'python' : 'node',
-        entry: 'server.js',
-        capabilities: validateCapabilities(db, req.body?.capabilities || ['browser.open_url', 'browser.extract_text']),
-        tests: {
-          health: true,
-          open_url: true,
-          extract_text: true,
-          screenshot: false,
-        },
+      const safetyConstraints = String(req.body?.constraints || req.body?.safety_constraints || '').trim();
+      if (!prompt) return res.status(400).json({ ok: false, error: 'prompt required', message: 'Describe what this MCP should do.' });
+      const proposalId = shortId('mcp_spec');
+      const spec = mode === 'advanced'
+        ? buildAdvancedProposalSpec({
+          proposalId,
+          name: req.body?.name,
+          prompt,
+          capabilities: validateCapabilities(db, req.body?.capabilities || ['browser.open_url', 'browser.extract_text']),
+        })
+        : buildSimpleProposalSpec({
+          proposalId,
+          name: req.body?.name,
+          description: prompt,
+          constraints: safetyConstraints,
+        });
+      spec.capabilities = validateCapabilities(db, spec.capabilities || []);
+      spec.schemas = buildSchemasForCapabilities(spec.capabilities || []);
+      spec.test_plan = buildTestPlanForCapabilities(spec.capabilities || []);
+      spec.webchat_test_prompt = buildWebchatTestPrompt({ capabilities: spec.capabilities || [] });
+      setProposalState(db, proposalId, {
+        proposal_id: proposalId,
+        mode,
         prompt,
+        safety_constraints: safetyConstraints,
+        spec,
         created_at: nowIso(),
-      };
-      return res.json({ ok: true, proposal_id: id, spec });
+      });
+      return res.json({ ok: true, proposal_id: proposalId, spec });
     } catch (e) {
       return res.status(400).json({ ok: false, error: String(e?.code || 'INVALID_CAPABILITY'), message: String(e?.message || e) });
+    }
+  });
+
+  r.get('/proposals/:id', async (req, res) => {
+    if (!assertWebchatOnly(req, res)) return;
+    try {
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ ok: false, error: 'proposal_id required' });
+      const found = getProposalById(db, id);
+      if (!found) return res.status(404).json({ ok: false, error: 'PROPOSAL_NOT_FOUND', proposal_id: id });
+      return res.json({
+        ok: true,
+        proposal_id: id,
+        mode: String(found.mode || ''),
+        spec: found.spec || null,
+        prompt: String(found.prompt || ''),
+        safety_constraints: String(found.safety_constraints || ''),
+        created_at: String(found.created_at || ''),
+        updated_at: String(found.updated_at || ''),
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'PROPOSAL_LOAD_FAILED', message: String(e?.message || e) });
     }
   });
 
@@ -1890,13 +2933,22 @@ export function createMcpRouter({ db }) {
     if (!assertWebchatOnly(req, res)) return;
     try {
       const inputSpec = req.body?.spec && typeof req.body.spec === 'object' ? req.body.spec : null;
+      const proposalId = String(req.body?.proposal_id || '').trim();
       const templateId = String(req.body?.template_id || req.body?.templateId || '').trim();
       const inputs = req.body?.inputs && typeof req.body.inputs === 'object' ? req.body.inputs : {};
       let spec = inputSpec;
 
+      if (!spec && proposalId) {
+        const proposal = getProposalById(db, proposalId);
+        if (!proposal?.spec || typeof proposal.spec !== 'object') {
+          return res.status(404).json({ ok: false, error: 'PROPOSAL_NOT_FOUND', proposal_id: proposalId });
+        }
+        spec = proposal.spec;
+      }
+
       if (!spec) {
         if (!templateId) return res.status(400).json({ ok: false, error: 'spec or template_id required' });
-        if (!MCP_MEDIA_TEMPLATE_IDS.has(templateId)) {
+        if (!MCP_SCAFFOLD_TEMPLATE_IDS.has(templateId)) {
           return res.status(400).json({ ok: false, error: 'INVALID_CAPABILITY', message: 'MCP is media-only. Unsupported template.' });
         }
         const tmpl = getTemplate(db, templateId);
@@ -1906,20 +2958,27 @@ export function createMcpRouter({ db }) {
         const resolvedInputs = resolveTemplateInputs(tmpl, inputs);
         const tmplCaps = safeJsonParse(tmpl.default_capabilities_json || '[]', []);
         const caps = validateCapabilities(db, req.body?.capabilities || templateSpec?.defaultCapabilities || templateSpec?.capabilities || tmplCaps || ['browser.open_url', 'browser.extract_text']);
-        const idRaw = String(req.body?.server_id || req.body?.id || templateSpec?.id || shortId('mcp_spec')).trim();
+        const displayName = buildDisplayName(req.body?.name || templateSpec?.name || tmpl.name || 'Custom MCP Server');
+        const idRaw = String(req.body?.server_id || req.body?.id || buildServerId(displayName)).trim();
         const id = idRaw.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
         if (!id) return res.status(400).json({ ok: false, error: 'server_id required' });
 
         spec = {
           ...templateSpec,
+          spec_id: String(req.body?.spec_id || shortId('mcp_spec')),
+          server_id: id,
           id,
-          name: String(req.body?.name || templateSpec?.name || tmpl.name || 'Custom MCP Server').trim() || 'Custom MCP Server',
+          name: displayName,
+          display_name: displayName,
           version: String(req.body?.version || templateSpec?.version || '0.1.0'),
           runtime: String(templateSpec?.runtime || 'node').toLowerCase() === 'python' ? 'python' : 'node',
           entry: String(templateSpec?.entry || 'server.js'),
           capabilities: caps,
+          schemas: buildSchemasForCapabilities(caps),
           inputs: resolvedInputs,
           template_id: templateId,
+          test_plan: buildTestPlanForCapabilities(caps),
+          webchat_test_prompt: buildWebchatTestPrompt({ capabilities: caps }),
           tests: {
             health: true,
             open_url: caps.includes('browser.open_url') || caps.includes('browser.extract_text'),
@@ -1930,14 +2989,31 @@ export function createMcpRouter({ db }) {
         };
       }
 
-      const id = String(spec.id || '').trim();
+      spec.capabilities = validateCapabilities(db, spec.capabilities || []);
+      spec.schemas = buildSchemasForCapabilities(spec.capabilities || []);
+      spec.test_plan = Array.isArray(spec.test_plan) ? spec.test_plan : buildTestPlanForCapabilities(spec.capabilities || []);
+      spec.server_id = String(spec.server_id || spec.id || req.body?.server_id || '').trim() || buildServerId(spec.display_name || spec.name || 'custom');
+      spec.id = String(spec.server_id || spec.id || '').trim();
+      spec.spec_id = String(spec.spec_id || shortId('mcp_spec')).trim();
+      spec.name = buildDisplayName(spec.display_name || spec.name || 'Custom MCP Server');
+      spec.display_name = spec.name;
+      if (!spec.template_id) spec.template_id = inferTemplateIdFromCapabilities(spec.capabilities || []);
+      if (!spec.inputs || typeof spec.inputs !== 'object') spec.inputs = inferInputsForTemplate(String(spec.template_id || ''));
+
+      const id = String(spec.server_id || spec.id || '').trim();
       if (!id) return res.status(400).json({ ok: false, error: 'spec.id required' });
       const caps = validateCapabilities(db, spec.capabilities || []);
       const dirs = await ensureMcpDirs();
       const stagingDir = path.join(dirs.staging, id);
       await fs.promises.rm(stagingDir, { recursive: true, force: true });
       await fs.promises.mkdir(stagingDir, { recursive: true });
-      const serverJs = `import http from 'node:http';
+      const usePbFilesRuntime = caps.some((cap) => String(cap).startsWith('pb_files.'));
+      const useKdenliveAlignedRuntime = caps.includes('kdenlive.make_aligned_project');
+      const serverJs = useKdenliveAlignedRuntime
+        ? await fs.promises.readFile(KDENLIVE_ALIGNED_RUNTIME_PATH, 'utf8')
+        : usePbFilesRuntime
+          ? await fs.promises.readFile(PB_FILES_RUNTIME_PATH, 'utf8')
+        : `import http from 'node:http';
 import https from 'node:https';
 
 const PORT = Number(process.env.PORT || process.argv[2] || 0) || 0;
@@ -2002,10 +3078,15 @@ server.listen(PORT, '127.0.0.1', () => {
       await fs.promises.writeFile(path.join(stagingDir, 'package.json'), JSON.stringify(pkg, null, 2));
       await fs.promises.writeFile(path.join(stagingDir, 'server.js'), serverJs);
       const ts = nowIso();
-      const templateForRow = String(spec?.template_id || templateId || 'custom_media') || 'custom_media';
+      const templateForRow = String(spec?.template_id || templateId || inferTemplateIdFromCapabilities(caps) || 'custom_media') || 'custom_media';
+      const entryCmd = useKdenliveAlignedRuntime
+        ? inferKdenliveAlignedEntryCmd({ templateId: templateForRow, configObj: spec.inputs || {} }) || `node ${path.join(stagingDir, 'server.js')} --root=${getPbWorkdir()}`
+        : usePbFilesRuntime
+          ? inferPbFilesEntryCmd({ templateId: templateForRow, configObj: spec.inputs || {} }) || `node ${path.join(stagingDir, 'server.js')} --mode=rw --root=${getPbWorkdir()}`
+          : `node ${path.join(stagingDir, 'server.js')}`;
       db.prepare(`
-        INSERT INTO mcp_servers (id, template_id, name, version, risk, status, approved_for_use, install_path, entry_cmd, health_url, config_json, security_json, last_error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'staged', 1, ?, ?, ?, '{}', '{}', NULL, ?, ?)
+        INSERT INTO mcp_servers (id, template_id, name, version, risk, status, approved_for_use, install_path, entry_cmd, health_url, config_json, security_json, last_error, spec_id, aliases_json, schemas_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'staged', 1, ?, ?, ?, ?, '{}', NULL, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           template_id = excluded.template_id,
           name = excluded.name,
@@ -2013,17 +3094,25 @@ server.listen(PORT, '127.0.0.1', () => {
           status = 'staged',
           install_path = excluded.install_path,
           entry_cmd = excluded.entry_cmd,
+          config_json = excluded.config_json,
+          spec_id = excluded.spec_id,
+          aliases_json = excluded.aliases_json,
+          schemas_json = excluded.schemas_json,
           health_url = excluded.health_url,
           updated_at = excluded.updated_at
       `).run(
         id,
         templateForRow,
-        String(spec.name || id),
+        String(spec.display_name || spec.name || id),
         String(spec.version || '0.1.0'),
         'medium',
         stagingDir,
-        `node ${path.join(stagingDir, 'server.js')}`,
+        entryCmd,
         '',
+        JSON.stringify(spec.inputs || {}),
+        String(spec.spec_id || ''),
+        JSON.stringify([String(spec.display_name || spec.name || id)]),
+        JSON.stringify(spec.schemas || {}),
         ts,
         ts,
       );
@@ -2040,18 +3129,43 @@ server.listen(PORT, '127.0.0.1', () => {
     if (!assertWebchatOnly(req, res)) return;
     const serverId = String(req.body?.server_id || req.body?.id || '').trim();
     let stagingPath = String(req.body?.staging_path || '').trim();
+    let spec = req.body?.spec && typeof req.body.spec === 'object' ? req.body.spec : null;
     if (!stagingPath && serverId) {
       const state = getBuildForServer(db, serverId);
       stagingPath = String(state?.staging_path || '').trim();
+      if (!spec && state?.spec && typeof state.spec === 'object') spec = state.spec;
     }
     if (!stagingPath) {
       return res.status(400).json({ ok: false, error: 'BUILD_REQUIRED', message: 'Run /api/mcp/build first for this server_id.' });
+    }
+    if (!spec) {
+      const specPath = path.join(stagingPath, 'mcp-server.spec.json');
+      if (fs.existsSync(specPath)) {
+        const txt = await fs.promises.readFile(specPath, 'utf8');
+        spec = safeJsonParse(txt, null);
+      }
     }
     const serverPath = path.join(stagingPath, 'server.js');
     if (!fs.existsSync(serverPath)) return res.status(404).json({ ok: false, error: 'server.js missing' });
     const { spawn } = await import('node:child_process');
     const port = 44000 + Math.floor(Math.random() * 1000);
-    const child = spawn('node', [serverPath, String(port)], { cwd: stagingPath, env: { ...process.env, PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const declaredCapsForSpawn = normalizeCapabilities(spec?.capabilities || []);
+    const templateIdForSpawn = String(spec?.template_id || inferTemplateIdFromCapabilities(declaredCapsForSpawn) || '');
+    const spawnArgs = [serverPath];
+    if (declaredCapsForSpawn.some((cap) => cap.startsWith('pb_files.'))) {
+      const writable = declaredCapsForSpawn.some((cap) => cap === 'pb_files.write' || cap === 'pb_files.mkdir' || cap === 'pb_files.delete');
+      spawnArgs.push(`--mode=${writable ? 'rw' : 'ro'}`);
+      spawnArgs.push(`--root=${String(spec?.inputs?.root_path || getPbWorkdir())}`);
+    } else if (declaredCapsForSpawn.includes('kdenlive.make_aligned_project') || templateIdForSpawn === 'kdenlive_aligned_5s_scene_builder') {
+      spawnArgs.push(`--root=${String(spec?.inputs?.root_path || getPbWorkdir())}`);
+    } else {
+      spawnArgs.push(String(port));
+    }
+    const child = spawn('node', spawnArgs, {
+      cwd: stagingPath,
+      env: { ...process.env, PORT: String(port), PB_WORKDIR: getPbWorkdir() },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     const logs = [];
     child.stdout.on('data', (b) => logs.push(String(b || '').slice(0, 500)));
     child.stderr.on('data', (b) => logs.push(String(b || '').slice(0, 500)));
@@ -2061,11 +3175,75 @@ server.listen(PORT, '127.0.0.1', () => {
       await sleep(900);
       const h = await fetch(`${base}/health`);
       const htxt = await h.text();
+      const declaredCaps = normalizeCapabilities(spec?.capabilities || []);
+      const requestedByTests = [];
+      if (Boolean(spec?.tests?.open_url)) requestedByTests.push('browser.open_url');
+      if (Boolean(spec?.tests?.extract_text)) requestedByTests.push('browser.extract_text');
+      if (Boolean(spec?.tests?.search)) requestedByTests.push('browser.search');
+      if (Boolean(spec?.tests?.screenshot)) requestedByTests.push('browser.screenshot');
+      const capabilityPlan = Array.from(new Set([...declaredCaps, ...requestedByTests]))
+        .sort((a, b) => capabilityTestPriority(a) - capabilityTestPriority(b) || String(a).localeCompare(String(b)));
       const testUrl = String(req.body?.url || 'https://example.com').trim() || 'https://example.com';
-      const open = await fetch(`${base}/rpc`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ capability: 'browser.open_url', args: { url: testUrl } }) });
-      const otxt = await open.text();
-      const ok = h.ok && open.ok;
-      return res.status(ok ? 200 : 400).json({ ok, server_id: serverId || null, staging_path: stagingPath, logs, tests: { health: { ok: h.ok, preview: String(htxt).slice(0, 300) }, browse: { ok: open.ok, preview: String(otxt).slice(0, 300) } } });
+      const capResults = [];
+      for (const capability of capabilityPlan) {
+        if (!declaredCaps.includes(capability)) {
+          logs.push(`[SKIPPED_NOT_DECLARED] capability=${capability}`);
+          capResults.push({
+            capability,
+            ok: true,
+            status: 'skipped',
+            code: 'SKIPPED_NOT_DECLARED',
+            declared: false,
+          });
+          continue;
+        }
+        const args = sampleArgsForCapability(capability, null);
+        if ((capability === 'browser.open_url' || capability === 'browser.extract_text') && !args.url) args.url = testUrl;
+        const rr = await fetch(`${base}/rpc`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ capability, args }),
+        });
+        const txt = await rr.text();
+        const payload = txt ? safeJsonParse(txt, null) : null;
+        let runtimeError = null;
+        if (rr.ok && capability === 'kdenlive.make_aligned_project') {
+          try {
+            const relProjectPath = String(payload?.project_path || '').trim();
+            if (!relProjectPath) throw new Error('project_path missing from response');
+            const abs = resolveInsideWorkdir(relProjectPath, { allowMissing: false });
+            const xml = await fs.promises.readFile(abs, 'utf8');
+            const hasMlt = xml.includes('<mlt');
+            const hasPlaylists = ['playlist_v1', 'playlist_a1', 'playlist_a2', 'playlist_a3'].every((id0) => xml.includes(`id="${id0}"`));
+            const trackCount = (xml.match(/<track producer="playlist_/g) || []).length;
+            if (!hasMlt || !hasPlaylists || trackCount < 4) {
+              throw new Error('generated MLT missing required root/playlists/tracks');
+            }
+          } catch (e) {
+            runtimeError = String(e?.message || e);
+          }
+        }
+        capResults.push({
+          capability,
+          ok: rr.ok && !runtimeError,
+          status: rr.ok && !runtimeError ? 'pass' : 'fail',
+          declared: true,
+          preview: String(txt || '').slice(0, 240),
+          error: runtimeError || (rr.ok ? null : String(payload?.error || payload?.message || `HTTP ${rr.status}`)),
+        });
+      }
+      const capsOk = capResults.every((row) => row.status !== 'fail');
+      const ok = h.ok && capsOk;
+      return res.status(ok ? 200 : 400).json({
+        ok,
+        server_id: serverId || String(spec?.id || '') || null,
+        staging_path: stagingPath,
+        logs,
+        tests: {
+          health: { ok: h.ok, preview: String(htxt).slice(0, 300) },
+          capability_runs: capResults,
+        },
+      });
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'TEST_FAILED', message: String(e?.message || e), server_id: serverId || null, staging_path: stagingPath, logs });
     } finally {
@@ -2094,7 +3272,17 @@ server.listen(PORT, '127.0.0.1', () => {
         }
       }
       if (!spec || typeof spec !== 'object') return res.status(400).json({ ok: false, error: 'BUILD_REQUIRED', message: 'mcp-server.spec.json missing. Rebuild required.' });
-      const id = String(spec.id || serverIdReq || '').trim();
+      spec.capabilities = validateCapabilities(db, spec.capabilities || []);
+      spec.schemas = buildSchemasForCapabilities(spec.capabilities || []);
+      spec.spec_id = String(spec.spec_id || proposalId || shortId('mcp_spec')).trim();
+      spec.server_id = String(spec.server_id || spec.id || serverIdReq || '').trim() || buildServerId(spec.display_name || spec.name || 'custom');
+      spec.id = spec.server_id;
+      spec.name = buildDisplayName(spec.display_name || spec.name || spec.server_id);
+      spec.display_name = spec.name;
+      if (!spec.template_id) spec.template_id = inferTemplateIdFromCapabilities(spec.capabilities || []);
+      if (!spec.inputs || typeof spec.inputs !== 'object') spec.inputs = inferInputsForTemplate(String(spec.template_id || ''));
+
+      const id = String(spec.server_id || serverIdReq || '').trim();
       if (!id) return res.status(400).json({ ok: false, error: 'spec.id required' });
       const dirs = await ensureMcpDirs();
       const installPath = path.join(dirs.installed, id);
@@ -2104,24 +3292,77 @@ server.listen(PORT, '127.0.0.1', () => {
       const ts = nowIso();
       const healthUrl = '';
       const templateId = String(req.body?.template_id || spec?.template_id || 'custom_media');
-      if (templateId !== 'custom_media' && !MCP_MEDIA_TEMPLATE_IDS.has(templateId)) {
+      if (!MCP_INSTALLABLE_TEMPLATE_IDS.has(templateId)) {
         return res.status(400).json({ ok: false, error: 'INVALID_CAPABILITY', message: 'MCP is media-only. Unsupported template.' });
       }
+      const installedCaps = normalizeCapabilities(spec.capabilities || []);
+      const installEntryCmd = installedCaps.includes('kdenlive.make_aligned_project')
+        ? inferKdenliveAlignedEntryCmd({ templateId, configObj: spec.inputs || {} }) || `node ${path.join(installPath, 'server.js')} --root=${getPbWorkdir()}`
+        : (installedCaps.some((cap) => cap.startsWith('pb_files.'))
+          ? inferPbFilesEntryCmd({ templateId, configObj: spec.inputs || {} }) || `node ${path.join(installPath, 'server.js')} --mode=rw --root=${getPbWorkdir()}`
+          : `node ${path.join(installPath, 'server.js')}`);
       db.prepare(`
-        INSERT INTO mcp_servers (id, template_id, name, version, risk, status, approved_for_use, install_path, entry_cmd, health_url, config_json, security_json, last_error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'stopped', 1, ?, ?, ?, '{}', '{}', NULL, ?, ?)
+        INSERT INTO mcp_servers (id, template_id, name, version, risk, status, approved_for_use, install_path, entry_cmd, health_url, config_json, security_json, last_error, spec_id, aliases_json, schemas_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'stopped', 1, ?, ?, ?, ?, '{}', NULL, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           name = excluded.name,
           version = excluded.version,
           install_path = excluded.install_path,
           entry_cmd = excluded.entry_cmd,
+          config_json = excluded.config_json,
+          spec_id = excluded.spec_id,
+          aliases_json = excluded.aliases_json,
+          schemas_json = excluded.schemas_json,
           health_url = excluded.health_url,
           updated_at = excluded.updated_at
-      `).run(id, templateId, String(spec.name || id), String(spec.version || '0.1.0'), 'medium', installPath, `node ${path.join(installPath, 'server.js')}`, healthUrl, ts, ts);
-      setServerCapabilities(db, id, spec.capabilities || []);
+      `).run(
+        id,
+        templateId,
+        String(spec.display_name || spec.name || id),
+        String(spec.version || '0.1.0'),
+        'medium',
+        installPath,
+        installEntryCmd,
+        healthUrl,
+        JSON.stringify(spec.inputs || {}),
+        String(spec.spec_id || ''),
+        JSON.stringify([String(spec.display_name || spec.name || id)]),
+        JSON.stringify(spec.schemas || {}),
+        ts,
+        ts,
+      );
+      setServerCapabilities(db, id, installedCaps);
       insertLog(db, id, 'INFO', 'installed from staging');
       clearBuildForServer(db, id);
-      return res.json({ ok: true, server_id: id, server: listServers(db).find((x) => x.id === id) || null });
+      const webchatState = getMcpWebchatEnabledState(db);
+      webchatState.servers[id] = true;
+      setMcpWebchatEnabledState(db, webchatState);
+      let started = false;
+      let startError = null;
+      try {
+        db.prepare('UPDATE mcp_servers SET status = ?, last_error = NULL, updated_at = ? WHERE id = ?').run('running', nowIso(), id);
+        const row = db.prepare('SELECT * FROM mcp_servers WHERE id = ?').get(id);
+        await startInstalledServer(db, row);
+        started = true;
+        insertLog(db, id, 'INFO', 'auto-started after install');
+      } catch (e) {
+        startError = String(e?.message || e);
+        db.prepare('UPDATE mcp_servers SET status = ?, last_error = ?, updated_at = ? WHERE id = ?').run('stopped', startError, nowIso(), id);
+        insertLog(db, id, 'WARN', `auto-start after install failed: ${startError}`);
+      }
+      const server = listServers(db).find((x) => x.id === id) || null;
+      return res.json({
+        ok: true,
+        server_id: id,
+        spec_id: String(spec.spec_id || ''),
+        display_name: String(spec.display_name || spec.name || id),
+        enabled_in_webchat: true,
+        started,
+        start_error: startError,
+        tool_names: installedCaps.map((cap) => toolNameForCapability(cap)).filter(Boolean),
+        webchat_test_prompt: buildWebchatTestPrompt({ capabilities: installedCaps }),
+        server,
+      });
     } catch (e) {
       return res.status(500).json({ ok: false, error: 'INSTALL_FAILED', message: String(e?.message || e) });
     }

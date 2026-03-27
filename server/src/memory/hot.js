@@ -60,6 +60,10 @@ export function clearHot({ sessionId } = {}) {
   SESSION_HOT.delete(sid);
 }
 
-export function __resetHotForTests() {
+export function resetHotCache() {
   SESSION_HOT.clear();
+}
+
+export function __resetHotForTests() {
+  resetHotCache();
 }

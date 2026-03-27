@@ -10,11 +10,23 @@
     { "key": "rootPath", "label": "Folder", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
   ],
   "securityDefaults": {
+    "testPlan": [
+      "pb_files.list .",
+      "pb_files.mkdir mcp_test",
+      "pb_files.write mcp_test/probe.txt",
+      "pb_files.read mcp_test/probe.txt"
+    ],
     "workdirOnly": true,
     "pathAllowlist": ["{PB_WORKDIR}"],
     "pathReadOnly": false,
     "domainAllowlist": [],
     "commandAllowlist": []
-  }
+  },
+  "defaultCapabilities": [
+    "pb_files.list",
+    "pb_files.read",
+    "pb_files.write",
+    "pb_files.mkdir",
+    "pb_files.delete"
+  ]
 }
-

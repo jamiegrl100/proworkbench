@@ -1,7 +1,7 @@
 {
   "name": "proworkbench-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "dist/main.js",
   "description": "ProWorkbench desktop app",
   "homepage": "https://proworkbench.com",

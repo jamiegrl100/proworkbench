@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { deleteJson, getJson, postJson, putJson } from "../components/api";
+import { getToken } from "../auth";
 import { useI18n } from "../i18n/LanguageProvider";
 
 type McpTemplateField = {
@@ -28,6 +29,8 @@ type McpTemplate = {
 
 type McpServer = {
   id: string;
+  specId?: string | null;
+  displayName?: string;
   templateId: string;
   builtIn?: boolean;
   enabledInWebChat?: boolean;
@@ -43,6 +46,18 @@ type McpServer = {
   startRequiresApproval?: boolean;
   startApproval?: { id: number; status: string; created_at: string } | null;
   updatedAt?: string;
+  capabilities?: string[];
+  schemas?: Record<string, any>;
+  toolNames?: string[];
+};
+
+type BuilderMode = "simple" | "advanced";
+
+type WebchatDiagnostic = {
+  capability: string;
+  tool_name?: string | null;
+  visible_in_webchat: boolean;
+  reason: string;
 };
 
 
@@ -62,7 +77,7 @@ function riskColor(risk: string) {
   return "var(--ok)";
 }
 
-export default function McpServersPage() {
+export default function McpServersPage({ approvalsEnabled = false }: { approvalsEnabled?: boolean }) {
   const { t } = useI18n();
   const [templates, setTemplates] = useState<McpTemplate[]>([]);
   const [servers, setServers] = useState<McpServer[]>([]);
@@ -82,15 +97,37 @@ export default function McpServersPage() {
 
   const [logServerId, setLogServerId] = useState<string>("");
   const [logs, setLogs] = useState<LogsRow[]>([]);
+  const [builderMode, setBuilderMode] = useState<BuilderMode>("simple");
+  const [simpleName, setSimpleName] = useState('');
+  const [simpleDescription, setSimpleDescription] = useState('Allow reading/writing files inside the PB workspace safely. Support mkdir, list, read, write. No delete.');
+  const [simpleConstraints, setSimpleConstraints] = useState('');
   const [proposalPrompt, setProposalPrompt] = useState('Build a media browser MCP with open_url and extract_text.');
   const [proposalCaps, setProposalCaps] = useState('browser.open_url,browser.extract_text,browser.screenshot');
+  const [proposalId, setProposalId] = useState<string>('');
   const [proposalSpec, setProposalSpec] = useState<any>(null);
+  const [proposalResult, setProposalResult] = useState<any>(null);
+  const [proposalErrorJson, setProposalErrorJson] = useState<any>(null);
+  const [proposalLoading, setProposalLoading] = useState(false);
+  const [toastMsg, setToastMsg] = useState('');
   const [buildOut, setBuildOut] = useState<any>(null);
+  const [buildId, setBuildId] = useState<string>('');
   const [testOut, setTestOut] = useState<any>(null);
   const [capPolicy, setCapPolicy] = useState<CapabilityPolicy | null>(null);
   const [disabledDefaults, setDisabledDefaults] = useState<Record<string, boolean>>({});
   const [customForbiddenText, setCustomForbiddenText] = useState('');
   const [pingStatus, setPingStatus] = useState<Record<string, string>>({});
+  const [currentProposalInput, setCurrentProposalInput] = useState('');
+  const [installOut, setInstallOut] = useState<any>(null);
+  const [webchatDiagnostics, setWebchatDiagnostics] = useState<WebchatDiagnostic[]>([]);
+  const [webchatRunOut, setWebchatRunOut] = useState<any>(null);
+
+  const canCreateProposal = builderMode === "simple"
+    ? Boolean(simpleDescription.trim())
+    : Boolean(proposalPrompt.trim());
+  const canBuild = Boolean(proposalId);
+  const canTest = Boolean(buildId);
+  const testsPassed = Boolean(testOut?.ok);
+  const canInstall = Boolean(buildId) && testsPassed;
 
   const filteredServers = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -143,6 +180,29 @@ export default function McpServersPage() {
     loadAll();
   }, []);
 
+  useEffect(() => {
+    const saved = String(localStorage.getItem('pb_mcp_current_proposal_id') || '').trim();
+    if (saved) {
+      setProposalId(saved);
+      setCurrentProposalInput(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!toastMsg) return;
+    const id = window.setTimeout(() => setToastMsg(''), 2600);
+    return () => window.clearTimeout(id);
+  }, [toastMsg]);
+
+  async function copyJson(value: any) {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(value ?? {}, null, 2));
+      setToastMsg('Copied JSON');
+    } catch {
+      setToastMsg('Copy failed');
+    }
+  }
+
   function openCreate(template: McpTemplate) {
     setCreateTemplateId(template.id);
     setCreateName(template.name);
@@ -158,28 +218,113 @@ export default function McpServersPage() {
 
   async function createProposal() {
     setBusy(true);
+    setProposalLoading(true);
     setErr('');
+    setProposalErrorJson(null);
+    setProposalResult(null);
+    setProposalId('');
+    setProposalSpec(null);
+    setInstallOut(null);
+    setWebchatDiagnostics([]);
+    setWebchatRunOut(null);
     try {
-      const capabilities = proposalCaps.split(',').map((x) => x.trim()).filter(Boolean);
-      const out = await postJson<any>('/api/mcp/proposals', { prompt: proposalPrompt, capabilities });
+      const token = getToken();
+      const r = await fetch('/api/mcp/proposals', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}`, 'X-PB-Admin-Token': token } : {}),
+        },
+        body: JSON.stringify(builderMode === 'simple'
+          ? {
+            mode: 'simple',
+            name: simpleName,
+            prompt: simpleDescription,
+            constraints: simpleConstraints,
+          }
+          : {
+            mode: 'advanced',
+            name: simpleName,
+            prompt: proposalPrompt,
+            capabilities: proposalCaps.split(',').map((x) => x.trim()).filter(Boolean),
+          }),
+      });
+      const raw = await r.text();
+      const parsed = raw ? (() => { try { return JSON.parse(raw); } catch { return { ok: false, error: 'INVALID_JSON', raw }; } })() : {};
+      if (!r.ok) {
+        setProposalErrorJson(parsed);
+        const msg = String((parsed as any)?.message || (parsed as any)?.error || `HTTP ${r.status}`);
+        setErr(msg);
+        setToastMsg(`Proposal failed: ${msg}`);
+        return;
+      }
+      setProposalResult(parsed);
+      const pid = String((parsed as any)?.proposal_id || '');
+      setProposalId(pid);
+      setCurrentProposalInput(pid);
+      if (pid) localStorage.setItem('pb_mcp_current_proposal_id', pid);
+      setProposalSpec((parsed as any)?.spec || null);
+      setBuildOut(null);
+      setBuildId('');
+      setTestOut(null);
+      setToastMsg('Proposal created');
+    } catch (e: any) {
+      console.error('MCP proposal request failed', e);
+      const networkErr = { ok: false, error: 'NETWORK_ERROR', message: String(e?.message || e || 'network error') };
+      setProposalErrorJson(networkErr);
+      setErr('network error');
+      setToastMsg('network error');
+    } finally {
+      setProposalLoading(false);
+      setBusy(false);
+    }
+  }
+
+  async function loadProposalById() {
+    const id = String(currentProposalInput || '').trim();
+    if (!id) {
+      setErr('proposal_id required');
+      return;
+    }
+    setBusy(true);
+    setErr('');
+    setProposalErrorJson(null);
+    try {
+      const out = await getJson<any>(`/api/mcp/proposals/${encodeURIComponent(id)}`);
+      setProposalResult(out);
+      setProposalId(String(out?.proposal_id || id));
+      setCurrentProposalInput(String(out?.proposal_id || id));
       setProposalSpec(out?.spec || null);
       setBuildOut(null);
+      setBuildId('');
       setTestOut(null);
+      setInstallOut(null);
+      setWebchatDiagnostics([]);
+      setWebchatRunOut(null);
+      localStorage.setItem('pb_mcp_current_proposal_id', String(out?.proposal_id || id));
+      setToastMsg('Proposal loaded');
     } catch (e: any) {
-      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+      const details = e?.detail || { ok: false, error: String(e?.message || e) };
+      setProposalErrorJson(details);
+      setErr(String(details?.message || details?.error || e?.message || e));
+      setToastMsg('Load proposal failed');
     } finally {
       setBusy(false);
     }
   }
 
   async function buildProposal() {
-    if (!proposalSpec) return;
+    if (!proposalId) return;
     setBusy(true);
     setErr('');
     try {
-      const out = await postJson<any>('/api/mcp/build', { spec: proposalSpec });
+      const out = await postJson<any>('/api/mcp/build', { proposal_id: proposalId, spec: proposalSpec || undefined });
       setBuildOut(out);
+      setBuildId(String(out?.server_id || ''));
       setTestOut(null);
+      setInstallOut(null);
+      setWebchatDiagnostics([]);
+      setWebchatRunOut(null);
     } catch (e: any) {
       setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
     } finally {
@@ -188,11 +333,14 @@ export default function McpServersPage() {
   }
 
   async function testBuild() {
-    if (!buildOut?.staging_path) return;
+    if (!buildId) return;
     setBusy(true);
     setErr('');
     try {
-      const out = await postJson<any>('/api/mcp/test', { staging_path: buildOut.staging_path });
+      const out = await postJson<any>('/api/mcp/test', {
+        server_id: buildId,
+        staging_path: buildOut?.staging_path || undefined,
+      });
       setTestOut(out);
     } catch (e: any) {
       setTestOut(e?.detail || { ok: false, error: String(e?.message || e) });
@@ -203,14 +351,64 @@ export default function McpServersPage() {
   }
 
   async function installBuild() {
-    if (!buildOut?.staging_path || !proposalSpec) return;
+    if (!buildId || !testsPassed) return;
     setBusy(true);
     setErr('');
     try {
-      await postJson<any>('/api/mcp/install', { staging_path: buildOut.staging_path, spec: proposalSpec, template_id: 'custom_media' });
+      const out = await postJson<any>('/api/mcp/install', {
+        server_id: buildId,
+        staging_path: buildOut?.staging_path || undefined,
+        spec: proposalSpec || undefined,
+        template_id: proposalSpec?.template_id || 'custom_media',
+      });
+      setInstallOut(out);
+      const installedServerId = String(out?.server_id || '');
+      if (installedServerId) {
+        const diag = await getJson<any>(`/api/mcp/servers/${encodeURIComponent(installedServerId)}/webchat-diagnostics`);
+        setWebchatDiagnostics(Array.isArray(diag?.tools) ? diag.tools : []);
+      } else {
+        setWebchatDiagnostics([]);
+      }
+      setWebchatRunOut(null);
       await loadAll();
     } catch (e: any) {
       setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyWebchatTestPrompt() {
+    const prompt = String(installOut?.webchat_test_prompt || proposalSpec?.webchat_test_prompt || '').trim();
+    if (!prompt) return setToastMsg('No test prompt available');
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setToastMsg('Copied WebChat test prompt');
+    } catch {
+      setToastMsg('Copy failed');
+    }
+  }
+
+  async function runWebchatTest() {
+    const serverId = String(installOut?.server_id || '').trim();
+    const prompt = String(installOut?.webchat_test_prompt || proposalSpec?.webchat_test_prompt || '').trim();
+    if (!serverId || !prompt) return;
+    setBusy(true);
+    setErr('');
+    try {
+      const out = await postJson<any>('/admin/webchat/send', {
+        session_id: `mcp-builder-${Date.now()}`,
+        agent_id: 'alex',
+        message_id: `msg-${Date.now()}`,
+        mcp_server_id: serverId,
+        message: prompt,
+      });
+      setWebchatRunOut(out);
+      setToastMsg(out?.ok ? 'WebChat test passed' : 'WebChat test failed');
+    } catch (e: any) {
+      const detail = e?.detail || { ok: false, error: String(e?.message || e) };
+      setWebchatRunOut(detail);
+      setErr(String(detail?.message || detail?.error || e?.message || e));
     } finally {
       setBusy(false);
     }
@@ -548,6 +746,11 @@ export default function McpServersPage() {
           {err}
         </div>
       ) : null}
+      {toastMsg ? (
+        <div style={{ padding: 10, border: '1px solid color-mix(in srgb, var(--accent-2) 45%, var(--border))', background: 'color-mix(in srgb, var(--accent-2) 10%, var(--panel))', borderRadius: 8 }}>
+          {toastMsg}
+        </div>
+      ) : null}
 
       <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12 }}>
         <h3 style={{ marginTop: 0 }}>{t("mcp.templates.title")}</h3>
@@ -634,23 +837,146 @@ export default function McpServersPage() {
       <section style={{ border: "1px solid var(--border-soft)", borderRadius: 10, padding: 12 }}>
         <h3 style={{ marginTop: 0 }}>Proposal to Build to Test to Install</h3>
         <div style={{ display: 'grid', gap: 8 }}>
-          <label>
-            <div style={{ fontSize: 12, opacity: 0.8 }}>Proposal prompt</div>
-            <textarea value={proposalPrompt} onChange={(e) => setProposalPrompt(e.target.value)} rows={3} style={{ width: '100%' }} />
-          </label>
-          <label>
-            <div style={{ fontSize: 12, opacity: 0.8 }}>Capabilities (comma separated)</div>
-            <input value={proposalCaps} onChange={(e) => setProposalCaps(e.target.value)} style={{ width: '100%', padding: 8 }} />
-          </label>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button onClick={createProposal} disabled={busy} style={{ padding: '8px 12px' }}>1) Proposal</button>
-            <button onClick={buildProposal} disabled={busy || !proposalSpec} style={{ padding: '8px 12px' }}>2) Build</button>
-            <button onClick={testBuild} disabled={busy || !buildOut?.staging_path} style={{ padding: '8px 12px' }}>3) Test</button>
-            <button onClick={installBuild} disabled={busy || !buildOut?.staging_path || !proposalSpec} style={{ padding: '8px 12px' }}>4) Install</button>
+            <button
+              onClick={() => setBuilderMode('simple')}
+              style={{ padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border-soft)', background: builderMode === 'simple' ? 'var(--panel-2)' : 'var(--panel)' }}
+            >
+              Simple
+            </button>
+            <button
+              onClick={() => setBuilderMode('advanced')}
+              style={{ padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border-soft)', background: builderMode === 'advanced' ? 'var(--panel-2)' : 'var(--panel)' }}
+            >
+              Advanced
+            </button>
           </div>
-          {proposalSpec ? <pre style={{ margin: 0, maxHeight: 180, overflow: 'auto' }}>{JSON.stringify(proposalSpec, null, 2)}</pre> : null}
+          <div style={{ border: '1px solid var(--border-soft)', borderRadius: 8, padding: 10, display: 'grid', gap: 8 }}>
+            <div style={{ fontWeight: 600 }}>Current proposal</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <input
+                value={currentProposalInput}
+                onChange={(e) => setCurrentProposalInput(e.target.value)}
+                placeholder='mcp_spec_...'
+                style={{ flex: 1, minWidth: 260, padding: 8 }}
+              />
+              <button onClick={loadProposalById} disabled={busy} style={{ padding: '8px 12px' }}>Load proposal</button>
+            </div>
+            {proposalId ? <div style={{ fontSize: 12, opacity: 0.85 }}>Active proposal_id: <code>{proposalId}</code></div> : null}
+          </div>
+          {builderMode === 'simple' ? (
+            <div style={{ display: 'grid', gap: 8, border: '1px solid var(--border-soft)', borderRadius: 8, padding: 10 }}>
+              <label>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Name (optional)</div>
+                <input value={simpleName} onChange={(e) => setSimpleName(e.target.value)} style={{ width: '100%', padding: 8 }} placeholder='PB Files Workspace MCP' />
+              </label>
+              <label>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Describe what this MCP should do</div>
+                <textarea value={simpleDescription} onChange={(e) => setSimpleDescription(e.target.value)} rows={4} style={{ width: '100%' }} />
+              </label>
+              <label>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Safety constraints / exclusions</div>
+                <textarea value={simpleConstraints} onChange={(e) => setSimpleConstraints(e.target.value)} rows={3} style={{ width: '100%' }} placeholder='Optional plain-English constraints such as “No delete” or “Only inside PB workspace”.' />
+              </label>
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gap: 8, border: '1px solid color-mix(in srgb, var(--warn) 35%, var(--border-soft))', borderRadius: 8, padding: 10 }}>
+              <div style={{ fontSize: 12, color: 'var(--warn)' }}>Advanced: only if you know what you’re doing</div>
+              <label>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Name (optional)</div>
+                <input value={simpleName} onChange={(e) => setSimpleName(e.target.value)} style={{ width: '100%', padding: 8 }} placeholder='Custom MCP Server' />
+              </label>
+              <label>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Proposal prompt</div>
+                <textarea value={proposalPrompt} onChange={(e) => setProposalPrompt(e.target.value)} rows={3} style={{ width: '100%' }} />
+              </label>
+              <label>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Capabilities (comma separated)</div>
+                <input value={proposalCaps} onChange={(e) => setProposalCaps(e.target.value)} style={{ width: '100%', padding: 8 }} />
+              </label>
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button onClick={createProposal} disabled={busy || proposalLoading || !canCreateProposal} style={{ padding: '8px 12px' }}>
+              {proposalLoading ? '1) Proposal…' : '1) Proposal'}
+            </button>
+            <button onClick={buildProposal} disabled={busy || !canBuild} style={{ padding: '8px 12px' }}>2) Build</button>
+            <button onClick={testBuild} disabled={busy || !canTest} style={{ padding: '8px 12px' }}>3) Test</button>
+            <button onClick={installBuild} disabled={busy || !canInstall} style={{ padding: '8px 12px' }}>4) Install</button>
+          </div>
+          {!canCreateProposal ? (
+            <div style={{ fontSize: 12, opacity: 0.75 }}>
+              {builderMode === 'simple' ? 'Enter a plain-English description to enable Proposal.' : 'Enter a prompt to enable Proposal.'}
+            </div>
+          ) : null}
+          {proposalId ? (
+            <div style={{ fontSize: 12, opacity: 0.85 }}>
+              Proposal ID: <code>{proposalId}</code>
+            </div>
+          ) : null}
+          {buildId ? (
+            <div style={{ fontSize: 12, opacity: 0.85 }}>
+              Build ID: <code>{buildId}</code>
+            </div>
+          ) : null}
+          {proposalResult ? (
+            <div style={{ display: 'grid', gap: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                <div style={{ fontSize: 12, opacity: 0.85 }}>Proposal result JSON</div>
+                <button onClick={() => copyJson(proposalResult)} style={{ padding: '4px 8px', fontSize: 12 }}>Copy</button>
+              </div>
+              <pre style={{ margin: 0, maxHeight: 220, overflow: 'auto' }}>{JSON.stringify(proposalResult, null, 2)}</pre>
+            </div>
+          ) : null}
+          {proposalSpec ? (
+            <div style={{ display: 'grid', gap: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                <div style={{ fontSize: 12, opacity: 0.85 }}>Spec JSON</div>
+                <button onClick={() => copyJson(proposalSpec)} style={{ padding: '4px 8px', fontSize: 12 }}>Copy</button>
+              </div>
+              <pre style={{ margin: 0, maxHeight: 220, overflow: 'auto' }}>{JSON.stringify(proposalSpec, null, 2)}</pre>
+            </div>
+          ) : null}
+          {proposalErrorJson ? (
+            <div style={{ display: 'grid', gap: 6 }}>
+              <div style={{ fontSize: 12, color: 'var(--bad)' }}>Proposal error JSON</div>
+              <pre style={{ margin: 0, maxHeight: 220, overflow: 'auto', border: '1px solid color-mix(in srgb, var(--bad) 35%, var(--border))', borderRadius: 8, padding: 8, background: 'color-mix(in srgb, var(--bad) 8%, var(--panel))' }}>
+                {JSON.stringify(proposalErrorJson, null, 2)}
+              </pre>
+            </div>
+          ) : null}
           {buildOut ? <pre style={{ margin: 0, maxHeight: 140, overflow: 'auto' }}>{JSON.stringify(buildOut, null, 2)}</pre> : null}
           {testOut ? <pre style={{ margin: 0, maxHeight: 180, overflow: 'auto' }}>{JSON.stringify(testOut, null, 2)}</pre> : null}
+          {installOut ? (
+            <div style={{ display: 'grid', gap: 8, border: '1px solid var(--border-soft)', borderRadius: 8, padding: 10 }}>
+              <div style={{ fontWeight: 600 }}>Installed server</div>
+              <div style={{ fontSize: 13 }}>Server display name: <code>{String(installOut?.display_name || installOut?.server?.displayName || installOut?.server?.name || '')}</code></div>
+              <div style={{ fontSize: 13 }}>Invocable server_id: <code>{String(installOut?.server_id || '')}</code></div>
+              <div style={{ fontSize: 13 }}>spec_id: <code>{String(installOut?.spec_id || installOut?.server?.specId || '')}</code></div>
+              <div style={{ fontSize: 13 }}>Auto-enabled in WebChat: <strong>{installOut?.enabled_in_webchat ? 'yes' : 'no'}</strong></div>
+              <div style={{ fontSize: 13 }}>Exposed tool names: {(Array.isArray(installOut?.tool_names) ? installOut.tool_names : []).join(', ') || '(none)'}</div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button onClick={copyWebchatTestPrompt} disabled={busy} style={{ padding: '8px 12px' }}>Copy WebChat test prompt</button>
+                <button onClick={runWebchatTest} disabled={busy || !installOut?.server_id} style={{ padding: '8px 12px' }}>Run WebChat test</button>
+              </div>
+              {webchatDiagnostics.length ? (
+                <div style={{ display: 'grid', gap: 6 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>WebChat visibility diagnostics</div>
+                  {webchatDiagnostics.map((diag) => (
+                    <div key={`${diag.capability}-${diag.tool_name || 'none'}`} style={{ fontSize: 12 }}>
+                      WebChat sees tool <code>{diag.tool_name || diag.capability}</code>: <strong>{diag.visible_in_webchat ? 'yes' : 'no'}</strong> ({diag.reason})
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {webchatRunOut ? (
+                <div style={{ display: 'grid', gap: 6 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>WebChat test result</div>
+                  <pre style={{ margin: 0, maxHeight: 220, overflow: 'auto' }}>{JSON.stringify(webchatRunOut, null, 2)}</pre>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </section>
 
@@ -697,9 +1023,11 @@ export default function McpServersPage() {
           <button onClick={() => setFilter("high")} style={{ padding: "6px 10px", borderRadius: 999, border: "1px solid var(--border)", background: filter === "high" ? "var(--panel-2)" : "var(--text-inverse)" }}>
             {t("mcp.filters.highRisk")}
           </button>
-          <button onClick={() => setFilter("needs_approval")} style={{ padding: "6px 10px", borderRadius: 999, border: "1px solid var(--border)", background: filter === "needs_approval" ? "var(--panel-2)" : "var(--text-inverse)" }}>
-            {t("mcp.filters.needsApproval")}
-          </button>
+          {approvalsEnabled ? (
+            <button onClick={() => setFilter("needs_approval")} style={{ padding: "6px 10px", borderRadius: 999, border: "1px solid var(--border)", background: filter === "needs_approval" ? "var(--panel-2)" : "var(--text-inverse)" }}>
+              {t("mcp.filters.needsApproval")}
+            </button>
+          ) : null}
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -775,7 +1103,7 @@ export default function McpServersPage() {
                   </td>
                   <td style={{ padding: 10, borderTop: "1px solid var(--panel-2)" }}>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      {Boolean(s.startRequiresApproval) && String(s.startApproval?.status || "") !== "approved" ? (
+                      {approvalsEnabled && Boolean(s.startRequiresApproval) && String(s.startApproval?.status || "") !== "approved" ? (
                         <button onClick={() => start(s.id)} disabled={busy} style={{ padding: "6px 10px" }}>
                           {t("mcp.requestApproval")}
                         </button>

@@ -14,6 +14,7 @@ import { getLocalDayKey } from '../util/dayKey.js';
 import { getHot, recordHot } from '../memory/hot.js';
 import { createMemoryDraft, listMemoryDrafts, listMemoryArchive, commitMemoryDrafts, discardMemoryDrafts, searchMemoryEntries, getMemoryCounts } from '../memory/service.js';
 import { scratchWrite, scratchRead, scratchList, scratchClear } from '../memory/scratch.js';
+import { approvalsEnabled } from '../util/approvals.js';
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -217,17 +218,19 @@ async function runSearch({ req, db, requestId }) {
 export function createMemoryRouter({ db }) {
   const r = express.Router();
 
-  try {
-    const migrated = migratePendingMemoryApprovalProposals(db);
-    console.log(`[memory] startup migration pending approvals -> drafts: converted=${Number(migrated.converted || 0)}`);
-    recordEvent(db, 'memory.draft_migration.startup', {
-      converted: Number(migrated.converted || 0),
-      proposal_ids: Array.isArray(migrated.proposal_ids) ? migrated.proposal_ids : [],
-    });
-  } catch (e) {
-    const msg = sanitizeErrorMessage(e);
-    console.error(`[memory] startup migration failed: ${msg}`);
-    recordEvent(db, 'memory.draft_migration.startup_failed', { error: msg });
+  if (approvalsEnabled()) {
+    try {
+      const migrated = migratePendingMemoryApprovalProposals(db);
+      console.log(`[memory] startup migration pending approvals -> drafts: converted=${Number(migrated.converted || 0)}`);
+      recordEvent(db, 'memory.draft_migration.startup', {
+        converted: Number(migrated.converted || 0),
+        proposal_ids: Array.isArray(migrated.proposal_ids) ? migrated.proposal_ids : [],
+      });
+    } catch (e) {
+      const msg = sanitizeErrorMessage(e);
+      console.error(`[memory] startup migration failed: ${msg}`);
+      recordEvent(db, 'memory.draft_migration.startup_failed', { error: msg });
+    }
   }
 
   // Request observability for all memory API calls.
@@ -412,6 +415,38 @@ export function createMemoryRouter({ db }) {
       const day = String(req.body?.day || getLocalDayKey());
       if (!DAY_RE.test(day)) return jsonError(res, 400, { code: 'MEMORY_DAY_INVALID', message: 'day must be YYYY-MM-DD', requestId: req.memoryRequestId });
       const sessionId = getRequestSessionId(req);
+      if (!approvalsEnabled()) {
+        const committed = createCommittedMemoryEntry(db, {
+          content: text,
+          day,
+          kind: String(req.body?.kind || 'note'),
+          title: req.body?.title || null,
+          tags: Array.isArray(req.body?.tags) ? req.body.tags : [],
+          sourceSessionId: sessionId,
+          workspaceId: getWorkspaceRoot(),
+          meta: { day, via: 'api', approvals_disabled: true },
+        });
+        const counts = getMemoryCounts(db);
+        recordEvent(db, 'memory.committed_immediately', { id: committed.id, day, session_id: sessionId, request_id: req.memoryRequestId || null });
+        return res.json({
+          ok: true,
+          verified: true,
+          committed: {
+            id: committed.id,
+            ts: committed.ts,
+            day: committed.day,
+            state: committed.state,
+            kind: committed.kind,
+            content: committed.content,
+            title: committed.title || null,
+            tags: committed.tags_json ? safeJsonParse(committed.tags_json, []) : [],
+          },
+          draftsCount: counts.drafts,
+          committedCount: counts.committed,
+          message: 'Saved and committed immediately.',
+          requestId: req.memoryRequestId || null,
+        });
+      }
       const draft = createMemoryDraft(db, {
         content: text,
         kind: String(req.body?.kind || 'note'),
@@ -756,6 +791,33 @@ export function createMemoryRouter({ db }) {
         })),
       };
       setPatch(db, patchId, payload);
+      if (!approvalsEnabled()) {
+        const out = await applyDurablePatch({ patch: payload, root: getWorkspaceRoot() });
+        clearPatch(db, patchId);
+        recordEvent(db, 'memory.apply_durable_patch', {
+          patch_id: patchId,
+          day: payload.day,
+          files: out.applied_files,
+          rotated_count: Number(out.rotated_count || 0),
+          request_id: req.memoryRequestId || null,
+          approvals_disabled: true,
+        });
+        return res.json({
+          ok: true,
+          day,
+          already_finalized: Boolean(patch.already_finalized),
+          patch_id: patchId,
+          findings: patch.findings,
+          redacted_preview: patch.redacted_text,
+          files: patch.files.map((f) => ({ relPath: f.relPath, diff: f.diff })),
+          rotated_count: Number(out.rotated_count || 0),
+          rotated_days: Array.isArray(out.rotated_days) ? out.rotated_days : [],
+          archive_writes: Array.isArray(out.archive_writes) ? out.archive_writes : [],
+          proposal: null,
+          applied: out,
+          requestId: req.memoryRequestId || null,
+        });
+      }
       const proposal = createDurablePatchProposal(db, {
         patchId,
         day,
@@ -820,4 +882,67 @@ export function createMemoryRouter({ db }) {
   });
 
   return r;
+}
+
+function createCommittedMemoryEntry(db, {
+  content,
+  day = getLocalDayKey(),
+  kind = 'note',
+  title = null,
+  tags = [],
+  sourceSessionId = null,
+  userId = null,
+  workspaceId = null,
+  agentId = null,
+  meta = null,
+}) {
+  const text = String(content || '').trim();
+  if (!text) {
+    const err = new Error('content required');
+    err.code = 'MEMORY_CONTENT_REQUIRED';
+    throw err;
+  }
+  const ts = nowIso();
+  const metaJson = meta == null ? null : JSON.stringify(meta);
+  const info = db.prepare(`
+    INSERT INTO memory_entries
+      (ts, day, kind, content, meta_json, state, committed_at, title, tags_json, source_session_id, user_id, workspace_id, agent_id)
+    VALUES (?, ?, ?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    ts,
+    String(day || getLocalDayKey()),
+    String(kind || 'note').slice(0, 64) || 'note',
+    text,
+    metaJson,
+    ts,
+    title ? String(title).slice(0, 200) : null,
+    JSON.stringify(Array.isArray(tags) ? tags.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 32) : []),
+    sourceSessionId ? String(sourceSessionId).slice(0, 120) : null,
+    userId ? String(userId).slice(0, 120) : null,
+    workspaceId ? String(workspaceId).slice(0, 120) : null,
+    agentId ? String(agentId).slice(0, 120) : null,
+  );
+  const row = db.prepare('SELECT * FROM memory_entries WHERE id = ?').get(Number(info.lastInsertRowid));
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO memory_archive
+        (memory_entry_id, ts, day, kind, content, title, tags_json, source_session_id, user_id, workspace_id, agent_id, meta_json, committed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      Number(row.id),
+      row.ts,
+      row.day,
+      row.kind,
+      row.content,
+      row.title || null,
+      row.tags_json || '[]',
+      row.source_session_id || null,
+      row.user_id || null,
+      row.workspace_id || null,
+      row.agent_id || null,
+      row.meta_json || null,
+      row.committed_at || row.ts,
+    );
+  } catch {}
+  return row;
 }

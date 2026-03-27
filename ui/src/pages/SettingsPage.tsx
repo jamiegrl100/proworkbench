@@ -1,11 +1,21 @@
 import React, { useEffect, useState } from 'react';
 
 import Card from '../components/Card';
-import { getJson, postJson } from '../components/api';
+import { deleteJson, getJson, patchJson, postJson } from '../components/api';
 import { useI18n } from '../i18n/LanguageProvider';
-import { clearToken } from '../auth';
 
 declare function toast(msg: string): void;
+
+type AlexProjectRoot = {
+  id: number;
+  label: string;
+  path: string;
+  enabled: boolean;
+  is_favorite: boolean;
+  created_at: number;
+  updated_at: number;
+  last_used_at: number | null;
+};
 
 export default function SettingsPage() {
   const { t } = useI18n();
@@ -32,14 +42,20 @@ export default function SettingsPage() {
   const [agentPreamble, setAgentPreamble] = useState('');
   const [defaultPreamble, setDefaultPreamble] = useState('');
   const [onlineDirectoryEnabled, setOnlineDirectoryEnabled] = useState(false);
+  const [alexRoots, setAlexRoots] = useState<AlexProjectRoot[]>([]);
+  const [alexRootLabel, setAlexRootLabel] = useState('');
+  const [alexRootPath, setAlexRootPath] = useState('');
+  const [alexRootsBusy, setAlexRootsBusy] = useState('');
+  const [alexSelfTestOut, setAlexSelfTestOut] = useState<any>(null);
 
   async function load() {
     setErr('');
-    const [s, panic, preamble, ext] = await Promise.all([
+    const [s, panic, preamble, ext, alexRootsOut] = await Promise.all([
       getJson<any>('/admin/security/summary'),
       getJson<any>('/admin/settings/panic-wipe'),
       getJson<any>('/admin/settings/agent-preamble'),
       getJson<any>('/admin/extensions/settings'),
+      getJson<any>('/api/admin/alex/project-roots').catch(() => ({ items: [] })),
     ]);
     setSummary(s);
     setUnknownViolations(Number(s?.unknownAutoBlock?.violations || 3));
@@ -51,6 +67,7 @@ export default function SettingsPage() {
     setAgentPreamble(String(preamble?.preamble || ''));
     setDefaultPreamble(String(preamble?.default_preamble || ''));
     setOnlineDirectoryEnabled(Boolean(ext?.onlineDirectoryEnabled));
+    setAlexRoots(Array.isArray(alexRootsOut?.items) ? alexRootsOut.items : []);
   }
 
   useEffect(() => {
@@ -160,11 +177,11 @@ export default function SettingsPage() {
     setResetBusy('working');
     setErr('');
     try {
-      await postJson('/admin/settings/factory-reset', { confirm: resetConfirm });
-      clearToken();
+      const out = await postJson<any>('/admin/settings/factory-reset', { confirm: resetConfirm });
       setResetConfirm('');
-      // Server is about to exit; reload once it comes back.
-      setTimeout(() => window.location.reload(), 1800);
+      toast(String(out?.message || 'Factory reset complete.'));
+      await load();
+      setResetBusy('');
     } catch (e: any) {
       setErr(String(e?.message || e));
       setResetBusy('');
@@ -197,6 +214,69 @@ export default function SettingsPage() {
       setErr(String(e?.message || e));
     } finally {
       setBusy('');
+    }
+  }
+
+  async function addAlexRoot() {
+    setAlexRootsBusy('add');
+    setErr('');
+    try {
+      await postJson('/api/admin/alex/project-roots', {
+        label: alexRootLabel.trim(),
+        path: alexRootPath.trim(),
+      });
+      setAlexRootLabel('');
+      setAlexRootPath('');
+      toast('Alex project root saved.');
+      await load();
+    } catch (e: any) {
+      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+    } finally {
+      setAlexRootsBusy('');
+    }
+  }
+
+  async function patchAlexRoot(id: number, patch: Partial<AlexProjectRoot>) {
+    setAlexRootsBusy(`patch-${id}`);
+    setErr('');
+    try {
+      await patchJson(`/api/admin/alex/project-roots/${id}`, patch);
+      await load();
+    } catch (e: any) {
+      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+    } finally {
+      setAlexRootsBusy('');
+    }
+  }
+
+  async function removeAlexRoot(id: number) {
+    const ok = window.confirm('Remove this Alex project root?');
+    if (!ok) return;
+    setAlexRootsBusy(`delete-${id}`);
+    setErr('');
+    try {
+      await deleteJson(`/api/admin/alex/project-roots/${id}`);
+      await load();
+    } catch (e: any) {
+      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+    } finally {
+      setAlexRootsBusy('');
+    }
+  }
+
+  async function runAlexSelfTest() {
+    setAlexRootsBusy('self-test');
+    setErr('');
+    try {
+      const out = await postJson<any>('/api/admin/test_alex_tools', { session_id: 'alex-settings-selftest' });
+      setAlexSelfTestOut(out);
+      toast(out?.ok ? 'Alex self-test passed.' : 'Alex self-test reported failures.');
+    } catch (e: any) {
+      const detail = e?.detail || { ok: false, error: String(e?.message || e) };
+      setAlexSelfTestOut(detail);
+      setErr(String(detail?.message || detail?.error || e?.message || e));
+    } finally {
+      setAlexRootsBusy('');
     }
   }
 
@@ -255,6 +335,63 @@ export default function SettingsPage() {
               r: summary?.rateLimit?.per_minute ?? 20,
             })}
           </div>
+        </div>
+      </Card>
+
+      <Card title="Agents / Alex">
+        <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 10 }}>
+          Saved project roots for Alex Project Mode. Allowed roots must be specific folders under <code>/home/jamiegrl100/Apps/</code> or <code>/var/www/</code>.
+        </div>
+        <div style={{ display: 'grid', gap: 10 }}>
+          <div style={{ display: 'grid', gap: 8, gridTemplateColumns: 'minmax(180px, 220px) minmax(320px, 1fr) auto' }}>
+            <input value={alexRootLabel} onChange={(e) => setAlexRootLabel(e.target.value)} placeholder="Project label" style={{ padding: 8 }} />
+            <input value={alexRootPath} onChange={(e) => setAlexRootPath(e.target.value)} placeholder="/home/jamiegrl100/Apps/proworkbench" style={{ padding: 8 }} />
+            <button onClick={addAlexRoot} disabled={alexRootsBusy !== '' || !alexRootPath.trim()} style={{ padding: '8px 12px' }}>
+              Add root
+            </button>
+          </div>
+          <div style={{ display: 'grid', gap: 8 }}>
+            {alexRoots.length === 0 ? (
+              <div style={{ fontSize: 13, opacity: 0.75 }}>No saved Alex project roots yet.</div>
+            ) : alexRoots.map((root) => (
+              <div key={root.id} style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 6 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <div>
+                    <strong>{root.label}</strong>
+                    {root.is_favorite ? <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.8 }}>favorite</span> : null}
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                      <input type="checkbox" checked={root.enabled} onChange={(e) => patchAlexRoot(root.id, { enabled: e.target.checked })} disabled={alexRootsBusy !== ''} />
+                      enabled
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                      <input type="checkbox" checked={root.is_favorite} onChange={(e) => patchAlexRoot(root.id, { is_favorite: e.target.checked })} disabled={alexRootsBusy !== ''} />
+                      favorite
+                    </label>
+                    <button onClick={() => removeAlexRoot(root.id)} disabled={alexRootsBusy !== ''} style={{ padding: '6px 10px' }}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                <div style={{ fontSize: 13 }}><code>{root.path}</code></div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>
+                  Updated {new Date(root.updated_at).toLocaleString()}
+                  {root.last_used_at ? ` · last used ${new Date(root.last_used_at).toLocaleString()}` : ''}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button onClick={runAlexSelfTest} disabled={alexRootsBusy !== ''} style={{ padding: '8px 12px' }}>
+              {alexRootsBusy === 'self-test' ? 'Running Alex self-test…' : 'Run Alex Tools Self-Test'}
+            </button>
+          </div>
+          {alexSelfTestOut ? (
+            <pre style={{ margin: 0, padding: 10, borderRadius: 8, border: '1px solid var(--border-soft)', background: 'var(--panel-2)', whiteSpace: 'pre-wrap' }}>
+              {JSON.stringify(alexSelfTestOut, null, 2)}
+            </pre>
+          ) : null}
         </div>
       </Card>
 
@@ -370,8 +507,8 @@ export default function SettingsPage() {
       <Card title="Factory Reset">
         <div style={{ display: 'grid', gap: 10 }}>
           <div style={{ fontSize: 13, opacity: 0.85 }}>
-            Deletes all local app data: database, stored settings, memory, and workspace state (<code>.pb/</code>).
-            The server restarts automatically. You will be asked to set a new password.
+            Clears conversations, memory, session state, uploads, and temporary workspace data.
+            Resets admin auth to first-run password setup, while keeping core tools, MCP servers/templates, provider settings, and memory functionality intact.
           </div>
           <label>
             <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 4 }}>Type <b>RESET</b> to confirm</div>

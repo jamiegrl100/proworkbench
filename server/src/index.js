@@ -7,7 +7,7 @@ import rateLimit from 'express-rate-limit';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-import { getDataDir } from './util/dataDir.js';
+import { getDataDir, getDbPath, getPbRoot } from './util/dataDir.js';
 import { ensureWorkspaceBootstrap, ensureDataHomeBootstrap } from './util/workspaceBootstrap.js';
 import { getWorkspaceRoot } from './util/workspace.js';
 import { openDb, migrate } from './db/db.js';
@@ -26,7 +26,7 @@ import { createSlackWorkerController } from './slack/worker.js';
 import { meta } from './util/meta.js';
 import { createRuntimeTextWebuiRouter } from './http/runtimeTextWebui.js';
 import { seedMcpTemplates } from './mcp/seedTemplates.js';
-import { createMcpRouter } from './http/mcp.js';
+import { createMcpRouter, reconcileInstalledServers } from './http/mcp.js';
 import { createDoctorRouter } from './http/doctor.js';
 import { createCanvasRouter } from './http/canvas.js';
 import { createMemoryRouter } from './http/memory.js';
@@ -37,11 +37,77 @@ import { createExtensionsRouter } from './http/extensions.js';
 import { createDirectoryAssistantRouter } from './http/directoryAssistant.js';
 import { createBrowserAllowlistRouter } from './http/browserAllowlist.js';
 import { createPluginsWebRouter } from './http/pluginsWeb.js';
+import { createPluginsApiRouter } from './http/pluginsApi.js';
 import { createPluginsDebugRouter } from './http/pluginsDebug.js';
 import { validateCanonPack } from './writingLab/service.js';
 import { getMemoryRetentionDays, pruneMemoryOlderThanDays } from './memory/service.js';
+import { runToolsSelfTest } from './util/toolsSelfTest.js';
+import { buildToolsHealthState, defaultHealthyToolsState } from './util/toolsHealth.js';
+import { getActiveProvider, PROVIDER_TYPES } from './llm/providerConfig.js';
+import { approvalsEnabled } from './util/approvals.js';
 
 const app = express();
+let serverInstanceLockFd = null;
+let serverInstanceLockPath = null;
+
+function isPidAlive(pid) {
+  const num = Number(pid);
+  if (!Number.isInteger(num) || num <= 0) return false;
+  try {
+    process.kill(num, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseServerInstanceLock() {
+  try {
+    if (serverInstanceLockFd != null) fs.closeSync(serverInstanceLockFd);
+  } catch {}
+  serverInstanceLockFd = null;
+  try {
+    if (serverInstanceLockPath) fs.unlinkSync(serverInstanceLockPath);
+  } catch {}
+  serverInstanceLockPath = null;
+}
+
+function acquireServerInstanceLock({ bind, port }) {
+  const pbRoot = getPbRoot();
+  fs.mkdirSync(pbRoot, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(pbRoot, `.server-${String(bind).replace(/[^a-zA-Z0-9._-]/g, '_')}-${port}.lock`);
+  const payload = JSON.stringify({
+    pid: process.pid,
+    bind,
+    port,
+    started_at: new Date().toISOString(),
+    cwd: process.cwd(),
+  });
+
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx', 0o600);
+      fs.writeFileSync(fd, payload);
+      serverInstanceLockFd = fd;
+      serverInstanceLockPath = lockPath;
+      return true;
+    } catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      let existing = null;
+      try {
+        existing = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      } catch {}
+      const existingPid = Number(existing?.pid || 0);
+      if (isPidAlive(existingPid)) {
+        console.log(`[server] Existing instance already owns ${bind}:${port} (pid ${existingPid}). Exiting duplicate watcher.`);
+        return false;
+      }
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {}
+    }
+  }
+}
 
 function resolveUiDistDir() {
   // Priority:
@@ -104,7 +170,7 @@ app.use(rateLimit({
 }));
 
 const dataDir = getDataDir('proworkbench');
-const dbPath = path.join(dataDir, 'proworkbench.db');
+const dbPath = getDbPath('proworkbench');
 
 // Load secrets from data dir .env first, then cwd .env (cwd can override for dev)
 dotenv.config({ path: `${dataDir}/.env` });
@@ -115,6 +181,7 @@ migrate(db);
 console.log(`Admin token DB: ${dbPath}`);
 console.log(`Admin tokens count: ${countAdminTokens(db)}`);
 console.log(`SECURITY_DISABLED=${BARE_BONES_MODE ? 'true' : 'false'}`);
+console.log(`APPROVALS_ENABLED=${approvalsEnabled() ? 'true' : 'false'}`);
 try {
   const seeded = seedMcpTemplates(db);
   console.log(`MCP templates seeded: ${seeded.seeded || 0}`);
@@ -123,6 +190,14 @@ try {
     const ids = rows.map((r) => String(r.id)).join(', ');
     console.log(`MCP template ids: ${ids || '(none)'}`);
   } catch {}
+  try {
+    const restored = await reconcileInstalledServers(db);
+    if (restored.restored > 0) {
+      console.log(`MCP installed servers restored: ${restored.restored}/${restored.found}`);
+    }
+  } catch (restoreError) {
+    console.log(`MCP installed server restore error: ${String(restoreError?.message || restoreError)}`);
+  }
 } catch (e) {
   console.log(`MCP templates seed error: ${String(e?.message || e)}`);
 }
@@ -147,13 +222,119 @@ try {
   console.log(`Writing Lab canon check error: ${String(e?.message || e)}`);
 }
 
+let toolsHealthState = defaultHealthyToolsState();
+
+async function rerunToolsHealthState(trigger = 'startup') {
+  try {
+    const raw = await runToolsSelfTest();
+    toolsHealthState = buildToolsHealthState(raw);
+  } catch (e) {
+    toolsHealthState = buildToolsHealthState({
+      ok: false,
+      healthy: false,
+      checked_at: new Date().toISOString(),
+      checks: [{ id: 'startup_exception', ok: false, error: String(e?.message || e), path: null }],
+    }, {
+      last_error: String(e?.message || e),
+    });
+    console.log(`Tools self-test error: ${String(e?.message || e)}`);
+  }
+  console.log(`Tools self-test: ${toolsHealthState.healthy ? 'OK' : 'FAILED'}`);
+  for (const c of (toolsHealthState.checks || [])) {
+    console.log(`  - ${c.id}: ${c.ok ? 'ok' : `fail (${c.error || 'unknown'})`}`);
+  }
+  try {
+    recordEvent(db, 'tools.self_test.completed', {
+      trigger,
+      healthy: Boolean(toolsHealthState.healthy),
+      failing_check_id: toolsHealthState.failing_check_id || null,
+      failing_path: toolsHealthState.failing_path || null,
+      last_error: toolsHealthState.last_error || null,
+      checked_at: toolsHealthState.checked_at || null,
+    });
+  } catch {}
+  return toolsHealthState;
+}
+
+await rerunToolsHealthState('startup');
+
 const telegram = createTelegramWorkerController({ db, dataDir });
 const slack = createSlackWorkerController({ db });
 
 // Auto-start Telegram worker if secrets are configured.
 telegram.startIfReady();
 
-app.get('/admin/meta', (_req, res) => res.json(meta()));
+app.get('/admin/meta', (_req, res) => {
+  const provider = getActiveProvider(db);
+  const providerType = String(provider?.providerType || provider?.kind || PROVIDER_TYPES.OPENAI_COMPATIBLE);
+  const selectedModel = String(db.prepare('SELECT value_json FROM app_kv WHERE key = ?').get('llm.selectedModel')?.value_json || 'null');
+  let selectedModelId = null;
+  try { selectedModelId = JSON.parse(selectedModel); } catch { selectedModelId = null; }
+  const supportsToolCalls = providerType === PROVIDER_TYPES.OPENAI || providerType === PROVIDER_TYPES.OPENAI_COMPATIBLE;
+  res.json({
+    ...meta(),
+    pb_root: getPbRoot(),
+    data_dir: dataDir,
+    db_path: dbPath,
+    db_file: (() => {
+      try {
+        const st = fs.statSync(dbPath);
+        return { size_bytes: Number(st.size || 0), mtime: st.mtime.toISOString() };
+      } catch {
+        return { size_bytes: 0, mtime: null };
+      }
+    })(),
+    approvals_enabled: approvalsEnabled(),
+    tools_disabled: Boolean(toolsHealthState?.tools_disabled),
+    tools_disabled_reason: toolsHealthState?.reason || null,
+    failing_check_id: toolsHealthState?.failing_check_id || null,
+    failing_path: toolsHealthState?.failing_path || null,
+    last_error: toolsHealthState?.last_error || null,
+    last_stdout: toolsHealthState?.last_stdout || null,
+    last_stderr: toolsHealthState?.last_stderr || null,
+    tools_health: toolsHealthState,
+    supports_tool_calls: supportsToolCalls,
+    fallback_enabled: true,
+    tools_self_test_ok: Boolean(toolsHealthState?.healthy),
+    provider: {
+      id: String(provider?.id || ''),
+      type: providerType,
+      model: selectedModelId || null,
+    },
+  });
+});
+
+app.get('/admin/paths', (_req, res) => {
+  let dbFile = { size_bytes: 0, mtime: null };
+  try {
+    const st = fs.statSync(dbPath);
+    dbFile = { size_bytes: Number(st.size || 0), mtime: st.mtime.toISOString() };
+  } catch {}
+  res.json({
+    ok: true,
+    pb_root: getPbRoot(),
+    data_dir: dataDir,
+    db_path: dbPath,
+    db_file: dbFile,
+    workspace_root: getWorkspaceRoot(),
+  });
+});
+
+app.get('/api/meta/tools', requireAuth(db), (_req, res) => {
+  res.json({
+    ok: true,
+    approvals_enabled: approvalsEnabled(),
+    tools_disabled: Boolean(toolsHealthState?.tools_disabled),
+    reason: toolsHealthState?.reason || null,
+    failing_check_id: toolsHealthState?.failing_check_id || null,
+    failing_path: toolsHealthState?.failing_path || null,
+    last_error: toolsHealthState?.last_error || null,
+    last_stdout: toolsHealthState?.last_stdout || null,
+    last_stderr: toolsHealthState?.last_stderr || null,
+    checked_at: toolsHealthState?.checked_at || null,
+    checks: Array.isArray(toolsHealthState?.checks) ? toolsHealthState.checks : [],
+  });
+});
 
 
 app.get('/admin/health/auth', (req, res) => {
@@ -199,13 +380,21 @@ app.use('/admin/writing-lab', createWritingLabRouter({ db }));
 app.use('/admin/writing', createWritingProjectsRouter({ db }));
 app.use('/api/plugins', createPluginsRouter({ db }));
 app.use('/api/browser', createBrowserAllowlistRouter({ db }));
+app.use('/plugins', createPluginsApiRouter());
 app.use('/plugins', createPluginsWebRouter());
 app.use('/admin/plugins', createPluginsDebugRouter({ db }));
 app.use('/admin/extensions', createExtensionsRouter({ db }));
 app.use('/admin/plugins/directory-assistant', createDirectoryAssistantRouter({ db }));
 app.use('/api/memory', createMemoryRouter({ db }));
 app.use('/api/admin/memory', createMemoryRouter({ db }));
-const adminRouter = createAdminRouter({ db, telegram, slack, dataDir });
+const adminRouter = createAdminRouter({
+  db,
+  telegram,
+  slack,
+  dataDir,
+  getToolsHealth: () => toolsHealthState,
+  rerunToolsHealth: () => rerunToolsHealthState('manual'),
+});
 app.use('/admin', adminRouter);
 
 // API aliases for Vite/dev clients.
@@ -213,12 +402,52 @@ app.get('/api/tools', requireAuth(db), (req, res) => {
   req.url = '/tools/openai';
   return adminRouter.handle(req, res);
 });
+app.get('/api/tools/registry', requireAuth(db), (req, res) => {
+  req.url = '/tools/registry';
+  return adminRouter.handle(req, res);
+});
+app.get('/api/chat/:sessionId/events', (req, res) => {
+  req.url = `/chat/${req.params.sessionId}/events`;
+  return adminRouter.handle(req, res);
+});
+app.get('/api/admin/alex/project-roots', requireAuth(db), (req, res) => {
+  req.url = '/alex/project-roots';
+  return adminRouter.handle(req, res);
+});
+app.post('/api/admin/alex/project-roots', requireAuth(db), (req, res) => {
+  req.url = '/alex/project-roots';
+  return adminRouter.handle(req, res);
+});
+app.patch('/api/admin/alex/project-roots/:id', requireAuth(db), (req, res) => {
+  req.url = `/alex/project-roots/${req.params.id}`;
+  return adminRouter.handle(req, res);
+});
+app.delete('/api/admin/alex/project-roots/:id', requireAuth(db), (req, res) => {
+  req.url = `/alex/project-roots/${req.params.id}`;
+  return adminRouter.handle(req, res);
+});
+app.get('/api/agents/alex/access', requireAuth(db), (req, res) => {
+  req.url = '/agents/alex/access';
+  return adminRouter.handle(req, res);
+});
+app.post('/api/agents/alex/access', requireAuth(db), (req, res) => {
+  req.url = '/agents/alex/access';
+  return adminRouter.handle(req, res);
+});
 app.post('/api/tools/run', requireAuth(db), (req, res) => {
   req.url = '/tools/run-now';
   return adminRouter.handle(req, res);
 });
+app.post('/api/admin/tools/self_test', requireAuth(db), (req, res) => {
+  req.url = '/tools/self_test';
+  return adminRouter.handle(req, res);
+});
 app.post('/api/tools/diagnostics', requireAuth(db), (req, res) => {
   req.url = '/tools/diagnostics';
+  return adminRouter.handle(req, res);
+});
+app.post('/api/admin/test_alex_tools', requireAuth(db), (req, res) => {
+  req.url = '/test-alex-tools';
   return adminRouter.handle(req, res);
 });
 app.get('/api/mcp', requireAuth(db), (_req, res) => {
@@ -237,6 +466,18 @@ if (!uiServed) {
 
 const bind = process.env.PROWORKBENCH_BIND || '127.0.0.1';
 const port = Number(process.env.PROWORKBENCH_PORT || 8787);
+
+if (!acquireServerInstanceLock({ bind, port })) {
+  process.exit(0);
+}
+
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGQUIT']) {
+  process.on(sig, () => {
+    releaseServerInstanceLock();
+    process.exit(0);
+  });
+}
+process.on('exit', () => releaseServerInstanceLock());
 
 app.listen(port, bind, () => {
   console.log(`Proworkbench listening on http://${bind}:${port}`);

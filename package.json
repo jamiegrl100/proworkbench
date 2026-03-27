@@ -1,7 +1,7 @@
 {
   "name": "proworkbench",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "workspaces": [
     "server",
     "ui"
@@ -10,9 +10,14 @@
     "dev": "concurrently -k -n server,ui \"npm -w server run dev\" \"wait-on http://127.0.0.1:8787/admin/meta && npm -w ui run dev\"",
     "dev:server": "npm -w server run dev",
     "dev:ui": "npm -w ui run dev",
+    "test": "npm -w server run test:tools",
     "build": "npm -w ui run build && npm -w server run build",
     "i18n:sync": "npm -w ui run i18n:sync",
     "i18n:audit": "npm -w ui run i18n:audit",
+    "release:build:linux": "node scripts/release-build.mjs linux",
+    "release:build:windows": "node scripts/release-build.mjs windows",
+    "release:build:macos": "node scripts/release-build.mjs macos",
+    "release:preflight": "bash scripts/preflight-release.sh",
     "start": "PROWORKBENCH_ADMIN_TOKEN=admin-secret npm -w server run start",
     "plugins:smoke": "bash scripts/plugin-smoke.sh"
   },

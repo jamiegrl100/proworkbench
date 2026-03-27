@@ -6,6 +6,7 @@ import express from 'express';
 import { requireAuth } from './middleware.js';
 import { getWorkspaceRoot } from '../util/workspace.js';
 import { recordEvent } from '../util/events.js';
+import { approvalsDisabledError, approvalsEnabled } from '../util/approvals.js';
 import {
   addBrowserAllowlistDomain,
   approveDomainOnce,
@@ -1203,6 +1204,10 @@ export function createDirectoryAssistantRouter({ db }) {
           VALUES (?, ?, ?, ?, 'manual', 'submitted', NULL, '[]', '{}', NULL, NULL)
         `).run(newId('att'), targetId, target.domain, ts);
         return res.json({ ok: true, projectId, submitted: true, approvalRequired: false, message: 'Submitted (no approval required by policy).' });
+      }
+
+      if (!approvalsEnabled()) {
+        return res.status(400).json(approvalsDisabledError());
       }
 
       const proposalId = newId('dir_submit');

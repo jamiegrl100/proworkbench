@@ -2,6 +2,14 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { getJson, postJson } from "../components/api";
 import { useI18n } from "../i18n/LanguageProvider";
 import { CommandCenterIndicator, useRuntimeStatePoll } from "../components/CommandCenter";
+import LiveActivityPanel, { type LiveActivityEvent } from "../components/LiveActivityPanel";
+import { getToken } from "../auth";
+import {
+  defaultWebchatToolsMode,
+  parseWebchatToolsCommand,
+  readStoredWebchatToolsMode,
+  writeStoredWebchatToolsMode,
+} from "./webchatToolsState.js";
 
 type Proposal = {
   id: string;
@@ -128,9 +136,134 @@ type ApiDiagEntry = {
   at: string;
 };
 
+type AlexProjectRoot = {
+  id: number;
+  label: string;
+  path: string;
+  enabled: boolean;
+  is_favorite: boolean;
+  last_used_at: number | null;
+};
+
+type AlexAccessState = {
+  level: number;
+  level_label: string;
+  exec_mode?: 'argv' | 'shell';
+  allow_shell_operators?: boolean;
+  project_root_id: number | null;
+  expires_at_ms: number | null;
+  expires_in_ms: number | null;
+  ttl_minutes: number;
+  allowed_roots: string[];
+  exec_whitelist: string[];
+};
+
+type AlexAccessResponse = {
+  ok: boolean;
+  access: AlexAccessState;
+  project_roots: AlexProjectRoot[];
+};
+
+type ToolsHealthCheck = {
+  id: string;
+  ok: boolean;
+  path?: string | null;
+  error?: string | null;
+  stdout_preview?: string | null;
+  stderr_preview?: string | null;
+};
+
+type ToolsHealthSummary = {
+  ok?: boolean;
+  approvals_enabled?: boolean;
+  tools_disabled?: boolean;
+  reason?: string | null;
+  failing_check_id?: string | null;
+  failing_path?: string | null;
+  last_error?: string | null;
+  last_stdout?: string | null;
+  last_stderr?: string | null;
+  checked_at?: string | null;
+  checks?: ToolsHealthCheck[];
+};
+
+type SessionCommand =
+  | { kind: "mission_on"; message: "" }
+  | { kind: "mission_off"; message: "" }
+  | { kind: "tools_on"; message: "" }
+  | { kind: "tools_off"; message: "" }
+  | { kind: "run_session_on"; message: "" }
+  | { kind: "run"; message: string }
+  | { kind: "none"; message: string };
+
+type WebchatToolsMode = "off" | "session";
+
 
 function nowTs() {
   return new Date().toISOString();
+}
+
+function liveEventKey(event: Partial<LiveActivityEvent>) {
+  return String(event.id || `${event.ts || 0}:${event.type || ""}:${event.tool || ""}:${event.message || ""}`);
+}
+
+function buildLiveEventsUrl(sessionId: string) {
+  const url = new URL(`/api/chat/${encodeURIComponent(sessionId)}/events`, window.location.origin);
+  const token = getToken();
+  if (token) url.searchParams.set("admin_token", token);
+  return url.toString();
+}
+
+async function probeLiveEventsError(sessionId: string) {
+  const url = new URL(buildLiveEventsUrl(sessionId));
+  url.searchParams.set("probe", "1");
+  try {
+    const res = await fetch(url.toString(), {
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (res.ok) return "";
+    const txt = await res.text();
+    const json = txt ? (() => { try { return JSON.parse(txt); } catch { return null; } })() : null;
+    return String(json?.message || json?.error || txt || `HTTP ${res.status}`);
+  } catch (e: any) {
+    return String(e?.message || e || "Live activity stream disconnected.");
+  }
+}
+
+function parseSessionCommand(input: string): SessionCommand {
+  const raw = String(input || "").trim();
+  if (/^\/mission(?:\s+on)?$/i.test(raw)) return { kind: "mission_on", message: "" };
+  if (/^\/mission\s+off$/i.test(raw)) return { kind: "mission_off", message: "" };
+  const toolsCommand = parseWebchatToolsCommand(raw);
+  if (toolsCommand) return toolsCommand as SessionCommand;
+  return { kind: "none", message: raw };
+}
+
+function normalizeWebchatToolsMode(value: any): WebchatToolsMode {
+  return String(value || "").trim().toLowerCase() === "session" ? "session" : "off";
+}
+
+function summarizeToolsHealth(source: any): ToolsHealthSummary {
+  if (!source || typeof source !== "object") return {};
+  const toolsHealth = source.tools_health && typeof source.tools_health === "object" ? source.tools_health : {};
+  const checks = Array.isArray(source.checks)
+    ? source.checks
+    : (Array.isArray(toolsHealth.checks) ? toolsHealth.checks : []);
+  return {
+    ok: source.ok ?? toolsHealth.ok,
+    approvals_enabled: source.approvals_enabled,
+    tools_disabled: Boolean(source.tools_disabled ?? toolsHealth.tools_disabled ?? (toolsHealth.healthy === false)),
+    reason: source.reason ?? source.tools_disabled_reason ?? toolsHealth.reason ?? null,
+    failing_check_id: source.failing_check_id ?? toolsHealth.failing_check_id ?? null,
+    failing_path: source.failing_path ?? toolsHealth.failing_path ?? null,
+    last_error: source.last_error ?? toolsHealth.last_error ?? null,
+    last_stdout: source.last_stdout ?? toolsHealth.last_stdout ?? null,
+    last_stderr: source.last_stderr ?? toolsHealth.last_stderr ?? null,
+    checked_at: source.checked_at ?? toolsHealth.checked_at ?? null,
+    checks,
+  };
 }
 
 const MCP_SELECTED_KEY = 'pb_webchat_mcp_server_id';
@@ -283,16 +416,19 @@ function parseHelpersFile(text: string) {
   return { titles, instr };
 }
 
-export default function WebChatPage() {
+export default function WebChatPage({ approvalsEnabled = false }: { approvalsEnabled?: boolean }) {
   const { t } = useI18n();
-  const { state: runtimeState } = useRuntimeStatePoll(true);
+  const { state: runtimeState, refresh: refreshRuntimeState } = useRuntimeStatePoll(true);
   const sessionIdRef = useRef<string>(getStableWebchatSessionId());
+  const sessionMetaLoadedRef = useRef(false);
   const [messages, setMessages] = useState<Msg[]>([]);
   const messagesRef = useRef<Msg[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [activeSendMessageId, setActiveSendMessageId] = useState<string | null>(null);
+  const [livePanelMessageId, setLivePanelMessageId] = useState<string | null>(null);
   const activeSendAbortRef = useRef<AbortController | null>(null);
+  const activeSendMessageIdRef = useRef<string | null>(null);
   const [powerUser, setPowerUser] = useState<boolean>(() => localStorage.getItem("pb_power_user") === "1");
   const [helpersCount, setHelpersCount] = useState<number>(0);
   const [helpersConfigOpen, setHelpersConfigOpen] = useState(false);
@@ -319,6 +455,8 @@ export default function WebChatPage() {
   const [provider, setProvider] = useState("Text WebUI");
   const [model, setModel] = useState("—");
   const [memoryState, setMemoryState] = useState<{ enabled: boolean; lastUpdatedAt: string | null; profileChars: number; summaryChars: number }>(() => ({ enabled: true, lastUpdatedAt: null, profileChars: 0, summaryChars: 0 }));
+  const [missionPath, setMissionPath] = useState("");
+  const [missionPreview, setMissionPreview] = useState("");
   const [mcpServers, setMcpServers] = useState<{ id: string; name: string; status: string; templateId: string; approvedForUse: boolean; enabledInWebChat?: boolean; hasBrowser?: boolean; lastTestStatus?: string; lastTestAt?: string | null; needsTest?: boolean }[]>([]);
   const [mcpTemplates, setMcpTemplates] = useState<McpTemplateOption[]>([]);
   const [mcpServerId, setMcpServerId] = useState<string>(() => String(localStorage.getItem(MCP_SELECTED_KEY) || '').trim());
@@ -333,10 +471,41 @@ export default function WebChatPage() {
   const composerInputRef = useRef<HTMLInputElement | null>(null);
   const [sendDebug, setSendDebug] = useState<string>("idle");
   const [sendSeq, setSendSeq] = useState<number>(0);
+  const [alexAccess, setAlexAccess] = useState<AlexAccessState | null>(null);
+  const [alexProjectRoots, setAlexProjectRoots] = useState<AlexProjectRoot[]>([]);
+  const [alexAccessBusy, setAlexAccessBusy] = useState(false);
+  const [alexAccessLevelDraft, setAlexAccessLevelDraft] = useState<number>(1);
+  const [alexProjectRootDraft, setAlexProjectRootDraft] = useState<string>('');
+  const [alexTtlDraft, setAlexTtlDraft] = useState<number>(30);
+  const [textOnlyMode, setTextOnlyMode] = useState(false);
+  const [toolsMode, setToolsMode] = useState<WebchatToolsMode>(() => normalizeWebchatToolsMode(
+    readStoredWebchatToolsMode(window.localStorage, getStableWebchatSessionId(), "alex") || "off"
+  ));
+  const [toolsHealthMeta, setToolsHealthMeta] = useState<ToolsHealthSummary | null>(null);
+  const [toolsHealthDetailsOpen, setToolsHealthDetailsOpen] = useState(false);
+  const [toolsSelfTestBusy, setToolsSelfTestBusy] = useState(false);
+  const [liveEvents, setLiveEvents] = useState<LiveActivityEvent[]>([]);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [liveStatusText, setLiveStatusText] = useState("");
+  const [lastLiveEventAt, setLastLiveEventAt] = useState<number | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const liveReconnectTimerRef = useRef<number | null>(null);
+  const liveReconnectDelayRef = useRef<number>(1000);
+  const liveEventIdsRef = useRef<Set<string>>(new Set());
 
   function toast(msg: string) {
     setToastMsg(msg);
     window.setTimeout(() => setToastMsg(""), 3000);
+  }
+
+  function persistToolsMode(nextMode: WebchatToolsMode) {
+    writeStoredWebchatToolsMode(window.localStorage, sessionIdRef.current, "alex", nextMode);
+    setToolsMode(nextMode);
+  }
+
+  function getStoredToolsMode(): WebchatToolsMode | null {
+    const stored = readStoredWebchatToolsMode(window.localStorage, sessionIdRef.current, "alex");
+    return stored ? normalizeWebchatToolsMode(stored) : null;
   }
 
   useEffect(() => {
@@ -405,6 +574,96 @@ export default function WebChatPage() {
   }, [messages]);
 
   useEffect(() => {
+    activeSendMessageIdRef.current = activeSendMessageId;
+  }, [activeSendMessageId]);
+
+  useEffect(() => {
+    const sessionId = sessionIdRef.current;
+    let disposed = false;
+
+    const connect = () => {
+      if (disposed) return;
+      try {
+        const es = new EventSource(buildLiveEventsUrl(sessionId));
+        eventSourceRef.current = es;
+        es.onopen = () => {
+          setLiveConnected(true);
+          setLiveStatusText("");
+          setLastLiveEventAt(Date.now());
+          liveReconnectDelayRef.current = 1000;
+        };
+        es.onmessage = (msg) => {
+          try {
+            const parsed = JSON.parse(String(msg.data || "{}")) as LiveActivityEvent;
+            setLiveConnected(true);
+            setLastLiveEventAt(Date.now());
+            if (parsed.type === "error" && parsed.message) {
+              setLiveStatusText(parsed.message);
+            }
+            const key = liveEventKey(parsed);
+            if (liveEventIdsRef.current.has(key)) return;
+            liveEventIdsRef.current.add(key);
+            setLiveEvents((prev) => [...prev, parsed].slice(-200));
+          } catch {}
+        };
+        es.onerror = () => {
+          setLiveConnected(false);
+          try { es.close(); } catch {}
+          if (disposed) return;
+          void probeLiveEventsError(sessionId).then((message) => {
+            if (disposed || !message) return;
+            setLiveStatusText(message);
+            setErr((prev) => prev || message);
+            const event: LiveActivityEvent = {
+              id: `stream-error-${Date.now().toString(36)}`,
+              ts: Date.now(),
+              sessionId,
+              type: "error",
+              message,
+              ok: false,
+            };
+            const key = liveEventKey(event);
+            if (!liveEventIdsRef.current.has(key)) {
+              liveEventIdsRef.current.add(key);
+              setLiveEvents((prev) => [...prev, event].slice(-200));
+            }
+            const pendingId = activeSendMessageIdRef.current;
+            if (pendingId) {
+              setMessages((prev) => prev.map((m) => (
+                m.id === pendingId && String(m.text || "").trim() === "Running…"
+                  ? { ...m, text: message, ts: nowTs() }
+                  : m
+              )));
+              setSending(false);
+              setActiveSendMessageId(null);
+              activeSendAbortRef.current = null;
+            }
+          });
+          if (liveReconnectTimerRef.current) window.clearTimeout(liveReconnectTimerRef.current);
+          const delay = liveReconnectDelayRef.current;
+          liveReconnectTimerRef.current = window.setTimeout(() => connect(), delay);
+          liveReconnectDelayRef.current = Math.min(delay * 2, 10000);
+        };
+      } catch {
+        setLiveConnected(false);
+      }
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      setLiveConnected(false);
+      setLiveStatusText("");
+      setLastLiveEventAt(null);
+      if (liveReconnectTimerRef.current) window.clearTimeout(liveReconnectTimerRef.current);
+      liveReconnectTimerRef.current = null;
+      try { eventSourceRef.current?.close(); } catch {}
+      eventSourceRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!sessionMetaLoadedRef.current) return;
     const sid = String(mcpServerId || '').trim();
     const tid = String(mcpTemplateId || '').trim();
     if (sid) localStorage.setItem(MCP_SELECTED_KEY, sid);
@@ -416,8 +675,20 @@ export default function WebChatPage() {
       assistant_name: assistantName,
       mcp_server_id: sid,
       mcp_template_id: tid,
+      webchat_text_only: textOnlyMode,
+      webchat_tools_mode: toolsMode,
     }).catch(() => {});
-  }, [mcpServerId, mcpTemplateId]);
+  }, [mcpServerId, mcpTemplateId, assistantName, textOnlyMode, toolsMode]);
+
+  useEffect(() => {
+    if (!runtimeState) return;
+    setToolsHealthMeta((prev) => {
+      const next = summarizeToolsHealth(runtimeState);
+      if (!prev) return next;
+      if (JSON.stringify(prev) === JSON.stringify(next)) return prev;
+      return next;
+    });
+  }, [runtimeState]);
 
 
   async function refreshSystemState({ toastOnChange }: { toastOnChange: boolean }) {
@@ -551,6 +822,11 @@ export default function WebChatPage() {
       const n = String(out?.meta?.assistant_name || "Alex").trim() || "Alex";
       setAssistantName(n);
       setAssistantNameDraft(n);
+      setTextOnlyMode(Boolean(out?.meta?.webchat_text_only));
+      const storedToolsMode = getStoredToolsMode();
+      const serverToolsMode = normalizeWebchatToolsMode(out?.meta?.webchat_tools_mode);
+      if (storedToolsMode) persistToolsMode(storedToolsMode);
+      else setToolsMode(serverToolsMode);
       const sid = String(out?.meta?.mcp_server_id || '').trim();
       const tidRaw = String(out?.meta?.mcp_template_id || '').trim();
       const tid = tidRaw === 'context7' ? 'code1' : (tidRaw === 'context7_docs_default' ? 'code1_docs_default' : tidRaw);
@@ -562,9 +838,62 @@ export default function WebChatPage() {
         setMcpServerId(sid);
         localStorage.setItem(MCP_SELECTED_KEY, sid);
       }
+      setMissionPath(String(out?.mission_path || ""));
+      setMissionPreview(String(out?.mission_preview || ""));
+    } catch {
+      // ignore
+    } finally {
+      sessionMetaLoadedRef.current = true;
+    }
+  }
+
+  async function refreshAlexAccess() {
+    try {
+      const out = await getJson<AlexAccessResponse>('/api/agents/alex/access');
+      setAlexAccess(out?.access || null);
+      setAlexProjectRoots(Array.isArray(out?.project_roots) ? out.project_roots : []);
+      setAlexAccessLevelDraft(Number(out?.access?.level || 1));
+      setAlexProjectRootDraft(out?.access?.project_root_id != null ? String(out.access.project_root_id) : '');
+      setAlexTtlDraft(Number(out?.access?.ttl_minutes ?? 30));
+      const storedMode = getStoredToolsMode();
+      const accessLevel = Number(out?.access?.level || 0);
+      // At L2+ always auto-enable tools unless user explicitly stored 'session' already
+      if (!storedMode) {
+        persistToolsMode(defaultWebchatToolsMode(accessLevel, null) as WebchatToolsMode);
+      } else if (accessLevel >= 2 && storedMode === "off") {
+        persistToolsMode("session");
+      }
     } catch {
       // ignore
     }
+  }
+
+  async function saveAlexAccess(levelOverride?: number) {
+    const level = levelOverride ?? alexAccessLevelDraft;
+    setAlexAccessBusy(true);
+    setErr('');
+    try {
+      const out = await postJson<AlexAccessResponse>('/api/agents/alex/access', {
+        level: Number(level),
+        project_root_id: level >= 3 && alexProjectRootDraft ? Number(alexProjectRootDraft) : null,
+        ttl_minutes: alexTtlDraft,
+        confirm_dangerous: level === 4,
+      });
+      setAlexAccess(out?.access || null);
+      setAlexProjectRoots(Array.isArray(out?.project_roots) ? out.project_roots : alexProjectRoots);
+      toast(`Alex access set to ${out?.access?.level_label || `L${level}`}.`);
+    } catch (e: any) {
+      setErr(String(e?.detail?.message || e?.detail?.error || e?.message || e));
+    } finally {
+      setAlexAccessBusy(false);
+    }
+  }
+
+  async function dropAlexToL1() {
+    setAlexAccessLevelDraft(1);
+    setAlexProjectRootDraft('');
+    setAlexTtlDraft(30);
+    await saveAlexAccess(1);
   }
 
   async function saveAssistantName() {
@@ -578,6 +907,136 @@ export default function WebChatPage() {
       setAssistantName(n);
       setAssistantNameDraft(n);
       toast(`Assistant name set to ${n}.`);
+    } catch (e: any) {
+      setErr(String(e?.detail?.error || e?.message || e));
+    }
+  }
+
+  async function setWebchatTextOnlyMode(nextValue: boolean, announce = true) {
+    try {
+      const out = await postJson<any>("/admin/webchat/session-meta", {
+        session_id: sessionIdRef.current,
+        assistant_name: assistantName,
+        mcp_server_id: mcpServerId || null,
+        mcp_template_id: mcpTemplateId || null,
+        webchat_text_only: nextValue,
+        webchat_tools_mode: toolsMode === 'session' ? 'session' : 'off',
+      });
+      setTextOnlyMode(Boolean(out?.meta?.webchat_text_only));
+      if (announce) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `system-text-only-${Date.now().toString(36)}`,
+            role: "system",
+            text: nextValue ? "Text-only mode is ON for this chat." : "Text-only mode is OFF for this chat.",
+            ts: nowTs(),
+          },
+        ]);
+      }
+      toast(nextValue ? "Text-only mode ON." : "Text-only mode OFF.");
+    } catch (e: any) {
+      setErr(String(e?.detail?.error || e?.message || e));
+    }
+  }
+
+  async function refreshToolsHealth() {
+    try {
+      const out = await getJson<ToolsHealthSummary>('/api/meta/tools');
+      const summary = summarizeToolsHealth(out);
+      setToolsHealthMeta(summary);
+      return summary;
+    } catch (e: any) {
+      const fallback = summarizeToolsHealth(runtimeState || {});
+      setToolsHealthMeta(fallback);
+      setErr(String(e?.detail?.error || e?.message || e));
+      return fallback;
+    }
+  }
+
+  async function rerunToolsSelfTest() {
+    setToolsSelfTestBusy(true);
+    setErr("");
+    try {
+      const out = await postJson<ToolsHealthSummary>('/api/admin/tools/self_test', {});
+      const summary = summarizeToolsHealth(out);
+      setToolsHealthMeta(summary);
+      await refreshRuntimeState().catch(() => null);
+      toast(summary.tools_disabled ? "Tools self-test still failing." : "Tools self-test passed.");
+      return summary;
+    } catch (e: any) {
+      setErr(String(e?.detail?.error || e?.detail?.message || e?.message || e));
+      throw e;
+    } finally {
+      setToolsSelfTestBusy(false);
+    }
+  }
+
+  function describeToolsFailure(summary: ToolsHealthSummary | null | undefined) {
+    const failingCheck = String(summary?.failing_check_id || '').trim();
+    const failingPath = String(summary?.failing_path || '').trim();
+    const lastError = String(summary?.last_error || '').trim();
+    const checkedAt = String(summary?.checked_at || '').trim();
+    return [
+      failingCheck ? `check=${failingCheck}` : "",
+      failingPath ? `path=${failingPath}` : "",
+      lastError ? `error=${lastError}` : "",
+      checkedAt ? `checked=${checkedAt}` : "",
+    ].filter(Boolean).join(" | ");
+  }
+
+  async function ensureToolsHealthy() {
+    const summary = await refreshToolsHealth();
+    if (summary?.tools_disabled) {
+      const detail = describeToolsFailure(summary);
+      const message = `Tools are disabled by self-test failure.${detail ? ` ${detail}` : ""}`;
+      setErr(message);
+      setToolsHealthDetailsOpen(true);
+      toast("Tools are disabled. Review the failing self-test and rerun it.");
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `system-tools-disabled-${Date.now().toString(36)}`,
+          role: "system",
+          text: `Tools disabled: ${summary?.failing_check_id || "self_test_failed"}. Use the rerun self-test button, then try again.`,
+          ts: nowTs(),
+        },
+      ]);
+      return { ok: false, summary };
+    }
+    return { ok: true, summary };
+  }
+
+  async function setWebchatToolsMode(nextMode: WebchatToolsMode) {
+    if (nextMode === "off") {
+      persistToolsMode("off");
+      try {
+        await postJson<any>("/admin/webchat/session-meta", {
+          session_id: sessionIdRef.current,
+          assistant_name: assistantName,
+          mcp_server_id: mcpServerId || null,
+          mcp_template_id: mcpTemplateId || null,
+          webchat_text_only: textOnlyMode,
+          webchat_tools_mode: "off",
+        });
+      } catch (e: any) {
+        setErr(String(e?.detail?.error || e?.message || e));
+      }
+      return;
+    }
+    const health = await ensureToolsHealthy();
+    if (!health.ok) return;
+    try {
+      const out = await postJson<any>("/admin/webchat/session-meta", {
+        session_id: sessionIdRef.current,
+        assistant_name: assistantName,
+        mcp_server_id: mcpServerId || null,
+        mcp_template_id: mcpTemplateId || null,
+        webchat_text_only: textOnlyMode,
+        webchat_tools_mode: "session",
+      });
+      persistToolsMode(normalizeWebchatToolsMode(out?.meta?.webchat_tools_mode || "session"));
+      toast("Tools enabled for this chat session.");
     } catch (e: any) {
       setErr(String(e?.detail?.error || e?.message || e));
     }
@@ -629,14 +1088,23 @@ export default function WebChatPage() {
   useEffect(() => {
     (async () => {
       try {
-        await refreshSystemState({ toastOnChange: false });
+      await refreshSystemState({ toastOnChange: false });
       } catch {
         // ignore
       }
       await refreshMcpServers();
       await refreshUploads();
       await refreshSessionMeta();
+      await refreshAlexAccess();
+      await refreshToolsHealth();
     })();
+  }, []);
+
+  useEffect(() => {
+    const h = window.setInterval(() => {
+      refreshAlexAccess().catch(() => {});
+    }, 30000);
+    return () => window.clearInterval(h);
   }, []);
 
   // If Canvas "Merge to WebChat" was used, prefill the composer once.
@@ -731,6 +1199,7 @@ export default function WebChatPage() {
 
   // Auto-refresh pending approvals so "Approve -> back to WebChat -> Invoke" works without manual reload.
   useEffect(() => {
+    if (!approvalsEnabled) return;
     const lastPoll: Record<string, number> = {};
     const h = setInterval(async () => {
       const msgs = messagesRef.current || [];
@@ -751,7 +1220,7 @@ export default function WebChatPage() {
       }
     }, 2500);
     return () => clearInterval(h);
-  }, []);
+  }, [approvalsEnabled]);
 
   async function pollAgentRuns() {
     try {
@@ -767,24 +1236,82 @@ export default function WebChatPage() {
   }
 
   async function send(rawText?: string) {
-    const payload = [rawText, text, composerInputRef.current?.value]
+    const inputPayload = [rawText, text, composerInputRef.current?.value]
       .map((v) => String(v ?? "").trim())
       .find((v) => v.length > 0) || "";
+    const command = parseSessionCommand(inputPayload);
+    const payload = command.message;
     setSendSeq((n) => n + 1);
     setSendDebug(`handler-fired payload_len=${payload.length}`);
+    if (command.kind === "mission_on") {
+      await setWebchatTextOnlyMode(true);
+      setText("");
+      return;
+    }
+    if (command.kind === "mission_off") {
+      await setWebchatTextOnlyMode(false);
+      setText("");
+      return;
+    }
+    if (command.kind === "tools_on") {
+      await setWebchatToolsMode("session");
+      setText("");
+      return;
+    }
+    if (command.kind === "tools_off") {
+      await setWebchatToolsMode("off");
+      setText("");
+      return;
+    }
+    if (command.kind === "run_session_on") {
+      if (textOnlyMode) await setWebchatTextOnlyMode(false, false);
+      if (toolsMode === "session") {
+        // Already enabled (L2+) — /run is a no-op, just refresh access and clear stale banners
+        setErr("");
+        await refreshAlexAccess();
+        toast(alexAccess && alexAccess.level >= 2
+          ? `Tools already enabled (${alexAccess.level_label}).`
+          : "Tools enabled for this chat session.");
+      } else {
+        await setWebchatToolsMode("session");
+        toast("Tools enabled for this chat session.");
+      }
+      setText("");
+      return;
+    }
+    if (command.kind === "run") {
+      await setWebchatToolsMode("session");
+      if (textOnlyMode) await setWebchatTextOnlyMode(false, false);
+    }
     if (!payload) return;
+    const allowToolsForMessage = command.kind === "run" || toolsMode === "session";
+    if (allowToolsForMessage) {
+      const health = await ensureToolsHealthy();
+      if (!health.ok) return;
+      if (command.kind === "run") toast("Tools enabled for this chat session.");
+    }
 
     const messageId = `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     const pendingId = `assistant-pending-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     const abortController = new AbortController();
     activeSendAbortRef.current = abortController;
     setActiveSendMessageId(pendingId);
+    setLivePanelMessageId(pendingId);
     setSending(true);
     setErr("");
+    setLiveStatusText("");
+    liveEventIdsRef.current = new Set();
+    setLiveEvents([{
+      id: `local_${Date.now()}`,
+      ts: Date.now(),
+      sessionId: sessionIdRef.current,
+      type: "status",
+      message: "Running…",
+    }]);
     setMessages((prev) => [
       ...prev,
       { id: messageId, role: "user", text: payload, ts: nowTs() },
-      { id: pendingId, role: "assistant", text: "Sending…", ts: nowTs() },
+      { id: pendingId, role: "assistant", text: "Running…", ts: nowTs() },
     ]);
     setSendDebug(`pending-added id=${pendingId}`);
     setText("");
@@ -798,6 +1325,7 @@ export default function WebChatPage() {
         agent_id: 'alex',
         mcp_server_id: mcpServerId || null,
         mcp_template_id: mcpTemplateId || null,
+        allow_tools_override: allowToolsForMessage,
       };
       console.debug('[webchat.send]', { mcpServerId, mcpTemplateId, session_id: reqPayload.session_id, message_id: reqPayload.message_id });
       const r = await postJson<any>("/admin/webchat/send", reqPayload, { signal: abortController.signal });
@@ -822,6 +1350,14 @@ export default function WebChatPage() {
           setAssistantNameDraft(n);
         }
       }
+      if (r?.session_meta) {
+        setTextOnlyMode(Boolean(r.session_meta.webchat_text_only));
+        const nextMode = normalizeWebchatToolsMode(r.session_meta.webchat_tools_mode);
+        if (getStoredToolsMode()) persistToolsMode(getStoredToolsMode() as WebchatToolsMode);
+        else setToolsMode(nextMode);
+      }
+      if (r?.mission_path != null) setMissionPath(String(r.mission_path || ""));
+      if (r?.mission_preview != null) setMissionPreview(String(r.mission_preview || ""));
       setMessages((prev) => {
         let replaced = false;
         const next = prev.map((m) => {
@@ -1116,6 +1652,38 @@ export default function WebChatPage() {
   }
 
   const statusLine = useMemo(() => t("webchat.statusLine", { provider, model }), [provider, model, t]);
+  const currentToolsHealth = useMemo(
+    () => summarizeToolsHealth(toolsHealthMeta || runtimeState || {}),
+    [toolsHealthMeta, runtimeState],
+  );
+  const toolingBadge = useMemo(() => {
+    if (currentToolsHealth?.tools_disabled) {
+      return {
+        label: "Tooling Mode: Tools disabled",
+        title: "Tools self-test failed. Tool execution is disabled until the failing probe is fixed.",
+        fg: "#991b1b",
+        bg: "rgba(248,113,113,0.18)",
+        border: "rgba(220,38,38,0.45)",
+      };
+    }
+    if (runtimeState?.supports_tool_calls === false) {
+      return {
+        label: "Tooling Mode: Deterministic fallback",
+        title: "Current provider/model does not support tool-calling API. Server runs deterministic executors.",
+        fg: "#92400e",
+        bg: "rgba(251,191,36,0.2)",
+        border: "rgba(217,119,6,0.4)",
+      };
+    }
+    return {
+      label: "Tooling Mode: Tool calling enabled",
+      title: "Provider/model supports tool-calling. Deterministic fallback remains enabled.",
+      fg: "#14532d",
+      bg: "rgba(74,222,128,0.18)",
+      border: "rgba(34,197,94,0.4)",
+    };
+  }, [currentToolsHealth, runtimeState]);
+  const alexNativeTools = String(assistantName || "").trim().toLowerCase() === "alex";
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
@@ -1124,9 +1692,83 @@ export default function WebChatPage() {
           <div style={{ display: "grid", gap: 6 }}>
             <h2 style={{ margin: 0 }}>{t("page.webchat.title")}</h2>
             <div style={{ fontSize: 12, opacity: 0.8, marginTop: 2 }}>{statusLine}</div>
+            <div
+              title={toolingBadge.title}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                width: "fit-content",
+                borderRadius: 999,
+                padding: "3px 10px",
+                fontSize: 12,
+                fontWeight: 700,
+                color: toolingBadge.fg,
+                background: toolingBadge.bg,
+                border: `1px solid ${toolingBadge.border}`,
+              }}
+            >
+              {toolingBadge.label}
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  borderRadius: 999,
+                  padding: "3px 10px",
+                  fontWeight: 700,
+                  color: toolsMode === "off" ? "#991b1b" : "#14532d",
+                  background: toolsMode === "off" ? "rgba(248, 113, 113, 0.18)" : "rgba(74, 222, 128, 0.18)",
+                  border: toolsMode === "off" ? "1px solid rgba(220, 38, 38, 0.45)" : "1px solid rgba(34, 197, 94, 0.4)",
+                }}
+              >
+                Tools: {toolsMode === "session" ? "ON" : "OFF"}{toolsMode === "session" && alexAccess ? ` (${alexAccess.level_label})` : ""}
+              </span>
+              {toolsMode === "session" ? (
+                <button type="button" onClick={() => { void setWebchatToolsMode("off"); }} style={{ padding: "4px 8px" }}>
+                  Tools OFF
+                </button>
+              ) : (
+                <button type="button" onClick={() => { void setWebchatToolsMode("session"); }} style={{ padding: "4px 8px" }}>
+                  Tools ON
+                </button>
+              )}
+              <span style={{ opacity: 0.8 }}>
+                {currentToolsHealth?.tools_disabled
+                  ? `Blocked by self-test: ${currentToolsHealth?.failing_check_id || "unknown"}`
+                  : (alexAccess && alexAccess.level >= 2
+                    ? "Auto-enabled at L2+. Tools stay on for this chat."
+                    : "Tools stay on for this chat until you turn them off.")}
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  borderRadius: 999,
+                  padding: "3px 10px",
+                  fontWeight: 700,
+                  color: textOnlyMode ? "#92400e" : "#14532d",
+                  background: textOnlyMode ? "rgba(245, 158, 11, 0.18)" : "rgba(74, 222, 128, 0.18)",
+                  border: textOnlyMode ? "1px solid rgba(245, 158, 11, 0.45)" : "1px solid rgba(34, 197, 94, 0.4)",
+                }}
+              >
+                {textOnlyMode ? "Text-only mode ON" : "Text-only mode OFF"}
+              </span>
+              <button type="button" onClick={() => { void setWebchatTextOnlyMode(!textOnlyMode); }} style={{ padding: "4px 8px" }}>
+                Text-only: {textOnlyMode ? "ON" : "OFF"}
+              </button>
+              <span style={{ opacity: 0.8 }}>/mission toggles safe text-only mode. Use /run or /tools on to keep tools enabled.</span>
+            </div>
             <div style={{ fontSize: 12, opacity: 0.8, marginTop: 2 }}>
               Memory: {memoryState.enabled ? 'ON' : 'OFF'} · profile {memoryState.profileChars} chars · chat {memoryState.summaryChars} chars{memoryState.lastUpdatedAt ? ` · updated ${new Date(memoryState.lastUpdatedAt).toLocaleTimeString()}` : ''}
             </div>
+            {(missionPath || missionPreview) && (
+              <div style={{ fontSize: 12, opacity: 0.85, marginTop: 4, whiteSpace: "pre-wrap" }}>
+                Mission: {missionPath || "(stored)"}{missionPreview ? `\n${missionPreview}` : ""}
+              </div>
+            )}
             <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
               <span>Assistant name</span>
               <input
@@ -1144,9 +1786,115 @@ export default function WebChatPage() {
                 Save
               </button>
             </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
+              <span>Alex Access</span>
+              <select
+                value={alexAccessLevelDraft}
+                onChange={(e) => {
+                  const nextLevel = Number(e.target.value || 1);
+                  setAlexAccessLevelDraft(nextLevel);
+                  if (nextLevel < 3) setAlexProjectRootDraft('');
+                  if (nextLevel === 2) setAlexTtlDraft(0);
+                  if (nextLevel !== 2 && alexTtlDraft === 0) setAlexTtlDraft(30);
+                }}
+                disabled={alexAccessBusy}
+                style={{ padding: "4px 8px" }}
+              >
+                <option value={0}>L0 Read-only</option>
+                <option value={1}>L1 Safe Write</option>
+                <option value={2}>L2 Build Mode</option>
+                <option value={3}>L3 Project Mode</option>
+                <option value={4}>L4 Full Local Dev</option>
+              </select>
+              {alexAccessLevelDraft >= 3 ? (
+                <select
+                  value={alexProjectRootDraft}
+                  onChange={(e) => setAlexProjectRootDraft(e.target.value)}
+                  disabled={alexAccessBusy}
+                  style={{ padding: "4px 8px", minWidth: 220 }}
+                >
+                  <option value="">Select project root</option>
+                  {alexProjectRoots.filter((root) => root.enabled).map((root) => (
+                    <option key={root.id} value={root.id}>
+                      {root.label} ({root.path})
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+              <select
+                value={alexTtlDraft}
+                onChange={(e) => setAlexTtlDraft(Number(e.target.value || 30))}
+                disabled={alexAccessBusy}
+                style={{ padding: "4px 8px" }}
+              >
+                {[0, 15, 30, 60, 120].map((mins) => (
+                  <option key={mins} value={mins}>{mins === 0 ? 'No expiry' : `${mins} min TTL`}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => saveAlexAccess()}
+                disabled={alexAccessBusy || (alexAccessLevelDraft >= 3 && !alexProjectRootDraft)}
+                style={{ padding: "4px 8px" }}
+              >
+                Apply
+              </button>
+              <button
+                type="button"
+                onClick={dropAlexToL1}
+                disabled={alexAccessBusy || alexAccess?.level === 1}
+                style={{ padding: "4px 8px" }}
+              >
+                Drop to L1 now
+              </button>
+              <span style={{ opacity: 0.8 }}>
+                {alexAccess?.level_label || 'L1 Safe Write'}
+                {alexAccess?.allow_shell_operators ? ' · Shell operators: Enabled' : ' · Shell operators: Disabled'}
+                {alexAccess?.expires_in_ms ? ` · reverts in ${Math.max(1, Math.ceil(alexAccess.expires_in_ms / 60000))} min` : ' · no expiry'}
+              </span>
+            </div>
           </div>
           <CommandCenterIndicator state={runtimeState} assistantName={assistantName} />
         </div>
+        {!currentToolsHealth?.tools_disabled && toolsMode !== "session" ? (
+          <div style={{ marginTop: 8, border: "1px solid var(--border-soft)", borderRadius: 10, padding: "8px 10px", background: "var(--panel)", color: "var(--text)", fontSize: 13, fontWeight: 700 }}>
+            Tools: OFF{alexAccess ? ` (${alexAccess.level_label})` : ""}. {alexAccess && alexAccess.level < 2
+              ? "Access level L2+ required for auto-enabled tools. Use /tools on to enable manually, or set access to L2+."
+              : "Use /run or /tools on to enable them."}
+          </div>
+        ) : null}
+        {!currentToolsHealth?.tools_disabled && alexNativeTools && toolsMode === "session" ? (
+          <div style={{ marginTop: 8, border: "1px solid var(--border-soft)", borderRadius: 10, padding: "8px 10px", background: "var(--panel)", color: "var(--text)", fontSize: 13, fontWeight: 700 }}>
+            Alex tools follow access level. Use Text-only mode if you want a no-tools turn.
+          </div>
+        ) : null}
+        {Boolean(currentToolsHealth?.tools_disabled) ? (
+          <div style={{ marginTop: 8, border: "1px solid #f59e0b", borderRadius: 10, padding: "8px 10px", background: "rgba(245,158,11,0.12)", color: "#b45309", fontSize: 13, fontWeight: 700, display: "grid", gap: 8 }}>
+            <div>
+              TOOLS DISABLED: startup self-test failed.
+              {currentToolsHealth?.failing_check_id ? ` Failing check: ${currentToolsHealth.failing_check_id}.` : ""}
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <button type="button" onClick={() => setToolsHealthDetailsOpen((v) => !v)} style={{ padding: "4px 8px" }}>
+                {toolsHealthDetailsOpen ? "Hide details" : "Show details"}
+              </button>
+              <button type="button" onClick={() => { void rerunToolsSelfTest(); }} disabled={toolsSelfTestBusy} style={{ padding: "4px 8px" }}>
+                {toolsSelfTestBusy ? "Rerunning..." : "Rerun self-test"}
+              </button>
+            </div>
+            {toolsHealthDetailsOpen ? (
+              <div style={{ fontSize: 12, fontWeight: 500, display: "grid", gap: 4 }}>
+                <div>Reason: {currentToolsHealth?.reason || "self_test_failed"}</div>
+                <div>Check: {currentToolsHealth?.failing_check_id || "unknown"}</div>
+                <div>Path: {currentToolsHealth?.failing_path || "(none)"}</div>
+                <div>Error: {currentToolsHealth?.last_error || "(none)"}</div>
+                <div>stdout: {currentToolsHealth?.last_stdout || "(none)"}</div>
+                <div>stderr: {currentToolsHealth?.last_stderr || "(none)"}</div>
+                <div>Checked: {currentToolsHealth?.checked_at ? new Date(currentToolsHealth.checked_at).toLocaleString() : "(unknown)"}</div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <div style={{ marginTop: 8, border: "1px solid var(--border-soft)", borderRadius: 10, padding: 10, background: "var(--panel)" }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
             <strong style={{ fontSize: 13 }}>Diagnostics</strong>
@@ -1548,6 +2296,9 @@ export default function WebChatPage() {
               >
                 <div style={{ fontSize: 11, opacity: 0.7 }}>{m.role.toUpperCase()} • {m.ts}</div>
                 <div style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+                {m.id === livePanelMessageId ? (
+                  <LiveActivityPanel events={liveEvents} connected={liveConnected} statusText={liveStatusText} lastEventAt={lastLiveEventAt} />
+                ) : null}
                 {m.role === 'assistant' && hasRawHtmlLeak(m.text) ? (
                   <div style={{ padding: 8, borderRadius: 8, border: '1px solid color-mix(in srgb, var(--warn) 45%, var(--border))', background: 'color-mix(in srgb, var(--warn) 16%, var(--panel))', fontSize: 12 }}>
                     Raw HTML detected — extraction failed.
@@ -1818,7 +2569,7 @@ export default function WebChatPage() {
               if (!sending) void send();
             }
           }}
-          placeholder={t("webchat.input.placeholder")}
+          placeholder={textOnlyMode ? "Text-only mode is ON. Paste a mission, or use /run or /tools on to enable tools." : t("webchat.input.placeholder")}
           style={{ flex: 1, padding: 10 }}
         />
         <button type="button" onClick={() => { void send(); }} disabled={sending} style={{ padding: "10px 14px" }}>

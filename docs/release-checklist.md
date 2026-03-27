@@ -3,9 +3,12 @@
 This is a lightweight checklist for cutting a Preview release.
 
 ## Before release
-- `npm install`
+- `npm ci`
+- `npm --prefix desktop ci`
 - `npm run build`
 - `npm run i18n:audit`
+- `npm run release:build:linux`
+- Push the release tag (for example `v0.1.1`) so GitHub Actions builds Windows and macOS installers on native runners.
 - Quick UI click-through:
   - Status, Diagnostics, ER+
   - Runtime (Text WebUI status + models)
@@ -22,9 +25,10 @@ This is a lightweight checklist for cutting a Preview release.
 
 ## Release artifacts
 - Update `CHANGELOG.md`.
-- Tag the release (Preview).
+- Update `RELEASE_NOTES.md`.
+- Tag the release (`vX.Y.Z`).
+- Confirm artifacts exist in `release/` with names like `proworkbench-vX.Y.Z-linux.*`, `proworkbench-vX.Y.Z-windows.*`, and `proworkbench-vX.Y.Z-macos.*`.
 - Create GitHub Release notes and include:
   - “Text WebUI manual start” steps
   - known-good model string
   - breaking changes (if any)
-

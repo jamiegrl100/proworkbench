@@ -10,10 +10,17 @@
     { "key": "outputPath", "label": "Output folder", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
   ],
   "securityDefaults": {
+    "testPlan": [
+      "export.write_markdown",
+      "export.write_csv"
+    ],
     "workdirOnly": true,
     "pathAllowlist": ["{PB_WORKDIR}"],
     "domainAllowlist": [],
     "commandAllowlist": []
-  }
+  },
+  "defaultCapabilities": [
+    "export.write_markdown",
+    "export.write_csv"
+  ]
 }
-

@@ -251,6 +251,10 @@ const state = {
         projectRoot: p.rootReal,
         requestedAction: trimmed,
       });
+      if (!req?.approvalId) {
+        await send(api, chatId, 'Approvals are disabled. Run/install requests cannot be queued.');
+        return;
+      }
       await send(
         api,
         chatId,

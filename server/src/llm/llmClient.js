@@ -189,6 +189,9 @@ export async function llmChatOnce({
     } catch {
       // memory is best-effort only
     }
+    if (systemWithMemory) {
+      systemWithMemory = `${systemWithMemory.trim()}\n\nMemory usage rule:\n- If the user asks what they said earlier, what was decided before, or references an earlier overnight/build note, answer from the MEMORY blocks first.\n- Prefer quoting or paraphrasing the remembered note over saying you do not know.`;
+    }
 
     let call;
     let path = '/v1/chat/completions';

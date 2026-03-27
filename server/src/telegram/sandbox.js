@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { llmChatOnce } from '../llm/llmClient.js';
 import { recordEvent } from '../util/events.js';
+import { approvalsEnabled } from '../util/approvals.js';
 
 function nowIso() {
   return new Date().toISOString();
@@ -339,6 +340,7 @@ function extractSuggestedCommands(text) {
 }
 
 export function createTelegramRunApproval(db, { chatId, projectSlug, projectRoot, requestedAction }) {
+  if (!approvalsEnabled()) return null;
   const createdAt = nowIso();
   const payload = {
     channel: 'telegram',
@@ -365,4 +367,3 @@ export function createTelegramRunApproval(db, { chatId, projectSlug, projectRoot
   });
   return { approvalId, payload };
 }
-

@@ -10,11 +10,18 @@
     { "key": "rootPath", "label": "Folder", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
   ],
   "securityDefaults": {
+    "testPlan": [
+      "pb_files.list .",
+      "pb_files.read sample.txt"
+    ],
     "workdirOnly": true,
     "pathAllowlist": ["{PB_WORKDIR}"],
     "pathReadOnly": true,
     "domainAllowlist": [],
     "commandAllowlist": []
-  }
+  },
+  "defaultCapabilities": [
+    "pb_files.list",
+    "pb_files.read"
+  ]
 }
-

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.1
+- Fixed Alex Factory Reset so it clears user memory, history, session state, and temporary workspace data without deleting MCP servers, tool definitions, provider configuration, or the memory system itself.
+- Factory Reset now returns auth to first-run setup by clearing the stored admin password and active admin tokens while preserving the rest of the application infrastructure.
+- Added standardized desktop release packaging for Linux, Windows, and macOS with normalized artifact names in `release/`.
+- Added tag-driven GitHub Actions release automation so pushing `v*` builds the same installers and uploads them as workflow artifacts and release assets.
+
 ## v0.1 (Preview)
 - Persistent Memory v0 (workspace-file based): daily scratch + summary memory, bounded memory context injection on every LLM call, finalize-day redaction with durable patch proposals for `MEMORY.md`/`MEMORY_ARCHIVE`, and admin Memory page.
 - Local-first admin console (UI + server + SQLite)

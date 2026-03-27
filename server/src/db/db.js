@@ -1,5 +1,19 @@
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { approvalsEnabled } from '../util/approvals.js';
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function recordMigration(db, id, notes = null) {
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO migrations (id, applied_at, notes)
+      VALUES (?, ?, ?)
+    `).run(String(id || '').trim(), nowIso(), notes == null ? null : String(notes));
+  } catch {}
+}
 
 export function openDb(dataDir) {
   const dbPath = path.join(dataDir, 'proworkbench.db');
@@ -10,10 +24,29 @@ export function openDb(dataDir) {
 }
 
 export function migrate(db) {
+  renameLegacyApprovalsTable(db);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS app_kv (
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS migrations (
+      id TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL,
+      notes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS alex_project_roots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      label TEXT NOT NULL,
+      path TEXT NOT NULL UNIQUE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      is_favorite INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_used_at INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS admin_auth (
@@ -526,6 +559,7 @@ export function migrate(db) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_canvas_items_created_at ON canvas_items(created_at);
+    CREATE INDEX IF NOT EXISTS idx_alex_project_roots_enabled ON alex_project_roots(enabled, is_favorite, updated_at);
     CREATE INDEX IF NOT EXISTS idx_canvas_items_kind ON canvas_items(kind);
     CREATE INDEX IF NOT EXISTS idx_canvas_items_pinned ON canvas_items(pinned, created_at);
     CREATE INDEX IF NOT EXISTS idx_webchat_uploads_session_created ON webchat_uploads(session_id, created_at);
@@ -547,6 +581,7 @@ export function migrate(db) {
   `);
 
   // Idempotent column adds for existing DBs.
+  try { db.prepare('ALTER TABLE migrations ADD COLUMN notes TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE web_tool_proposals ADD COLUMN mcp_server_id TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN last_test_at TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN last_test_status TEXT').run(); } catch {}
@@ -555,6 +590,10 @@ export function migrate(db) {
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN entry_cmd TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN install_path TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN version TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN spec_id TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0').run(); } catch {}
+  try { db.prepare('ALTER TABLE mcp_servers ADD COLUMN aliases_json TEXT NOT NULL DEFAULT \'[]\'').run(); } catch {}
+  try { db.prepare("ALTER TABLE mcp_servers ADD COLUMN schemas_json TEXT NOT NULL DEFAULT '{}'").run(); } catch {}
   try { db.prepare('ALTER TABLE mcp_templates ADD COLUMN template_path TEXT').run(); } catch {}
   try { db.prepare("ALTER TABLE mcp_templates ADD COLUMN default_capabilities_json TEXT NOT NULL DEFAULT '[]'").run(); } catch {}
   try { db.prepare('ALTER TABLE agent_runs ADD COLUMN config_json TEXT').run(); } catch {}
@@ -577,6 +616,8 @@ export function migrate(db) {
       WHERE state = 'committed' AND (committed_at IS NULL OR TRIM(committed_at) = '');
     `);
   } catch {}
+
+  recordMigration(db, 'memory_schema_v1', 'Ensured memory_entries, memory_archive, memories, and memory_facts exist.');
   try {
     db.exec(`
       INSERT OR IGNORE INTO memory_archive
@@ -636,50 +677,52 @@ export function migrate(db) {
   } catch {}
 
   // Migrate old approval-gated memory write proposals into durable draft memory entries.
-  try {
-    const proposals = db.prepare(`
-      SELECT id, session_id, args_json, status
-      FROM web_tool_proposals
-      WHERE tool_name IN ('memory.write_scratch', 'memory.append')
-        AND status IN ('awaiting_approval', 'ready', 'blocked')
-    `).all();
-    const now = new Date().toISOString();
-    const insertDraft = db.prepare(`
-      INSERT INTO memory_entries
-        (ts, day, kind, content, meta_json, state, committed_at, source_session_id, workspace_id, title, tags_json)
-      VALUES (?, ?, 'note', ?, ?, 'draft', NULL, ?, ?, ?, ?)
-    `);
-    const markDone = db.prepare(`
-      UPDATE web_tool_proposals
-      SET status = 'migrated_to_draft', requires_approval = 0, approval_id = NULL
-      WHERE id = ?
-    `);
-    for (const row of proposals) {
-      const args = (() => {
-        try { return JSON.parse(String(row.args_json || '{}')) || {}; } catch { return {}; }
-      })();
-      const text = String(args.text ?? args.content ?? '').trim();
-      if (!text) {
+  if (approvalsEnabled()) {
+    try {
+      const proposals = db.prepare(`
+        SELECT id, session_id, args_json, status
+        FROM web_tool_proposals
+        WHERE tool_name IN ('memory.write_scratch', 'memory.append')
+          AND status IN ('awaiting_approval', 'ready', 'blocked')
+      `).all();
+      const now = new Date().toISOString();
+      const insertDraft = db.prepare(`
+        INSERT INTO memory_entries
+          (ts, day, kind, content, meta_json, state, committed_at, source_session_id, workspace_id, title, tags_json)
+        VALUES (?, ?, 'note', ?, ?, 'draft', NULL, ?, ?, ?, ?)
+      `);
+      const markDone = db.prepare(`
+        UPDATE web_tool_proposals
+        SET status = 'migrated_to_draft', requires_approval = 0, approval_id = NULL
+        WHERE id = ?
+      `);
+      for (const row of proposals) {
+        const args = (() => {
+          try { return JSON.parse(String(row.args_json || '{}')) || {}; } catch { return {}; }
+        })();
+        const text = String(args.text ?? args.content ?? '').trim();
+        if (!text) {
+          markDone.run(row.id);
+          continue;
+        }
+        const day = String(args.day || now.slice(0, 10));
+        insertDraft.run(
+          now,
+          day,
+          text,
+          JSON.stringify({ migrated_from_proposal: row.id, migrated_at: now }),
+          String(row.session_id || 'migrated'),
+          process.env.PB_WORKDIR || process.env.PROWORKBENCH_WORKDIR || '',
+          null,
+          '[]'
+        );
         markDone.run(row.id);
-        continue;
+        try {
+          db.prepare(`UPDATE approvals SET status = 'superseded', resolved_at = ? WHERE proposal_id = ? AND status = 'pending'`).run(now, row.id);
+        } catch {}
       }
-      const day = String(args.day || now.slice(0, 10));
-      insertDraft.run(
-        now,
-        day,
-        text,
-        JSON.stringify({ migrated_from_proposal: row.id, migrated_at: now }),
-        String(row.session_id || 'migrated'),
-        process.env.PB_WORKDIR || process.env.PROWORKBENCH_WORKDIR || '',
-        null,
-        '[]'
-      );
-      markDone.run(row.id);
-      try {
-        db.prepare(`UPDATE approvals SET status = 'superseded', resolved_at = ? WHERE proposal_id = ? AND status = 'pending'`).run(now, row.id);
-      } catch {}
-    }
-  } catch {}
+    } catch {}
+  }
 
   // Ensure admin_auth row exists
   const row = db.prepare('SELECT id FROM admin_auth WHERE id = 1').get();
@@ -706,6 +749,43 @@ export function migrate(db) {
 
   try {
     const now = new Date().toISOString();
+    if (!approvalsEnabled()) {
+      if (hasTable(db, 'web_tool_proposals')) {
+        db.prepare(`
+          UPDATE web_tool_proposals
+          SET status = CASE WHEN status = 'awaiting_approval' THEN 'ready' ELSE status END,
+              requires_approval = 0,
+              approval_id = NULL
+          WHERE requires_approval = 1 OR status = 'awaiting_approval' OR approval_id IS NOT NULL
+        `).run();
+      }
+      if (hasTable(db, 'approvals')) {
+        db.prepare(`
+          UPDATE approvals
+          SET status = 'disabled',
+              resolved_at = COALESCE(resolved_at, ?),
+              reason = COALESCE(reason, 'approvals_disabled')
+          WHERE status = 'pending'
+        `).run(now);
+      }
+      if (hasTable(db, 'approval_requests')) {
+        db.prepare(`
+          UPDATE approval_requests
+          SET status = 'disabled',
+              resolved_at = COALESCE(resolved_at, ?),
+              why = COALESCE(why, 'approvals_disabled')
+          WHERE status = 'pending'
+        `).run(now);
+      }
+      if (hasTable(db, 'mcp_servers')) {
+        db.prepare(`
+          UPDATE mcp_servers
+          SET approved_for_use = 1,
+              updated_at = ?
+          WHERE approved_for_use != 1
+        `).run(now);
+      }
+    }
     if (hasTable(db, 'capability_grants')) {
       db.prepare(`
         UPDATE capability_grants
@@ -793,5 +873,36 @@ export function migrate(db) {
     }
   } catch {
     // ignore migration errors (non-fatal)
+  }
+}
+
+function hasTable(db, tableName) {
+  try {
+    const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(String(tableName));
+    return Boolean(row?.name);
+  } catch {
+    return false;
+  }
+}
+
+function hasColumn(db, tableName, columnName) {
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
+    return rows.some((row) => String(row.name || '') === String(columnName));
+  } catch {
+    return false;
+  }
+}
+
+function renameLegacyApprovalsTable(db) {
+  try {
+    if (!hasTable(db, 'approvals')) return;
+    if (hasColumn(db, 'approvals', 'status')) return;
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+    const nextName = `approvals_legacy_${stamp}`;
+    db.prepare(`ALTER TABLE approvals RENAME TO ${nextName}`).run();
+    console.log(`[db] renamed legacy approvals table to ${nextName}`);
+  } catch (e) {
+    console.log(`[db] legacy approvals rename skipped: ${String(e?.message || e)}`);
   }
 }

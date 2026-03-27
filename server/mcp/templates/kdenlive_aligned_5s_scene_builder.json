@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "kdenlive_aligned_5s_scene_builder",
+  "name": "Kdenlive Aligned 5s Scene Builder",
+  "description": "Builds a Kdenlive MLT project with aligned scene slots across V1/A1/A2/A3 tracks.",
+  "risk": "low",
+  "allowedChannels": ["webchat"],
+  "requiresApprovalByDefault": true,
+  "fields": [
+    { "key": "rootPath", "label": "Workspace root", "type": "path", "required": true, "defaultFrom": "PB_WORKDIR" }
+  ],
+  "securityDefaults": {
+    "testPlan": [
+      "kdenlive.make_aligned_project"
+    ],
+    "workdirOnly": true,
+    "pathAllowlist": ["{PB_WORKDIR}"],
+    "pathReadOnly": false,
+    "domainAllowlist": [],
+    "commandAllowlist": []
+  },
+  "defaultCapabilities": [
+    "kdenlive.make_aligned_project"
+  ]
+}

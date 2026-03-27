@@ -27,6 +27,23 @@ type OutsideError = {
   };
 };
 
+type ToolsRegistry = {
+  ok: boolean;
+  agent_id: string;
+  route: string;
+  route_mode?: string;
+  allowed_tools: string[];
+  approvals_enabled: boolean;
+  sandbox_root: string;
+  model?: string | null;
+  allowed_roots?: string[];
+  exec_whitelist?: string[];
+  access_level?: number;
+  access_level_label?: string;
+  exec_mode?: 'argv' | 'shell';
+  allow_shell_operators?: boolean;
+};
+
 function pretty(v: unknown) {
   try { return JSON.stringify(v, null, 2); } catch { return String(v); }
 }
@@ -48,15 +65,19 @@ export default function ToolsPage() {
   const [diagBusy, setDiagBusy] = useState(false);
   const [diagOut, setDiagOut] = useState<any>(null);
   const [diagQuickOut, setDiagQuickOut] = useState<any>(null);
+  const [registry, setRegistry] = useState<ToolsRegistry | null>(null);
+  const [selfTestBusy, setSelfTestBusy] = useState(false);
+  const [selfTestOut, setSelfTestOut] = useState<any>(null);
 
   async function load() {
     setLoading(true);
     setErr('');
     try {
-      const [toolsOut, grantsOut, legacyToolsOut] = await Promise.all([
+      const [toolsOut, grantsOut, legacyToolsOut, registryOut] = await Promise.all([
         getJson<any>('/api/tools'),
         getJson<any>('/admin/grants/path-prefix').catch(() => ({ ok: true, grants: [] })),
         getJson<any>('/admin/tools').catch(() => ({ tools: [], allowed_roots: null })),
+        getJson<ToolsRegistry>('/api/tools/registry?agent_id=alex&route=tools').catch(() => null),
       ]);
       const fromOpenAi = Array.isArray(toolsOut)
         ? toolsOut.map((t: any) => ({
@@ -70,6 +91,7 @@ export default function ToolsPage() {
       setTools(fromOpenAi.length ? fromOpenAi : fromLegacy);
       setAllowedRoots(legacyToolsOut?.allowed_roots || null);
       setGrants(Array.isArray(grantsOut?.grants) ? grantsOut.grants : []);
+      setRegistry(registryOut || null);
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally {
@@ -183,6 +205,22 @@ export default function ToolsPage() {
     }
   }
 
+  async function runAlexSelfTest() {
+    setSelfTestBusy(true);
+    setErr('');
+    try {
+      const out = await postJson('/api/admin/test_alex_tools', { session_id: 'alex-self-test-ui' });
+      setSelfTestOut(out);
+      await load();
+    } catch (e: any) {
+      const detail = e?.detail || { ok: false, error: String(e?.message || e) };
+      setSelfTestOut(detail);
+      setErr(String(detail?.message || detail?.error || e?.message || e));
+    } finally {
+      setSelfTestBusy(false);
+    }
+  }
+
   if (loading) return <div>Loading tools…</div>;
 
   return (
@@ -194,6 +232,19 @@ export default function ToolsPage() {
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Allowed roots</div>
         <div style={{ fontSize: 13 }}>HOME: <code>{allowedRoots?.home || 'n/a'}</code></div>
         <div style={{ fontSize: 13 }}>WORKSPACE: <code>{allowedRoots?.workspace || 'n/a'}</code></div>
+      </div>
+
+      <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
+        <div style={{ fontWeight: 700 }}>Alex tool registry</div>
+        <div style={{ fontSize: 13 }}>Model: <code>{registry?.model || 'unknown'}</code></div>
+        <div style={{ fontSize: 13 }}>Route mode: <code>{registry?.route_mode || registry?.route || 'unknown'}</code></div>
+        <div style={{ fontSize: 13 }}>Access: <strong>{registry?.access_level_label || `L${registry?.access_level ?? 1}`}</strong></div>
+        <div style={{ fontSize: 13 }}>Exec mode: <code>{registry?.exec_mode || 'argv'}</code> · Shell operators: <strong>{registry?.allow_shell_operators ? 'Enabled' : 'Disabled'}</strong></div>
+        <div style={{ fontSize: 13 }}>Approvals enabled: <strong>{registry?.approvals_enabled ? 'true' : 'false'}</strong></div>
+        <div style={{ fontSize: 13 }}>Sandbox root: <code>{registry?.sandbox_root || 'unknown'}</code></div>
+        <div style={{ fontSize: 13 }}>Allowed roots: <code>{(registry?.allowed_roots || []).join(', ') || '(none)'}</code></div>
+        <div style={{ fontSize: 13 }}>Exec whitelist: <code>{(registry?.exec_whitelist || []).join(', ') || '(none)'}</code></div>
+        <div style={{ fontSize: 13 }}>Allowed tools: <code>{(registry?.allowed_tools || []).join(', ') || '(none)'}</code></div>
       </div>
 
       <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
@@ -263,11 +314,13 @@ export default function ToolsPage() {
       <div style={{ border: '1px solid var(--border-soft)', borderRadius: 10, padding: 10, display: 'grid', gap: 8 }}>
         <div style={{ fontWeight: 700 }}>Diagnostics</div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button onClick={runAlexSelfTest} disabled={selfTestBusy}>{selfTestBusy ? 'Running Alex self-test…' : 'Run Alex Tools Self-Test'}</button>
           <button onClick={() => runQuickDiag('list')} disabled={diagBusy}>List tools</button>
           <button onClick={() => runQuickDiag('write')} disabled={diagBusy}>Write workspace hello.txt</button>
           <button onClick={() => runQuickDiag('read')} disabled={diagBusy}>Read workspace hello.txt</button>
           <button onClick={runDiagnostics} disabled={diagBusy}>{diagBusy ? 'Running…' : 'Run diagnostics'}</button>
         </div>
+        {selfTestOut ? <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{pretty(selfTestOut)}</pre> : null}
         {diagQuickOut ? <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{pretty(diagQuickOut)}</pre> : null}
         {diagOut ? <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{pretty(diagOut)}</pre> : null}
       </div>

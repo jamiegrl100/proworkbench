@@ -8,10 +8,17 @@
   "requiresApprovalByDefault": false,
   "fields": [],
   "securityDefaults": {
+    "testPlan": [
+      "json.format",
+      "json.validate"
+    ],
     "workdirOnly": true,
     "pathAllowlist": ["{PB_WORKDIR}"],
     "domainAllowlist": [],
     "commandAllowlist": []
-  }
+  },
+  "defaultCapabilities": [
+    "json.format",
+    "json.validate"
+  ]
 }
-

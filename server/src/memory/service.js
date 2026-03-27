@@ -292,7 +292,17 @@ export function getRecentCommittedMemoryForContext(db, { limit = 80 } = {}) {
   if (hasArchive) {
     return db.prepare(`
       SELECT day, ts, content
-      FROM memory_archive
+      FROM (
+        SELECT day, ts, content, committed_at, id
+        FROM memory_archive
+        UNION ALL
+        SELECT e.day, e.ts, e.content, COALESCE(e.committed_at, e.ts) AS committed_at, e.id
+        FROM memory_entries e
+        WHERE (e.state = 'committed' OR e.state IS NULL OR TRIM(e.state) = '')
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_archive a WHERE a.memory_entry_id = e.id
+          )
+      )
       ORDER BY committed_at DESC, id DESC
       LIMIT ?
     `).all(max);
@@ -352,12 +362,25 @@ export function searchMemoryEntries(db, { q = '', startDay = '', endDay = '', li
       argsArchive.push(endDay);
     }
     rows = db.prepare(`
-      SELECT id, ts, day, kind, content, meta_json, title, tags_json, 'committed' as state, committed_at, source_session_id
-      FROM memory_archive
-      WHERE ${whereArchive.join(' AND ')}
+      SELECT id, ts, day, kind, content, meta_json, title, tags_json, state, committed_at, source_session_id
+      FROM (
+        SELECT id, ts, day, kind, content, meta_json, title, tags_json, 'committed' AS state, committed_at, source_session_id
+        FROM memory_archive
+        WHERE ${whereArchive.join(' AND ')}
+        UNION ALL
+        SELECT e.id, e.ts, e.day, e.kind, e.content, e.meta_json, e.title, e.tags_json, 'committed' AS state, COALESCE(e.committed_at, e.ts) AS committed_at, e.source_session_id
+        FROM memory_entries e
+        WHERE (e.state = 'committed' OR e.state IS NULL OR TRIM(e.state) = '')
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_archive a WHERE a.memory_entry_id = e.id
+          )
+          ${query ? 'AND (e.content LIKE ? OR e.meta_json LIKE ? OR e.title LIKE ?)' : ''}
+          ${startDay && isValidDay(startDay) ? 'AND e.day >= ?' : ''}
+          ${endDay && isValidDay(endDay) ? 'AND e.day <= ?' : ''}
+      )
       ORDER BY committed_at DESC, id DESC
       LIMIT ?
-    `).all(...argsArchive, max);
+    `).all(...argsArchive, ...argsArchive, max);
   } else {
     rows = db
       .prepare(

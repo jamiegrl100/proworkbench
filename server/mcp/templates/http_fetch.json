@@ -10,10 +10,16 @@
     { "key": "domainAllowlistCsv", "label": "Allowed domains (comma separated)", "type": "csv", "required": true }
   ],
   "securityDefaults": {
+    "testPlan": [
+      "http.fetch https://example.com",
+      "http.fetch forbidden-domain"
+    ],
     "workdirOnly": true,
     "pathAllowlist": ["{PB_WORKDIR}"],
     "domainAllowlist": [],
     "commandAllowlist": []
-  }
+  },
+  "defaultCapabilities": [
+    "http.fetch"
+  ]
 }
-

@@ -4,7 +4,8 @@ export function extractToken(req) {
   const auth = String(req.headers?.authorization || '');
   const match = auth.match(/^Bearer\s+(.+)$/i);
   const legacy = String(req.headers?.['x-pb-admin-token'] || '');
-  return match?.[1] || legacy || '';
+  const queryToken = String(req.query?.admin_token || req.query?.token || '');
+  return match?.[1] || legacy || queryToken || '';
 }
 
 function unauthorized(res, { hint, bootstrap = null } = {}) {

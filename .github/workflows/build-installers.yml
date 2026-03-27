@@ -1,4 +1,4 @@
-name: Build Desktop Installers (Artifacts)
+name: Release Desktop Installers
 
 on:
   workflow_dispatch:
@@ -7,15 +7,23 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -31,85 +39,67 @@ jobs:
           node-version: "20"
           cache: "npm"
 
-      - name: Install root deps
-        run: npm ci
-
-      - name: Build UI
-        working-directory: ui
-        run: |
-          npm ci
-          npm run build
-
-      - name: Build Server
-        working-directory: server
-        run: |
-          npm ci
-          npm run build
-
-      - name: Build Desktop
-        working-directory: desktop
-        run: |
-          npm ci
-          npm run build
-
-      - name: Package Desktop
-        working-directory: desktop
-        run: npm run dist
-
-      - name: Smoke check macOS DMG
-        if: runner.os == 'macOS'
+      - name: Export release version
         shell: bash
         run: |
           set -euo pipefail
-          echo "Listing desktop/dist-installers:"
-          ls -la desktop/dist-installers || true
+          echo "RELEASE_VERSION=v$(node -p "require('./package.json').version")" >> "$GITHUB_ENV"
 
-          DMG="$(ls -1 desktop/dist-installers/*.dmg | head -n 1)"
-          echo "DMG=$DMG"
-
-          echo "Mounting DMG..."
-          PLIST_FILE="$(mktemp)"
-          hdiutil attach "$DMG" -nobrowse -plist > "$PLIST_FILE"
-
-          # Extract mount-point robustly (find first mount-point in system-entities)
-          MOUNT="$(plutil -convert json -o - "$PLIST_FILE" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); ents=d.get('system-entities',[]); m=next((e.get('mount-point') for e in ents if isinstance(e,dict) and e.get('mount-point')), None); print(m or '')")"
-
-          if [ -z "$MOUNT" ]; then
-            echo "ERROR: Could not detect mount point from hdiutil plist."
-            echo "hdiutil plist:"
-            cat "$PLIST_FILE"
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="v$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "${VERSION}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${VERSION}" >&2
             exit 1
           fi
 
-          echo "MOUNT=$MOUNT"
-          ls -la "$MOUNT"
+      - name: Install root deps
+        run: npm ci
 
-          APP="$(find "$MOUNT" -maxdepth 2 -name '*.app' -print -quit)"
-          echo "APP=$APP"
-          test -d "$APP"
+      - name: Install desktop deps
+        run: npm --prefix desktop ci
 
-          echo "Checking app bundle structure..."
-          test -f "$APP/Contents/Info.plist"
-          test -d "$APP/Contents/Resources"
-          test -d "$APP/Contents/MacOS"
-          test -f "$APP/Contents/MacOS/"* || (echo "Missing MacOS executable" && exit 1)
-
-          echo "Info.plist summary:"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP/Contents/Info.plist" || true
-
-          echo "Unmounting..."
-          hdiutil detach "$MOUNT" -quiet
+      - name: Build release artifacts
+        run: npm run release:build:${{ matrix.platform }}
 
       - name: Upload installers (artifacts)
         uses: actions/upload-artifact@v4
         with:
-          name: installers-${{ matrix.os }}
+          name: proworkbench-${{ env.RELEASE_VERSION }}-${{ matrix.platform }}
           path: |
-            desktop/dist-installers/**/*.AppImage
-            desktop/dist-installers/**/*.deb
-            desktop/dist-installers/**/*.exe
-            desktop/dist-installers/**/*.dmg
+            release/proworkbench-v*-${{ matrix.platform }}*
           if-no-files-found: error
           retention-days: 14
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download staged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: Flatten artifact layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/final
+          find release -type f -name 'proworkbench-v*' -exec cp {} release/final/ \;
+          ls -la release/final
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/final/*
+          body_path: RELEASE_NOTES.md

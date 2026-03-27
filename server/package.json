@@ -1,13 +1,17 @@
 {
   "name": "proworkbench-server",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "dev": "node --watch src/index.js",
     "build": "node scripts/build.mjs",
     "test": "wait-on http://127.0.0.1:8787/admin/meta && PROWORKBENCH_ADMIN_TOKEN=admin-secret node src/http/admin.test.js",
+    "test:agent": "node --test src/agent/*.test.js",
+    "test:tools": "node --test src/agent/toolRouter.test.js src/http/admin.toolloop.test.js",
+    "test:alex-tools": "node scripts/test_alex_tools.mjs",
+    "seed:mcp": "node scripts/seed-default-mcp.js",
     "start": "node src/index.js"
   },
   "dependencies": {

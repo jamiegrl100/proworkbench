@@ -46,6 +46,8 @@ writing/**/*.pdf
 # PB workspace folder (repo-local) — keep untracked
 workspace/
 **/workspace/
+.proworkbench/
+**/.proworkbench/
 
 # PB internal state (repo-local copies should never exist, but ignore defensively)
 .pb/
@@ -70,6 +72,7 @@ writing/cache/**
 desktop/dist-installers/
 desktop/dist/
 dist-installers/
+release/
 *.AppImage
 *.dmg
 *.exe
@@ -102,4 +105,3 @@ desktop/dist/
 *.exe
 *.msi
 *.deb
-

@@ -60,7 +60,7 @@ function todayUtc() {
   return `${y}-${m}-${day}`;
 }
 
-export default function MemoryPage() {
+export default function MemoryPage({ approvalsEnabled = false }: { approvalsEnabled?: boolean }) {
   const memoryApiBase = '/api/memory';
   const [day, setDay] = useState(todayUtc());
   const [scratchText, setScratchText] = useState("");
@@ -567,7 +567,7 @@ export default function MemoryPage() {
           <button onClick={discardSelected} disabled={busy || selectedDrafts.length === 0} style={{ padding: "8px 10px" }}>Discard selected</button>
           <button onClick={commitAllDrafts} disabled={busy || drafts.length === 0} style={{ padding: "8px 10px" }}>Commit all</button>
           <button onClick={discardAllDrafts} disabled={busy || drafts.length === 0} style={{ padding: "8px 10px" }}>Discard all</button>
-          <button onClick={migratePendingApprovalsToDrafts} disabled={busy} style={{ padding: "8px 10px" }}>Convert pending approvals to drafts</button>
+          {approvalsEnabled ? <button onClick={migratePendingApprovalsToDrafts} disabled={busy} style={{ padding: "8px 10px" }}>Convert pending approvals to drafts</button> : null}
         </div>
         {drafts.length === 0 ? (
           <div style={{ fontSize: 12, opacity: 0.7 }}>No drafts.</div>

@@ -36,8 +36,11 @@ if (!target || !(target in platformConfig)) {
 }
 
 function run(cmd, args, cwd = rootDir) {
-  console.log(`[release] ${cmd} ${args.join(" ")}`);
-  execFileSync(cmd, args, {
+  const isWindows = process.platform === "win32";
+  const finalCmd = isWindows ? "cmd.exe" : cmd;
+  const finalArgs = isWindows ? ["/d", "/s", "/c", cmd, ...args] : args;
+  console.log(`[release] ${finalCmd} ${finalArgs.join(" ")}`);
+  execFileSync(finalCmd, finalArgs, {
     cwd,
     stdio: "inherit",
     env: {
